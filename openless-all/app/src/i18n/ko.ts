@@ -400,7 +400,6 @@ export const ko: typeof zhCN = {
       apiKeyLabel: 'API 키',
       baseUrlLabel: '엔드포인트',
       modelLabel: '모델',
-      geminiModelHint: '모든 Gemini 모델에서 사고 모드가 강제로 꺼집니다. 사용 가능한 모델 ID: gemini-2.5-flash(권장, 저지연), gemini-2.5-flash-lite, gemini-2.5-pro(공식 발표상 사고 모드를 끌 수 없음), gemini-3.1-pro-preview(최저 LOW 사고 단계), gemini-3-flash-preview, gemini-3.1-flash-lite, gemini-3.1-flash-lite-preview.',
       bailianVocabularyIdLabel: '핫워드 Vocabulary ID(선택)',
       bailianVocabularyIdNote: 'DashScope에서 핫워드 사전을 만들었다면 vocab-... ID를 입력하세요. 비워 두면 핫워드를 전송하지 않습니다.',
       appIdLabel: 'App ID(애플리케이션 ID)',

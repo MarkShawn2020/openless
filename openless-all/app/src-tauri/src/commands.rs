@@ -810,14 +810,21 @@ fn encode_wav_16k_mono_silence(duration_ms: u32) -> Vec<u8> {
 
 async fn fetch_provider_models(config: &ProviderConfig) -> Result<Vec<String>, String> {
     let url = models_url(&config.base_url);
-    log::info!("[provider-check] GET {url}");
+    let is_gemini = is_gemini_base_url(&config.base_url);
+    log::info!("[provider-check] GET {url} (gemini={is_gemini})");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("HTTP client 初始化失败: {e}"))?;
     let mut request = client.get(&url);
     if !config.api_key.trim().is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", config.api_key));
+        // 谷歌原生 generativelanguage.googleapis.com 不识别 Bearer Authorization,
+        // 必须用 x-goog-api-key 头。其它 OpenAI 兼容 provider 仍走 Bearer。
+        if is_gemini {
+            request = request.header("x-goog-api-key", config.api_key.as_str());
+        } else {
+            request = request.header("Authorization", format!("Bearer {}", config.api_key));
+        }
     }
     let response = request.send().await.map_err(|e| {
         if e.is_timeout() {
@@ -834,7 +841,15 @@ async fn fetch_provider_models(config: &ProviderConfig) -> Result<Vec<String>, S
     if !status.is_success() {
         return Err(format!("providerHttpStatus:{}", status.as_u16()));
     }
-    parse_model_ids(&body)
+    if is_gemini {
+        parse_gemini_model_ids(&body)
+    } else {
+        parse_model_ids(&body)
+    }
+}
+
+fn is_gemini_base_url(base_url: &str) -> bool {
+    base_url.contains("generativelanguage.googleapis.com")
 }
 
 fn models_url(base_url: &str) -> String {
@@ -865,6 +880,27 @@ fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
     models.sort();
     models.dedup();
     Ok(models)
+}
+
+/// 谷歌 v1beta/models 响应形状：`{models: [{name: "models/gemini-2.5-flash", ...}, ...]}`。
+/// 与 OpenAI `{data: [{id: "..."}]}` 不兼容，所以单独解析；name 字段去掉 "models/" 前缀
+/// 后即是 ProviderTools「拉取模型」按钮可直接写入 ark.model_id 的字符串。
+fn parse_gemini_model_ids(body: &str) -> Result<Vec<String>, String> {
+    let json: Value =
+        serde_json::from_str(body).map_err(|e| format!("模型列表不是有效 JSON: {e}"))?;
+    let models = json
+        .get("models")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "Gemini 模型列表缺少 models 数组".to_string())?;
+    let mut ids = models
+        .iter()
+        .filter_map(|item| item.get("name").and_then(|n| n.as_str()))
+        .map(|name| name.strip_prefix("models/").unwrap_or(name).trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 fn parse_account(s: &str) -> Result<CredentialAccount, String> {
@@ -1841,10 +1877,11 @@ mod tests {
     use super::{
         active_asr_is_keyless_for_validation, active_foundry_model_from_prefs,
         asr_configured_for_provider, asr_transcriptions_url, fetch_provider_models,
-        llm_configured_for_provider, local_asr_release_plan_for_provider, models_url,
-        normalize_foundry_language_hint, parse_latest_beta_from_atom, parse_model_ids,
-        persist_settings, release_foundry_runtime_if_inactive, validate_foundry_model_alias,
-        ProviderConfig, SettingsWriter,
+        is_gemini_base_url, llm_configured_for_provider, local_asr_release_plan_for_provider,
+        models_url, normalize_foundry_language_hint, parse_gemini_model_ids,
+        parse_latest_beta_from_atom, parse_model_ids, persist_settings,
+        release_foundry_runtime_if_inactive, validate_foundry_model_alias, ProviderConfig,
+        SettingsWriter,
     };
     use crate::persistence::CredentialsSnapshot;
     use crate::types::{
@@ -2130,6 +2167,36 @@ mod tests {
             parse_model_ids(r#"{ "data": [{ "id": "b" }, { "id": "a" }, { "id": "b" }] }"#)
                 .unwrap();
         assert_eq!(models, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_gemini_model_ids_strips_models_prefix_and_dedups() {
+        // Google v1beta/models 真实响应的子集——name 字段带 `models/` 前缀，
+        // ProviderTools 选中后写入 ark.model_id 时不能带这个前缀（generateContent
+        // URL 拼接已经会加 `models/`，不去前缀就会变成 `models/models/...`）。
+        let body = r#"{"models":[
+            {"name":"models/gemini-2.5-pro"},
+            {"name":"models/gemini-2.5-flash"},
+            {"name":"models/gemini-2.5-flash"},
+            {"name":"models/gemini-3-flash-preview"}
+        ]}"#;
+        let ids = parse_gemini_model_ids(body).unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                "gemini-2.5-flash".to_string(),
+                "gemini-2.5-pro".to_string(),
+                "gemini-3-flash-preview".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_gemini_base_url_matches_official_domain() {
+        assert!(is_gemini_base_url("https://generativelanguage.googleapis.com/v1beta"));
+        assert!(is_gemini_base_url("https://generativelanguage.googleapis.com/v1beta/"));
+        assert!(!is_gemini_base_url("https://api.openai.com/v1"));
+        assert!(!is_gemini_base_url("https://ark.cn-beijing.volces.com/api/v3"));
     }
 
     #[test]

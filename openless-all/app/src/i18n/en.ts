@@ -398,7 +398,6 @@ export const en: typeof zhCN = {
       apiKeyLabel: 'API Key',
       baseUrlLabel: 'Base URL',
       modelLabel: 'Model',
-      geminiModelHint: 'Thinking mode is forced off for every Gemini model. Available model IDs: gemini-2.5-flash (recommended, low-latency), gemini-2.5-flash-lite, gemini-2.5-pro (Google states thinking cannot be disabled), gemini-3.1-pro-preview (minimum thinking level: LOW), gemini-3-flash-preview, gemini-3.1-flash-lite, gemini-3.1-flash-lite-preview.',
       bailianVocabularyIdLabel: 'Hotword Vocabulary ID (optional)',
       bailianVocabularyIdNote: 'If you have created a DashScope hotword vocabulary, enter its vocab-... ID. Leave blank to skip hotwords.',
       appIdLabel: 'App ID',

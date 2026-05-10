@@ -396,7 +396,6 @@ export const zhCN = {
       apiKeyLabel: 'API 密钥',
       baseUrlLabel: '接口地址',
       modelLabel: '模型',
-      geminiModelHint: '所有 Gemini 模型已强制关闭思考模式。可用模型 ID：gemini-2.5-flash（推荐，低延迟）、gemini-2.5-flash-lite、gemini-2.5-pro（官方说明无法关闭思考）、gemini-3.1-pro-preview（最低 LOW 思考档）、gemini-3-flash-preview、gemini-3.1-flash-lite、gemini-3.1-flash-lite-preview。',
       bailianVocabularyIdLabel: '热词 Vocabulary ID（可选）',
       bailianVocabularyIdNote: '如已在百炼创建热词表，可填写 vocab-...；留空则不下发热词。',
       appIdLabel: 'App ID（应用 ID）',

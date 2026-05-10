@@ -1170,7 +1170,8 @@ const LLM_PRESETS = [
     // 后端 llm_gemini.rs 会拼成 `{baseUrl}/models/{model}:generateContent`，
     // 并按模型 family 注入 thinkingConfig 强制关思考（2.5 flash 系列 thinkingBudget=0；
     // 3.x pro 走 thinkingLevel="low"；3.x flash 走 thinkingLevel="minimal"；
-    // 2.5 pro 官方明示无法关闭思考）。具体 ID 列表见 i18n geminiModelHint。
+    // 2.5 pro 官方明示无法关闭思考）。模型列表用 ProviderTools「拉取模型」按钮取，
+    // 由 commands.rs::fetch_provider_models 识别 generativelanguage 域名后按 Gemini shape 解析。
     id: 'gemini',
     nameKey: 'gemini',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
@@ -1380,16 +1381,7 @@ function ProvidersSection() {
           placeholder={preset.baseUrl || 'https://your-endpoint/v1'} />
         <CredentialField key={`${committedLlmProvider}:model:${llmModelRevision}`} label={t('settings.providers.modelLabel')} account="ark.model_id"
           placeholder={preset.modelPlaceholder || 'model-name'} mono />
-        {committedLlmProvider === 'gemini' ? (
-          // ProviderTools 的"拉取模型"按钮访问 `<baseUrl>/models` 并按 OpenAI shape 解析；
-          // 谷歌原生 v1beta/models 返回 `{models:[{name:"models/...",}]}` 不兼容，会失败。
-          // 这里换成静态文案直接列出当前可用 ID + 强制关思考的策略。
-          <div style={{ marginTop: 4, fontSize: 11.5, color: 'var(--ol-ink-4)', lineHeight: 1.6 }}>
-            {t('settings.providers.geminiModelHint')}
-          </div>
-        ) : (
-          <ProviderTools key={committedLlmProvider} kind="llm" modelAccount="ark.model_id" onModelSelected={() => setLlmModelRevision(v => v + 1)} />
-        )}
+        <ProviderTools key={committedLlmProvider} kind="llm" modelAccount="ark.model_id" onModelSelected={() => setLlmModelRevision(v => v + 1)} />
       </Card>
 
       <Card>

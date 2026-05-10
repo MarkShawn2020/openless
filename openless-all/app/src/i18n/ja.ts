@@ -400,7 +400,6 @@ export const ja: typeof zhCN = {
       apiKeyLabel: 'API キー',
       baseUrlLabel: 'エンドポイント',
       modelLabel: 'モデル',
-      geminiModelHint: 'すべての Gemini モデルで思考モードを強制 OFF にしています。利用可能なモデル ID：gemini-2.5-flash（推奨、低レイテンシ）、gemini-2.5-flash-lite、gemini-2.5-pro（公式仕様：思考は OFF にできません）、gemini-3.1-pro-preview（最低 LOW 思考レベル）、gemini-3-flash-preview、gemini-3.1-flash-lite、gemini-3.1-flash-lite-preview。',
       bailianVocabularyIdLabel: 'ホットワード Vocabulary ID（任意）',
       bailianVocabularyIdNote: 'DashScope でホットワード辞書を作成済みの場合は vocab-... ID を入力します。空欄なら送信しません。',
       appIdLabel: 'App ID（アプリケーション ID）',
