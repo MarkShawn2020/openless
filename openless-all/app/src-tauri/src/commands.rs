@@ -882,9 +882,17 @@ fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
     Ok(models)
 }
 
-/// 谷歌 v1beta/models 响应形状：`{models: [{name: "models/gemini-2.5-flash", ...}, ...]}`。
-/// 与 OpenAI `{data: [{id: "..."}]}` 不兼容，所以单独解析；name 字段去掉 "models/" 前缀
-/// 后即是 ProviderTools「拉取模型」按钮可直接写入 ark.model_id 的字符串。
+/// 谷歌 v1beta/models 响应形状：`{models: [{name: "models/gemini-2.5-flash",
+/// supportedGenerationMethods: ["generateContent", ...], ...}, ...]}`。
+/// 与 OpenAI `{data: [{id: "..."}]}` 不兼容，所以单独解析；name 字段去掉
+/// "models/" 前缀后即是 ProviderTools「拉取模型」按钮可直接写入 ark.model_id
+/// 的字符串。
+///
+/// 过滤：只保留声明支持 `generateContent` 的模型——Google 的 model list 同时
+/// 暴露 embedding (`gemini-embedding-2`)、TTS、image 等不支持
+/// generateContent 的家族；用户选中那种 ID 后 polish 必失败（PR #398 pr_agent
+/// 漏洞反馈）。`supportedGenerationMethods` 字段缺失时保守保留——某些 preview
+/// 模型可能未暴露这个字段，宁误显示也不要把新模型挡在外面。
 fn parse_gemini_model_ids(body: &str) -> Result<Vec<String>, String> {
     let json: Value =
         serde_json::from_str(body).map_err(|e| format!("模型列表不是有效 JSON: {e}"))?;
@@ -894,6 +902,14 @@ fn parse_gemini_model_ids(body: &str) -> Result<Vec<String>, String> {
         .ok_or_else(|| "Gemini 模型列表缺少 models 数组".to_string())?;
     let mut ids = models
         .iter()
+        .filter(|item| {
+            match item.get("supportedGenerationMethods").and_then(|v| v.as_array()) {
+                Some(methods) => methods
+                    .iter()
+                    .any(|m| m.as_str() == Some("generateContent")),
+                None => true, // 字段缺失：保守包含
+            }
+        })
         .filter_map(|item| item.get("name").and_then(|n| n.as_str()))
         .map(|name| name.strip_prefix("models/").unwrap_or(name).trim().to_string())
         .filter(|id| !id.is_empty())
@@ -2174,6 +2190,7 @@ mod tests {
         // Google v1beta/models 真实响应的子集——name 字段带 `models/` 前缀，
         // ProviderTools 选中后写入 ark.model_id 时不能带这个前缀（generateContent
         // URL 拼接已经会加 `models/`，不去前缀就会变成 `models/models/...`）。
+        // 字段缺失时保守保留（视为支持 generateContent）。
         let body = r#"{"models":[
             {"name":"models/gemini-2.5-pro"},
             {"name":"models/gemini-2.5-flash"},
@@ -2187,6 +2204,30 @@ mod tests {
                 "gemini-2.5-flash".to_string(),
                 "gemini-2.5-pro".to_string(),
                 "gemini-3-flash-preview".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_gemini_model_ids_filters_out_non_generate_content_families() {
+        // 真实 Google v1beta/models 响应里同时有 generateContent / embedContent /
+        // generateMessage 等多种家族。用户选中 embedding/TTS/image 模型写入
+        // ark.model_id → polish 必败。这里是 PR #398 pr_agent advisory 的回归用例：
+        // 只把 supportedGenerationMethods 里含 generateContent 的过滤出来。
+        let body = r#"{"models":[
+            {"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent","streamGenerateContent","countTokens"]},
+            {"name":"models/gemini-embedding-2","supportedGenerationMethods":["embedContent"]},
+            {"name":"models/text-embedding-004","supportedGenerationMethods":["embedContent","countTextTokens"]},
+            {"name":"models/gemini-2.5-pro-preview-tts","supportedGenerationMethods":["generateContent"]},
+            {"name":"models/gemini-2.5-flash-image","supportedGenerationMethods":["predict"]}
+        ]}"#;
+        let ids = parse_gemini_model_ids(body).unwrap();
+        // 只剩两条声明 generateContent 的；embedding 与 image (predict-only) 必须被过滤。
+        assert_eq!(
+            ids,
+            vec![
+                "gemini-2.5-flash".to_string(),
+                "gemini-2.5-pro-preview-tts".to_string(),
             ]
         );
     }

@@ -366,21 +366,39 @@ fn system_instruction(system_prompt: &str) -> Value {
     json!({ "parts": [{ "text": system_prompt }] })
 }
 
-/// 从字节缓冲里取出所有以 `\n\n` 分隔的完整 SSE event；剩余不完整字节留在
-/// buffer 里等下一次 chunk 拼接。
+/// 从字节缓冲里取出所有以 SSE 帧分隔符（`\n\n` 或 `\r\n\r\n`）分隔的完整
+/// event；剩余不完整字节留在 buffer 里等下一次 chunk 拼接。
 ///
-/// 不变量：分隔符 `\n\n` 两字节都是 ASCII (0x0A)，永远不会出现在 UTF-8 多字节
-/// 字符的中部位置，所以
+/// 不变量：两种分隔符的所有字节都是 ASCII（0x0A / 0x0D），永远不会出现在
+/// UTF-8 多字节字符的中部位置，所以
 /// 1. 按字节查找分隔符 100% 安全；
 /// 2. 对完整 event 字节区间 (event_start..delim_start) 做 from_utf8 永远不会因
-///    chunk 边界把多字节字符切开而失败。
+///    chunk 边界把多字节字符切开而失败；
+/// 3. CRLF 与 LF 不会在同一位置都匹配（\r\n\r\n 内部不含 \n\n），按"最早出现"
+///    选取分隔符不会歧义。
 ///
-/// 这是 PR #398 pr_agent 指出的 UTF-8 SSE 漏洞的修法：原代码对每个网络 chunk
-/// 独立 from_utf8，遇到 CJK / emoji 跨 chunk 切分时直接报错让流挂掉。
+/// 这是 PR #398 pr_agent 指出的两个 SSE 漏洞的合修：
+/// (a) 原代码对每个网络 chunk 独立 from_utf8，遇到 CJK / emoji 跨 chunk 切分时
+///     直接报错让流挂掉；
+/// (b) 原代码只识别 `\n\n`，碰到走 CRLF 风格的服务器流（个别 HTTP/2 中间层、
+///     CDN 会做行尾标准化）会以为流是空的——文档没强制 LF only，必须兼容。
 fn drain_complete_sse_events(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut events = Vec::new();
-    while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
-        // event_content = buffer[..end]; delimiter = buffer[end..end+2]
+    loop {
+        let crlf = buffer.windows(4).position(|w| w == b"\r\n\r\n");
+        let lf = buffer.windows(2).position(|w| w == b"\n\n");
+        let (end, delim_len) = match (crlf, lf) {
+            (Some(c), Some(l)) => {
+                if c <= l {
+                    (c, 4)
+                } else {
+                    (l, 2)
+                }
+            }
+            (Some(c), None) => (c, 4),
+            (None, Some(l)) => (l, 2),
+            (None, None) => break,
+        };
         let event_str = match std::str::from_utf8(&buffer[..end]) {
             Ok(s) => s.to_string(),
             Err(e) => {
@@ -388,12 +406,12 @@ fn drain_complete_sse_events(buffer: &mut Vec<u8>) -> Vec<String> {
                 log::warn!(
                     "[llm] gemini SSE event has invalid UTF-8 (skipping): {e}"
                 );
-                buffer.drain(..end + 2);
+                buffer.drain(..end + delim_len);
                 continue;
             }
         };
         events.push(event_str);
-        buffer.drain(..end + 2);
+        buffer.drain(..end + delim_len);
     }
     events
 }
@@ -693,6 +711,26 @@ mod tests {
             "中文必须在拼齐后完好解出；旧实现这里会丢字"
         );
         assert!(buf.is_empty(), "处理完后 buffer 应清空");
+    }
+
+    #[test]
+    fn drain_complete_sse_events_handles_crlf_delimiter() {
+        // 回归 PR #398 pr_agent advisory：部分服务器/CDN 用 \r\n\r\n 分隔 SSE 帧，
+        // 旧实现只认 \n\n 会把整条流当空流。新实现按字节同时查 \r\n\r\n 与 \n\n，
+        // 取最早位置。Rust str::lines() 在 event 内自动剥 \r，所以 line 处理无需改。
+        let mut buf = b"data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r\n\r\n".to_vec();
+        let events = drain_complete_sse_events(&mut buf);
+        assert_eq!(events, vec!["data: {\"a\":1}", "data: {\"b\":2}"]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_complete_sse_events_picks_earliest_delimiter_when_mixed() {
+        // 同一 buffer 里既有 LF 风格也有 CRLF 风格——按出现顺序处理，不漏 event。
+        let mut buf = b"data: lf-event\n\ndata: crlf-event\r\n\r\nrest".to_vec();
+        let events = drain_complete_sse_events(&mut buf);
+        assert_eq!(events, vec!["data: lf-event", "data: crlf-event"]);
+        assert_eq!(buf, b"rest");
     }
 
     #[test]
