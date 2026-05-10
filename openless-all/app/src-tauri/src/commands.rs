@@ -410,6 +410,9 @@ fn llm_provider_default_endpoint(provider: &str) -> Option<&'static str> {
         "deepseek" => Some("https://api.deepseek.com/v1"),
         "siliconflow" => Some("https://api.siliconflow.cn/v1"),
         "openai" => Some("https://api.openai.com/v1"),
+        // 谷歌 Gemini 原生 API（v1beta）。后端 llm_gemini.rs 会拼成
+        // `{baseUrl}/models/{model}:generateContent`，认证用 x-goog-api-key 头。
+        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta"),
         "mimo" => Some("https://api.xiaomimimo.com/v1"),
         "cometapi" => Some("https://api.cometapi.com/v1"),
         "openrouterFree" => Some("https://openrouter.ai/api/v1"),

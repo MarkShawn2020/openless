@@ -1,0 +1,637 @@
+//! 谷歌 Gemini 原生 generateContent / streamGenerateContent 客户端。
+//!
+//! 为什么不复用 `polish.rs::OpenAICompatibleLLMProvider`：
+//! 1. **思考模式控制**——Gemini 系列必须按模型 family 注入对的字段
+//!    （`thinkingBudget` 给 2.5 / `thinkingLevel` 给 3.x），且两个字段不能同发。
+//!    OpenAI 兼容协议没有原生 thinking control 字段；谷歌的 OpenAI 兼容 shim
+//!    虽然支持 `reasoning_effort`，但仍是 beta、3.x 上要走 `extra_body` 绕路，
+//!    且官方文档对"是否真的关掉思考"措辞模糊。原生 endpoint 的契约最直接。
+//! 2. **认证机制**——原生用 `x-goog-api-key` header（Bearer 不被识别），
+//!    OpenAICompatibleLLMProvider 写死了 Bearer Authorization。
+//! 3. **请求/响应 shape**——原生 `contents` 走 `role: user|model`，没有
+//!    chat completions 的 system role；要走 `systemInstruction` 字段。
+//!
+//! prompt 装配 (system_prompt / user_prompt / qa system_prompt) 复用
+//! `polish.rs::compose_*` pub(crate) 装配函数，避免两路 LLM 客户端漂移。
+//! `clean_polish_output` 也复用——polish 提示词禁的"以下是整理后的内容"
+//! 前缀只有走它才能在原生路径上同样剥离。
+
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use crate::polish::{
+    clean_polish_output, compose_polish_prompts, compose_qa_system_prompt,
+    compose_translate_prompts, safe_str_slice, LLMError,
+};
+use crate::types::{ChineseScriptPreference, OutputLanguagePreference, PolishMode, QaChatMessage};
+
+const DEFAULT_TEMPERATURE: f32 = 0.3;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const BODY_PREVIEW_LIMIT: usize = 200;
+
+#[derive(Clone, Debug)]
+pub struct GeminiConfig {
+    pub api_key: String,
+    pub model: String,
+    /// e.g. `https://generativelanguage.googleapis.com/v1beta`。允许末尾带 `/`。
+    /// 后端拼成 `{base_url}/models/{model}:generateContent`。
+    pub base_url: String,
+    pub temperature: f32,
+    pub request_timeout_secs: u64,
+}
+
+impl GeminiConfig {
+    pub fn new(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            api_key: api_key.into(),
+            model: model.into(),
+            base_url: base_url.into(),
+            temperature: DEFAULT_TEMPERATURE,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        }
+    }
+}
+
+pub struct GeminiProvider {
+    config: GeminiConfig,
+    client: reqwest::Client,
+}
+
+impl GeminiProvider {
+    pub fn new(config: GeminiConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { config, client }
+    }
+
+    pub async fn polish(
+        &self,
+        raw_text: &str,
+        mode: PolishMode,
+        hotwords: &[String],
+        working_languages: &[String],
+        chinese_script_preference: ChineseScriptPreference,
+        output_language_preference: OutputLanguagePreference,
+        front_app: Option<&str>,
+        prior_turns: &[(String, String)],
+    ) -> Result<String, LLMError> {
+        let (system_prompt, user_prompt) = compose_polish_prompts(
+            raw_text,
+            mode,
+            hotwords,
+            working_languages,
+            chinese_script_preference,
+            output_language_preference,
+            front_app,
+            !prior_turns.is_empty(),
+        );
+
+        let contents = build_polish_history_contents(prior_turns, &user_prompt);
+        let body = self.build_generate_body(&system_prompt, contents);
+        let url = generate_content_url(&self.config.base_url, &self.config.model);
+
+        log::info!(
+            "[llm] POST {} provider=gemini model={} prior_turns={}",
+            url,
+            self.config.model,
+            prior_turns.len()
+        );
+
+        let body_text = self.send_unary(&url, &body).await?;
+        let raw = extract_assistant_content(&body_text)?;
+        Ok(clean_polish_output(&raw))
+    }
+
+    pub async fn translate_to(
+        &self,
+        raw_text: &str,
+        target_language: &str,
+        working_languages: &[String],
+        chinese_script_preference: ChineseScriptPreference,
+        _output_language_preference: OutputLanguagePreference,
+        front_app: Option<&str>,
+    ) -> Result<String, LLMError> {
+        let (system_prompt, user_prompt) = compose_translate_prompts(
+            raw_text,
+            target_language,
+            working_languages,
+            chinese_script_preference,
+            front_app,
+        );
+
+        let contents = vec![user_content(&user_prompt)];
+        let body = self.build_generate_body(&system_prompt, contents);
+        let url = generate_content_url(&self.config.base_url, &self.config.model);
+
+        log::info!(
+            "[llm] POST {} provider=gemini model={} translate=true",
+            url, self.config.model
+        );
+
+        let body_text = self.send_unary(&url, &body).await?;
+        let raw = extract_assistant_content(&body_text)?;
+        Ok(clean_polish_output(&raw))
+    }
+
+    /// 划词语音问答的流式回答。Gemini 原生 SSE: `:streamGenerateContent?alt=sse`，
+    /// 每个 `data: {...}` 帧里 `candidates[0].content.parts[0].text` 是 delta；
+    /// 流结束没有 `[DONE]` sentinel，stream 自然终止。
+    pub async fn answer_chat_streaming<F, C>(
+        &self,
+        messages: &[QaChatMessage],
+        working_languages: &[String],
+        chinese_script_preference: ChineseScriptPreference,
+        output_language_preference: OutputLanguagePreference,
+        front_app: Option<&str>,
+        on_delta: F,
+        should_cancel: C,
+    ) -> Result<String, LLMError>
+    where
+        F: Fn(&str) + Send + Sync,
+        C: Fn() -> bool + Send + Sync,
+    {
+        let system_prompt = compose_qa_system_prompt(
+            working_languages,
+            chinese_script_preference,
+            output_language_preference,
+            front_app,
+        );
+
+        let contents = qa_messages_to_contents(messages);
+        let body = self.build_generate_body(&system_prompt, contents);
+        let url = stream_generate_content_url(&self.config.base_url, &self.config.model);
+
+        log::info!(
+            "[llm] POST {} provider=gemini model={} chat_turns={} stream=true",
+            url,
+            self.config.model,
+            messages.len()
+        );
+
+        self.send_streaming(&url, &body, on_delta, should_cancel)
+            .await
+    }
+
+    /// `generationConfig` 注入：温度 + 按模型 family 的 thinkingConfig。
+    fn build_generate_body(&self, system_prompt: &str, contents: Vec<Value>) -> Value {
+        let mut generation_config = json!({ "temperature": self.config.temperature });
+        if let Some(thinking) = thinking_config_for(&self.config.model) {
+            generation_config["thinkingConfig"] = thinking;
+        }
+        json!({
+            "systemInstruction": system_instruction(system_prompt),
+            "contents": contents,
+            "generationConfig": generation_config,
+        })
+    }
+
+    async fn send_unary(&self, url: &str, body: &Value) -> Result<String, LLMError> {
+        let mut request = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json");
+        if !self.config.api_key.trim().is_empty() {
+            request = request.header("x-goog-api-key", self.config.api_key.as_str());
+        }
+        let request = request.json(body);
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_timeout() {
+                    return Err(LLMError::Timeout);
+                }
+                return Err(LLMError::Network(e.to_string()));
+            }
+        };
+
+        let status = response.status();
+        let body_text = response
+            .text()
+            .await
+            .map_err(|e| LLMError::Network(e.to_string()))?;
+
+        let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
+        let preview = safe_str_slice(&body_text, preview_end);
+        log::info!("[llm] HTTP {} body={}", status.as_u16(), preview);
+
+        if !status.is_success() {
+            return Err(LLMError::InvalidResponse {
+                status: status.as_u16(),
+                body: preview.to_string(),
+            });
+        }
+
+        Ok(body_text)
+    }
+
+    async fn send_streaming<F, C>(
+        &self,
+        url: &str,
+        body: &Value,
+        on_delta: F,
+        should_cancel: C,
+    ) -> Result<String, LLMError>
+    where
+        F: Fn(&str) + Send + Sync,
+        C: Fn() -> bool + Send + Sync,
+    {
+        let mut request = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+        if !self.config.api_key.trim().is_empty() {
+            request = request.header("x-goog-api-key", self.config.api_key.as_str());
+        }
+        let request = request.json(body);
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_timeout() {
+                    return Err(LLMError::Timeout);
+                }
+                return Err(LLMError::Network(e.to_string()));
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response
+                .text()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
+            let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
+            let preview = safe_str_slice(&body_text, preview_end);
+            log::error!("[llm] HTTP {} body={}", status.as_u16(), preview);
+            return Err(LLMError::InvalidResponse {
+                status: status.as_u16(),
+                body: preview.to_string(),
+            });
+        }
+
+        let mut response = response;
+        let mut buffer = String::new();
+        let mut full_text = String::new();
+        loop {
+            // 与 polish.rs streaming 同款取消旗标——用户取消 / 关浮窗时立即 break，
+            // 不再 drain HTTP body 烧 quota。
+            if should_cancel() {
+                log::info!("[llm] gemini stream cancelled by caller; breaking SSE loop");
+                break;
+            }
+            let chunk_opt = response
+                .chunk()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
+            let Some(chunk) = chunk_opt else { break };
+            let s = std::str::from_utf8(&chunk)
+                .map_err(|e| LLMError::Network(format!("non-utf8 SSE chunk: {e}")))?;
+            buffer.push_str(s);
+
+            while let Some(idx) = buffer.find("\n\n") {
+                let event = buffer[..idx].to_string();
+                buffer.drain(..idx + 2);
+                for line in event.lines() {
+                    let Some(payload) = line
+                        .strip_prefix("data: ")
+                        .or_else(|| line.strip_prefix("data:"))
+                    else {
+                        continue;
+                    };
+                    let payload = payload.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    let v: Value = match serde_json::from_str(payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::warn!(
+                                "[llm] gemini SSE parse skip: {e}; payload preview: {}",
+                                safe_str_slice(payload, 80)
+                            );
+                            continue;
+                        }
+                    };
+                    // Gemini SSE: candidates[0].content.parts[*].text
+                    if let Some(parts) = v["candidates"][0]["content"]["parts"].as_array() {
+                        for part in parts {
+                            if let Some(delta) = part["text"].as_str() {
+                                if !delta.is_empty() {
+                                    full_text.push_str(delta);
+                                    on_delta(delta);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        log::info!(
+            "[llm] HTTP 200 gemini stream done; total chars={}",
+            full_text.chars().count()
+        );
+
+        if full_text.is_empty() {
+            return Err(LLMError::InvalidResponse {
+                status: 200,
+                body: "empty stream".to_string(),
+            });
+        }
+        Ok(full_text)
+    }
+}
+
+// ─────────────────────── 内部辅助 ───────────────────────
+
+fn user_content(text: &str) -> Value {
+    json!({ "role": "user", "parts": [{ "text": text }] })
+}
+
+fn model_content(text: &str) -> Value {
+    json!({ "role": "model", "parts": [{ "text": text }] })
+}
+
+fn system_instruction(system_prompt: &str) -> Value {
+    json!({ "parts": [{ "text": system_prompt }] })
+}
+
+/// 多轮 polish 的 contents 序列。
+/// 输入约定：`prior_turns` 与 polish.rs 一致（最新在前 newest-first），
+/// chat 时间序为 oldest-first，所以这里 `iter().rev()` 反转。
+fn build_polish_history_contents(prior_turns: &[(String, String)], user_prompt: &str) -> Vec<Value> {
+    let mut contents: Vec<Value> = Vec::with_capacity(prior_turns.len() * 2 + 1);
+    for (raw, polished) in prior_turns.iter().rev() {
+        contents.push(user_content(&crate::polish::prompts::user_prompt(raw)));
+        contents.push(model_content(polished));
+    }
+    contents.push(user_content(user_prompt));
+    contents
+}
+
+/// QA chat messages → Gemini contents：assistant role 重命名为 model。
+/// QaChatMessage.role 在 polish.rs OpenAI 路径里是 `"user" | "assistant"`；
+/// 这里把 `assistant` 翻成 Gemini 的 `model`，其它原样保留。
+fn qa_messages_to_contents(messages: &[QaChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| {
+            let role = if m.role == "assistant" { "model" } else { "user" };
+            json!({ "role": role, "parts": [{ "text": m.content }] })
+        })
+        .collect()
+}
+
+/// 按模型 ID 选 thinkingConfig。返回 None 表示该模型官方明示无法关思考
+/// （目前仅 gemini-2.5-pro），交由模型默认行为。
+///
+/// 字段对应矩阵（已对 ai.google.dev/gemini-api/docs/thinking 交叉核对）：
+/// - `gemini-2.5-flash`, `gemini-2.5-flash-lite`  → `thinkingBudget = 0`（完全关）
+/// - `gemini-2.5-pro`                              → 不可关（官方 N/A），不下发字段
+/// - `gemini-3*-pro*`                              → `thinkingLevel = "low"`（最低档）
+/// - `gemini-3*-flash*`                            → `thinkingLevel = "minimal"`（Flash-only）
+/// - 其它未知                                       → `thinkingLevel = "minimal"`（"尽量关"兜底）
+///
+/// 注意：thinkingBudget 与 thinkingLevel 不能同发——文档没明示但属未定义行为。
+fn thinking_config_for(model: &str) -> Option<Value> {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("gemini-2.5-pro") {
+        return None;
+    }
+    if m.starts_with("gemini-2.5-flash") {
+        return Some(json!({ "thinkingBudget": 0 }));
+    }
+    if m.starts_with("gemini-3") {
+        if m.contains("pro") {
+            return Some(json!({ "thinkingLevel": "low" }));
+        }
+        return Some(json!({ "thinkingLevel": "minimal" }));
+    }
+    Some(json!({ "thinkingLevel": "minimal" }))
+}
+
+fn generate_content_url(base_url: &str, model: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    format!("{trimmed}/models/{model}:generateContent")
+}
+
+fn stream_generate_content_url(base_url: &str, model: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    format!("{trimmed}/models/{model}:streamGenerateContent?alt=sse")
+}
+
+fn extract_assistant_content(body: &str) -> Result<String, LLMError> {
+    let json: Value = serde_json::from_str(body)
+        .map_err(|e| LLMError::ParseError(format!("not valid JSON: {}", e)))?;
+    let candidates = json
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| LLMError::ParseError("missing candidates array".into()))?;
+    let first = candidates
+        .first()
+        .ok_or_else(|| LLMError::ParseError("candidates array is empty".into()))?;
+    let parts = first
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| LLMError::ParseError("missing content.parts".into()))?;
+    // 把所有 part.text 拼起来。模型在 thinking on 时可能产出多段，但我们已禁
+    // 思考；仍按 array 处理是为了不被 future-proof 单 part vs 多 part 的差异坑到。
+    let mut buf = String::new();
+    for part in parts {
+        if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+            buf.push_str(t);
+        }
+    }
+    if buf.is_empty() {
+        return Err(LLMError::ParseError(
+            "candidates[0].content.parts[*].text 为空".into(),
+        ));
+    }
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_config_2_5_flash_disables_thinking_via_budget_zero() {
+        let v = thinking_config_for("gemini-2.5-flash").unwrap();
+        assert_eq!(v, json!({ "thinkingBudget": 0 }));
+        // flash-lite 同款
+        let v2 = thinking_config_for("gemini-2.5-flash-lite").unwrap();
+        assert_eq!(v2, json!({ "thinkingBudget": 0 }));
+    }
+
+    #[test]
+    fn thinking_config_2_5_pro_returns_none_because_cannot_disable() {
+        assert!(thinking_config_for("gemini-2.5-pro").is_none());
+    }
+
+    #[test]
+    fn thinking_config_3_x_pro_uses_low_thinking_level() {
+        let v = thinking_config_for("gemini-3.1-pro-preview").unwrap();
+        assert_eq!(v, json!({ "thinkingLevel": "low" }));
+    }
+
+    #[test]
+    fn thinking_config_3_x_flash_uses_minimal() {
+        let v = thinking_config_for("gemini-3-flash-preview").unwrap();
+        assert_eq!(v, json!({ "thinkingLevel": "minimal" }));
+        let v2 = thinking_config_for("gemini-3.1-flash-lite").unwrap();
+        assert_eq!(v2, json!({ "thinkingLevel": "minimal" }));
+    }
+
+    #[test]
+    fn thinking_config_unknown_falls_back_to_minimal_level() {
+        // 未来未知 ID 兜底到 minimal——尽量"关"，避免默认放出长思考。
+        let v = thinking_config_for("gemini-99-future-model").unwrap();
+        assert_eq!(v, json!({ "thinkingLevel": "minimal" }));
+    }
+
+    #[test]
+    fn thinking_config_never_emits_both_budget_and_level() {
+        // 不变量：任一返回值最多含 `thinkingBudget` 或 `thinkingLevel` 中的一个，
+        // 不能同发——文档没明示但属未定义行为，回归就立刻暴露。
+        for model in [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-99-future-model",
+        ] {
+            let v = thinking_config_for(model).unwrap();
+            let obj = v.as_object().unwrap();
+            let has_budget = obj.contains_key("thinkingBudget");
+            let has_level = obj.contains_key("thinkingLevel");
+            assert!(
+                has_budget ^ has_level,
+                "model {model} 同时下发 budget 与 level，违反单字段不变量: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_content_url_handles_trailing_slash_in_base_url() {
+        let a = generate_content_url("https://x/v1beta", "gemini-2.5-flash");
+        let b = generate_content_url("https://x/v1beta/", "gemini-2.5-flash");
+        assert_eq!(a, "https://x/v1beta/models/gemini-2.5-flash:generateContent");
+        assert_eq!(b, "https://x/v1beta/models/gemini-2.5-flash:generateContent");
+    }
+
+    #[test]
+    fn stream_generate_content_url_appends_alt_sse() {
+        let a = stream_generate_content_url("https://x/v1beta", "gemini-2.5-flash");
+        assert_eq!(
+            a,
+            "https://x/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn extract_assistant_content_concatenates_multiple_parts() {
+        let body = r#"{"candidates":[{"content":{"parts":[{"text":"hello "},{"text":"world"}]}}]}"#;
+        assert_eq!(extract_assistant_content(body).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn extract_assistant_content_empty_array_errors() {
+        let body = r#"{"candidates":[]}"#;
+        assert!(extract_assistant_content(body).is_err());
+    }
+
+    #[test]
+    fn build_polish_history_contents_orders_oldest_to_newest_and_uses_model_role() {
+        // prior_turns 入参约定 newest-first（与 polish.rs::build_polish_history_messages
+        // 同源约定）；这里反转为 chat 时间序 oldest-first 喂给 Gemini。
+        // assistant role 的 polished 历史必须挂在 Gemini 的 `model` role 上。
+        let prior = vec![
+            ("raw-newest".into(), "polished-newest".into()),
+            ("raw-mid".into(), "polished-mid".into()),
+            ("raw-oldest".into(), "polished-oldest".into()),
+        ];
+        let contents = build_polish_history_contents(&prior, "USER_NOW");
+        // 3×(user/model) + 1 当前 user = 7
+        assert_eq!(contents.len(), 7);
+        assert_eq!(contents[0]["role"], "user");
+        assert!(contents[0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("raw-oldest"));
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["text"], "polished-oldest");
+        assert_eq!(contents[5]["role"], "model");
+        assert_eq!(contents[5]["parts"][0]["text"], "polished-newest");
+        assert_eq!(contents[6]["role"], "user");
+        assert_eq!(contents[6]["parts"][0]["text"], "USER_NOW");
+    }
+
+    #[test]
+    fn qa_messages_assistant_role_is_remapped_to_model() {
+        let messages = vec![
+            QaChatMessage {
+                role: "user".into(),
+                content: "选区是什么意思".into(),
+            },
+            QaChatMessage {
+                role: "assistant".into(),
+                content: "这是一段示例文本".into(),
+            },
+            QaChatMessage {
+                role: "user".into(),
+                content: "继续问".into(),
+            },
+        ];
+        let contents = qa_messages_to_contents(&messages);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[2]["role"], "user");
+    }
+
+    #[test]
+    fn build_generate_body_2_5_flash_includes_thinking_budget_zero() {
+        let cfg = GeminiConfig::new("k", "gemini-2.5-flash", "https://x/v1beta");
+        let provider = GeminiProvider::new(cfg);
+        let body = provider.build_generate_body("SYS", vec![user_content("hi")]);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({ "thinkingBudget": 0 })
+        );
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
+        assert_eq!(body["contents"][0]["role"], "user");
+    }
+
+    #[test]
+    fn build_generate_body_2_5_pro_omits_thinking_config() {
+        let cfg = GeminiConfig::new("k", "gemini-2.5-pro", "https://x/v1beta");
+        let provider = GeminiProvider::new(cfg);
+        let body = provider.build_generate_body("SYS", vec![user_content("hi")]);
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "2.5 Pro 不能关思考，generationConfig 不应含 thinkingConfig 字段"
+        );
+    }
+
+    #[test]
+    fn build_generate_body_3_x_pro_emits_low_thinking_level() {
+        let cfg = GeminiConfig::new("k", "gemini-3.1-pro-preview", "https://x/v1beta");
+        let provider = GeminiProvider::new(cfg);
+        let body = provider.build_generate_body("SYS", vec![]);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({ "thinkingLevel": "low" })
+        );
+    }
+}
