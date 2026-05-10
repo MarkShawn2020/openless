@@ -279,7 +279,12 @@ impl GeminiProvider {
         }
 
         let mut response = response;
-        let mut buffer = String::new();
+        // 字节级缓冲——`reqwest::chunk()` 可能在多字节 UTF-8 字符（CJK / emoji）
+        // 中间切开，对每个 chunk 独立 from_utf8 会把合法的 SSE 流当成
+        // "non-utf8 SSE chunk" 直接 fail（PR #398 pr_agent 实测漏洞）。
+        // SSE 帧分隔符 `\n\n` 两字节都是 ASCII (0x0A)，永远不会落在多字节字符中部，
+        // 所以按字节定位完整 event、再对完整 event 做 from_utf8 永远安全。
+        let mut byte_buffer: Vec<u8> = Vec::new();
         let mut full_text = String::new();
         loop {
             // 与 polish.rs streaming 同款取消旗标——用户取消 / 关浮窗时立即 break，
@@ -293,13 +298,9 @@ impl GeminiProvider {
                 .await
                 .map_err(|e| LLMError::Network(e.to_string()))?;
             let Some(chunk) = chunk_opt else { break };
-            let s = std::str::from_utf8(&chunk)
-                .map_err(|e| LLMError::Network(format!("non-utf8 SSE chunk: {e}")))?;
-            buffer.push_str(s);
+            byte_buffer.extend_from_slice(&chunk);
 
-            while let Some(idx) = buffer.find("\n\n") {
-                let event = buffer[..idx].to_string();
-                buffer.drain(..idx + 2);
+            for event in drain_complete_sse_events(&mut byte_buffer) {
                 for line in event.lines() {
                     let Some(payload) = line
                         .strip_prefix("data: ")
@@ -363,6 +364,38 @@ fn model_content(text: &str) -> Value {
 
 fn system_instruction(system_prompt: &str) -> Value {
     json!({ "parts": [{ "text": system_prompt }] })
+}
+
+/// 从字节缓冲里取出所有以 `\n\n` 分隔的完整 SSE event；剩余不完整字节留在
+/// buffer 里等下一次 chunk 拼接。
+///
+/// 不变量：分隔符 `\n\n` 两字节都是 ASCII (0x0A)，永远不会出现在 UTF-8 多字节
+/// 字符的中部位置，所以
+/// 1. 按字节查找分隔符 100% 安全；
+/// 2. 对完整 event 字节区间 (event_start..delim_start) 做 from_utf8 永远不会因
+///    chunk 边界把多字节字符切开而失败。
+///
+/// 这是 PR #398 pr_agent 指出的 UTF-8 SSE 漏洞的修法：原代码对每个网络 chunk
+/// 独立 from_utf8，遇到 CJK / emoji 跨 chunk 切分时直接报错让流挂掉。
+fn drain_complete_sse_events(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut events = Vec::new();
+    while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
+        // event_content = buffer[..end]; delimiter = buffer[end..end+2]
+        let event_str = match std::str::from_utf8(&buffer[..end]) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                // 完整 event 自身 UTF-8 不合法（极少见，可能是上游异常）：丢弃此 event 不让流挂掉。
+                log::warn!(
+                    "[llm] gemini SSE event has invalid UTF-8 (skipping): {e}"
+                );
+                buffer.drain(..end + 2);
+                continue;
+            }
+        };
+        events.push(event_str);
+        buffer.drain(..end + 2);
+    }
+    events
 }
 
 /// 多轮 polish 的 contents 序列。
@@ -622,6 +655,56 @@ mod tests {
             body["generationConfig"].get("thinkingConfig").is_none(),
             "2.5 Pro 不能关思考，generationConfig 不应含 thinkingConfig 字段"
         );
+    }
+
+    #[test]
+    fn drain_complete_sse_events_splits_full_event_at_delimiter() {
+        let mut buf = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: incompl".to_vec();
+        let events = drain_complete_sse_events(&mut buf);
+        assert_eq!(events, vec!["data: {\"a\":1}", "data: {\"b\":2}"]);
+        // 不完整的最后一段保留在 buffer 里等下次 chunk 拼接
+        assert_eq!(buf, b"data: incompl");
+    }
+
+    #[test]
+    fn drain_complete_sse_events_handles_multibyte_split_across_chunks() {
+        // 回归 PR #398 pr_agent UTF-8 SSE 漏洞：
+        // "你好" 的 UTF-8 字节是 e4 bd a0 e5 a5 bd（共 6 字节）。
+        // 模拟 reqwest::chunk() 把这段切在 e4 bd 后（即第一个汉字的 1/3 处），
+        // 旧代码立刻 from_utf8(&chunk) 报错让整条流挂掉；新代码累积字节直到拿到
+        // 完整 event (\n\n) 才解码，应当无损。
+        let event_bytes = b"data: {\"text\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}\n\n";
+        let cut = 17; // 切在 e4 bd 之后、a0 之前——多字节字符内部
+        assert!(cut < event_bytes.len() && event_bytes[cut] == 0xa0);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&event_bytes[..cut]);
+        let events_round_1 = drain_complete_sse_events(&mut buf);
+        assert!(
+            events_round_1.is_empty(),
+            "尚未收到 \\n\\n，不能产生 event；同时 buffer 不应因半截多字节字符报错"
+        );
+
+        buf.extend_from_slice(&event_bytes[cut..]);
+        let events_round_2 = drain_complete_sse_events(&mut buf);
+        assert_eq!(events_round_2.len(), 1, "拼齐后应产生 1 个完整 event");
+        assert!(
+            events_round_2[0].contains("你好"),
+            "中文必须在拼齐后完好解出；旧实现这里会丢字"
+        );
+        assert!(buf.is_empty(), "处理完后 buffer 应清空");
+    }
+
+    #[test]
+    fn drain_complete_sse_events_skips_invalid_utf8_event_without_failing_stream() {
+        // 极端情况：完整 event 自身字节序列就 UTF-8 不合法（上游脏数据）。
+        // 旧实现会 ? 直接 fail 让流挂掉；新实现降级为 warn + skip。
+        let mut buf: Vec<u8> = b"data: ok\n\n".to_vec();
+        buf.extend_from_slice(&[0xff, 0xfe, b'\n', b'\n']); // 不合法 event
+        buf.extend_from_slice(b"data: ok2\n\n");
+        let events = drain_complete_sse_events(&mut buf);
+        assert_eq!(events, vec!["data: ok", "data: ok2"]);
+        assert!(buf.is_empty());
     }
 
     #[test]
