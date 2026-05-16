@@ -2101,10 +2101,14 @@ pub mod prompts {
     /// LLM 自己理解（"繁体中文"/"English"/"美式英文"/"日本語" 都行）。
     /// 此 prompt 之上还有 working_languages_premise 拼出的"# 上下文"前提。
     ///
-    /// 当 target_language == "English" 时再拼一段 EN 专用补丁（ASR 纠错优先 + 技术词中→英规范化表
-    /// + 自然英文，不要 Chinglish）。来源：社区贡献的「重写为英文」prompt。
+    /// target_language == "English"（含 "美式英文" / "英文" / "english" 等别名）时整段切到
+    /// EN_TRANSLATE_SYSTEM_PROMPT —— 不再走通用 base，避免通用规则与 EN 专属的「ASR 纠错优先
+    /// + 中→英技术词规范化」相互稀释。来源：社区「重写为英文」prompt，精简整合后整体注入。
     pub fn translate_system_prompt(target_language: &str) -> String {
-        let base = format!(
+        if is_english_target(target_language) {
+            return EN_TRANSLATE_SYSTEM_PROMPT.to_string();
+        }
+        format!(
             "# 任务（翻译输出）\n\
              把下面收到的一段语音转写翻译成 \u{300C}{lang}\u{300D}。\n\
              这是用户对着语音输入工具说的话——他正在某个 app 的输入框前，\
@@ -2136,18 +2140,12 @@ pub mod prompts {
              只输出翻译后的正文，\u{4E0D}带 \u{300C}翻译：\u{300D}\u{300C}译文：\u{300D}\u{300C}Translation:\u{300D}之类前缀，\
              \u{4E0D}加引号、\u{4E0D}加 markdown 围栏。",
             lang = target_language
-        );
-
-        if is_english_target(target_language) {
-            format!("{base}\n\n{EN_TRANSLATE_EXTRA}")
-        } else {
-            base
-        }
+        )
     }
 
     /// target_language 是否指向英语 —— 容忍用户在偏好里写 "English" / "english" / "美式英文" /
-    /// "英文" / "British English" 等几种写法。匹配松一点没坏处：误命中只会让模型多收到一段
-    /// "保 ASR 纠错 + 技术词标准化" 的英文指引，对其它语言无副作用。
+    /// "英文" / "British English" 等几种写法。匹配松一点没坏处：误命中只会让模型走 EN 专属
+    /// prompt，对纯中文 / 日文等目标本来就不会被选中。
     fn is_english_target(target_language: &str) -> bool {
         let trimmed = target_language.trim();
         if trimmed.is_empty() {
@@ -2160,44 +2158,81 @@ pub mod prompts {
         trimmed.contains("英文") || trimmed.contains("英語") || trimmed.contains("英语")
     }
 
-    /// 英文翻译追加段（仅在 target_language == English 时拼到 base 末尾）。
-    /// 设计原则：不重复 base 已说过的规则；只补 EN 专属的 ASR 纠错优先 + 中→英技术词规范化表
-    /// + Chinglish 拦截。来源：社区「重写为英文」prompt。
-    const EN_TRANSLATE_EXTRA: &str = "# English translation — extra guidance\n\
-        Input is raw ASR output of Chinese tech talk. Treat it as **likely noisy**: \
-        homophone slips, mis-segmentation, transliterated English terms. \
-        Correct silently, then translate the *intended* meaning — do not faithfully \
-        translate obvious recognition errors.\n\
+    /// 中→英专用 system prompt（target_language 命中 English 时整段替换通用 base）。
+    /// 设计原则：
+    /// - 自包含、无前置 base —— 这就是 LLM 收到的全部任务说明。
+    /// - 中文骨架方便描述中文 ASR 错误模式 + 中→英术语表（来源就是中文转写）。
+    /// - 比通用翻译 prompt 更窄、更强：ASR 纠错优先于逐字翻译；英文要求自然 idiomatic，
+    ///   不接受 Chinglish 直译。
+    /// - 来源：社区「重写为英文」prompt（imported.573e86a1bcf44dbb...），整合精简后注入。
+    const EN_TRANSLATE_SYSTEM_PROMPT: &str = "# 任务（中文转写 → 英文翻译）\n\
+        你是一名中译英助手，专门处理语音识别（ASR）后的中文技术文本。\n\
+        用户的转写不是可靠原文：可能有错别字、同音字、近音字、断句缺失、术语误识别、\
+        英文术语被中文音译。**你的任务不是逐字翻译，而是先理解用户真实意图，纠正显然的识别错误，\
+        再把修复后的意思翻译成自然、准确、专业的英文**。\
+        结果会被直接插入用户当前 app 的光标位置。\n\
         \n\
-        ## Correct-then-translate priority\n\
-        - High confidence (wrong term is clearly a misrecognition with one obvious fix) → silently replace.\n\
-        - Mid confidence (term doesn't fit context but a likely candidate exists) → replace with the candidate.\n\
-        - Low confidence (cannot determine intent) → keep the source word; do **not** invent fields, URLs, paths or steps.\n\
+        # 工作流程（顺序不可换）\n\
+        1. 判断转写里是否存在 ASR 错误或语义异常。\n\
+        2. 把明显不合理 / 不符合上下文的词按下方分级策略修正。\n\
+        3. 把中文音译还原为标准英文技术术语。\n\
+        4. 整理混乱、口语化或重复的表达。\n\
+        5. 在不改变用户真实意图的前提下，翻译成自然、专业的英文。\n\
+        6. **只输出最终英文译文**。\n\
         \n\
-        ## Chinese tech-term → English normalization\n\
+        # ASR 纠错（按置信度分级）\n\
+        - 高置信度（错误明显、正确写法唯一）→ 直接替换，不保留原词、不加说明。\n\
+        - 中置信度（原词在当前主题下不合理，存在最可能候选）→ 选最契合上下文的候选替换。\n\
+        - 低置信度（无法判断正确词）→ 保留原词，\u{4E0D}强行编造不存在的字段、链接、路径或步骤。\n\
+        - 忠实的是用户**意图**，不是 ASR 产生的错误文本。\n\
+        \n\
+        # 中→英术语规范化（必须按右侧写法输出）\n\
         - 令牌 / 脱肯 / 拓肯 → Token；访问令牌 → Access Token；刷新令牌 → Refresh Token。\n\
         - 密钥 / 西克瑞特 key / 思可瑞特 → Secret Key；访问密钥 → Access Key。\n\
         - 阿屁艾 → API；应用 ID / APP ID / app id → App ID；服务 ID → Service ID；模型 ID → Model ID。\n\
-        - 端点 → Endpoint；网关 → Gateway；钩子 → Webhook。\n\
-        - 鉴权 → authentication；鉴权失败 → authentication failure；调用接口 → call the API；\
-        请求头 → request header；调用额度 → quota / available quota；生成结果 → generated output；\
-        前端 / 前端代码 → front-end / front-end code；后端 → back-end；公开文档 → public documentation。\n\
-        - Model / product names: 克劳德 / 克劳迪 → Claude；双子座 / 杰米尼 / 极米利 → Gemini；\
-        卡布奇诺 / 卡布西诺 → Cappuccino；实习生 / 英特恩 → InternS or InternLM (pick by suffix and context).\n\
+        - 端点 → Endpoint；网关 → Gateway；钩子 → Webhook；接口 → API；调用接口 → call the API；\
+        请求头 → request header；请求头中携带 Token → include the Token in the request header；\
+        鉴权 → authentication；鉴权失败 → authentication failure；调用额度 → quota / available quota；\
+        生成结果 → generated output；前端 / 前端代码 → front-end / front-end code；\
+        后端 → back-end；公开文档 → public documentation；代码仓 → repository / repo。\n\
+        - 模型 / 产品名（按上下文判断）：克劳德 / 克劳迪 → Claude；双子座 / 杰米尼 / 极米利 → Gemini；\
+        卡布奇诺 / 卡布西诺 → Cappuccino；实习生 / 英特恩 → InternS or InternLM（按后缀和上下文判断）；\
+        阿里 Panda / 科德 / 卡德 / Coda → Coder（AI IDE / Agent 开发语境）；\
+        熊猫 / 浪猫 → LongCat（LongCat 平台 / 模型语境）。\n\
         \n\
-        ## Natural English, not Chinglish\n\
-        - Idiomatic, professional, concise. **Avoid literal word-for-word renders** that read like a textbook gloss.\n\
-        - Acronyms (API, SDK, JWT, OAuth, JSON, HTTP, URL, SSE, MCP, CLI, PR, CI/CD) stay uppercase, no expansion.\n\
-        - Tech operations get crisp imperative or declarative English — turn step-by-step Chinese spoken instructions \
-        into clean English steps (\"先调 X 再回 Y\" → \"first call X, then return Y\").\n\
-        - Code identifiers, commands, file paths, env vars, URL segments, config keys, booleans `true / false / null`, \
-        and full version strings (GPT-5.6, Claude 4.7, Gemini 3.5, iOS 26.1) must stay byte-for-byte identical.\n\
+        # 翻译要求\n\
+        - 英文必须**自然、准确、专业**，避免中式英语（Chinglish）和生硬直译。\n\
+        - 技术文档语气简洁、清晰、可执行；操作步骤整理为干净的英文步骤或段落。\n\
+        - 保持原说话语气：口语场景维持口语化，正式场景维持正式；不擅自正式化或扩写。\n\
+        - 数字、日期、时间用英语地区常见写法：\"5月1日下午两点\" → \"May 1, 2 PM\"；\
+        \"明天上午十点\" → \"tomorrow at 10 AM\"。\n\
+        - 转写已经是英文时：去明显口癖（um / you know / like）+ 补必要标点，\u{4E0D}做风格改写。\n\
         \n\
-        ## Forbidden in English output\n\
-        - Don't translate clearly broken ASR text literally.\n\
-        - Don't emit Chinese polished text alongside the English translation.\n\
-        - Don't add explanations, change logs, or before/after comparisons.\n\
-        - Don't add information the speaker never said.";
+        # 原样保留（byte-for-byte，不翻译）\n\
+        - 代码标识符、Bash 命令、文件路径、环境变量、URL 路径段、配置 key、JSON 字段名、接口名。\n\
+        - 布尔值 `true / false / null`；不要改成 \"开启\" / \"开\" / \"2\"。\n\
+        - 完整版本号：GPT-5.6、Claude 4.7、Gemini 3.5、iOS 26.1、Python 3.13、Tauri 2.10 —— \
+        \u{4E0D}简写成 GPT-5、Claude 4、Gemini 3。\n\
+        - 缩略语 API / SDK / JWT / OAuth / JSON / HTTP / URL / SSE / MCP / CLI / PR / CI / CD / \
+        SOTA / MoE / FP8 / RLHF 全部大写，不展开成中文 / 全称。\n\
+        - 人名、地名、品牌名、emoji。\n\
+        - 例外：转写词是 # 热词列表中某词的同音 / 形近误识别时，按热词列表里的正确写法输出。\n\
+        \n\
+        # 边界 case\n\
+        - 转写非常短（一两个字）也照译，\u{4E0D}因为短就硬补内容。\n\
+        - 转写是命令式（\"加个空格 / 删除最后一行\"）时，照原意翻译为英文命令式，\u{4E0D}改成陈述句。\n\
+        - 转写全是 fillers（\"嗯嗯啊那个\"）时，输出空字符串。\n\
+        \n\
+        # 禁止\n\
+        1. \u{4E0D}得逐字翻译明显错误的 ASR 文本。\n\
+        2. \u{4E0D}得输出中文（不要给出中文润色稿、对比表、原文回显）。\n\
+        3. \u{4E0D}得输出解释、修改说明、change log、思路过程。\n\
+        4. \u{4E0D}得为了流畅而删减重要信息，也\u{4E0D}得添加用户未表达过的新事实、链接、路径、字段、步骤。\n\
+        5. \u{4E0D}得改变用户真实意图。\n\
+        \n\
+        # 输出\n\
+        只输出最终英文译文。\u{4E0D}带 \u{300C}翻译：\u{300D}\u{300C}译文：\u{300D}\u{300C}Translation:\u{300D}\
+        \u{4E4B}\u{7C7B}前缀，\u{4E0D}加引号、\u{4E0D}加 markdown 围栏、\u{4E0D}加代码 fence。";
 }
 
 #[cfg(test)]
@@ -2871,30 +2906,34 @@ mod tests {
     }
 
     #[test]
-    fn translate_prompt_appends_en_extras_only_for_english() {
+    fn translate_prompt_swaps_to_en_dedicated_when_target_is_english() {
+        // 英文目标：整段切到 EN_TRANSLATE_SYSTEM_PROMPT，不再带通用 base 的 \"# 任务（翻译输出）\" 标题。
         let en = prompts::translate_system_prompt("English");
-        assert!(en.contains("# 任务（翻译输出）"), "base block missing for English");
-        assert!(
-            en.contains("# English translation — extra guidance"),
-            "English target should append EN-extra block"
-        );
+        assert!(en.contains("# 任务（中文转写 → 英文翻译）"), "English target 必须使用 EN 专用 prompt");
+        assert!(!en.contains("# 任务（翻译输出）"), "English target 不应再带通用 base 标题");
+        assert!(en.contains("# 工作流程"));
+        assert!(en.contains("# 中→英术语规范化"));
+        assert!(en.contains("# 翻译要求"));
+        assert!(en.contains("# 禁止"));
         assert!(en.contains("Secret Key"));
         assert!(en.contains("App ID"));
         assert!(en.contains("authentication failure"));
+        assert!(en.contains("Chinglish"));
 
+        // 非英文目标：仍走通用 base，不应包含 EN 专用 prompt 的任何独占段。
         let zh_tw = prompts::translate_system_prompt("繁体中文");
         assert!(zh_tw.contains("# 任务（翻译输出）"));
         assert!(
-            !zh_tw.contains("# English translation — extra guidance"),
-            "non-English target should not get EN-extra block"
+            !zh_tw.contains("# 任务（中文转写 → 英文翻译）"),
+            "非英文目标不应误用 EN 专用 prompt"
         );
 
-        // 别名容忍：'美式英文' / '英语' / 'english' 等也算 English。
+        // 别名容忍：'美式英文' / '英文' / 'english' / 'British English' 都走 EN 专用 prompt。
         for alias in ["美式英文", "英文", "english", "British English"] {
             assert!(
                 prompts::translate_system_prompt(alias)
-                    .contains("# English translation — extra guidance"),
-                "alias '{alias}' should match English"
+                    .contains("# 任务（中文转写 → 英文翻译）"),
+                "alias '{alias}' should resolve to English target"
             );
         }
     }
