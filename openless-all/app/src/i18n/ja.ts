@@ -121,6 +121,10 @@ export const ja: typeof zhCN = {
         withdraw: '取り下げ',
       },
       loadFailed: '自分の公開の読み込みに失敗：{{err}}',
+      loadingTitle: '読み込み中…',
+      loadingHint: 'マーケットからあなたの最新公開を取得しています。',
+      loadErrorTitle: '読み込み失敗',
+      loadErrorRetry: '再試行',
     },
     upload: {
       confirmBtn: 'アップロード確定',

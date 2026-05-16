@@ -2100,8 +2100,11 @@ pub mod prompts {
     /// 翻译模式 system prompt — 用户在「翻译」页选定的目标语言（内置 15 种自然语言原生名）。
     /// LLM 自己理解（"繁体中文"/"English"/"美式英文"/"日本語" 都行）。
     /// 此 prompt 之上还有 working_languages_premise 拼出的"# 上下文"前提。
+    ///
+    /// 当 target_language == "English" 时再拼一段 EN 专用补丁（ASR 纠错优先 + 技术词中→英规范化表
+    /// + 自然英文，不要 Chinglish）。来源：社区贡献的「重写为英文」prompt。
     pub fn translate_system_prompt(target_language: &str) -> String {
-        format!(
+        let base = format!(
             "# 任务（翻译输出）\n\
              把下面收到的一段语音转写翻译成 \u{300C}{lang}\u{300D}。\n\
              这是用户对着语音输入工具说的话——他正在某个 app 的输入框前，\
@@ -2133,8 +2136,68 @@ pub mod prompts {
              只输出翻译后的正文，\u{4E0D}带 \u{300C}翻译：\u{300D}\u{300C}译文：\u{300D}\u{300C}Translation:\u{300D}之类前缀，\
              \u{4E0D}加引号、\u{4E0D}加 markdown 围栏。",
             lang = target_language
-        )
+        );
+
+        if is_english_target(target_language) {
+            format!("{base}\n\n{EN_TRANSLATE_EXTRA}")
+        } else {
+            base
+        }
     }
+
+    /// target_language 是否指向英语 —— 容忍用户在偏好里写 "English" / "english" / "美式英文" /
+    /// "英文" / "British English" 等几种写法。匹配松一点没坏处：误命中只会让模型多收到一段
+    /// "保 ASR 纠错 + 技术词标准化" 的英文指引，对其它语言无副作用。
+    fn is_english_target(target_language: &str) -> bool {
+        let trimmed = target_language.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("english") {
+            return true;
+        }
+        trimmed.contains("英文") || trimmed.contains("英語") || trimmed.contains("英语")
+    }
+
+    /// 英文翻译追加段（仅在 target_language == English 时拼到 base 末尾）。
+    /// 设计原则：不重复 base 已说过的规则；只补 EN 专属的 ASR 纠错优先 + 中→英技术词规范化表
+    /// + Chinglish 拦截。来源：社区「重写为英文」prompt。
+    const EN_TRANSLATE_EXTRA: &str = "# English translation — extra guidance\n\
+        Input is raw ASR output of Chinese tech talk. Treat it as **likely noisy**: \
+        homophone slips, mis-segmentation, transliterated English terms. \
+        Correct silently, then translate the *intended* meaning — do not faithfully \
+        translate obvious recognition errors.\n\
+        \n\
+        ## Correct-then-translate priority\n\
+        - High confidence (wrong term is clearly a misrecognition with one obvious fix) → silently replace.\n\
+        - Mid confidence (term doesn't fit context but a likely candidate exists) → replace with the candidate.\n\
+        - Low confidence (cannot determine intent) → keep the source word; do **not** invent fields, URLs, paths or steps.\n\
+        \n\
+        ## Chinese tech-term → English normalization\n\
+        - 令牌 / 脱肯 / 拓肯 → Token；访问令牌 → Access Token；刷新令牌 → Refresh Token。\n\
+        - 密钥 / 西克瑞特 key / 思可瑞特 → Secret Key；访问密钥 → Access Key。\n\
+        - 阿屁艾 → API；应用 ID / APP ID / app id → App ID；服务 ID → Service ID；模型 ID → Model ID。\n\
+        - 端点 → Endpoint；网关 → Gateway；钩子 → Webhook。\n\
+        - 鉴权 → authentication；鉴权失败 → authentication failure；调用接口 → call the API；\
+        请求头 → request header；调用额度 → quota / available quota；生成结果 → generated output；\
+        前端 / 前端代码 → front-end / front-end code；后端 → back-end；公开文档 → public documentation。\n\
+        - Model / product names: 克劳德 / 克劳迪 → Claude；双子座 / 杰米尼 / 极米利 → Gemini；\
+        卡布奇诺 / 卡布西诺 → Cappuccino；实习生 / 英特恩 → InternS or InternLM (pick by suffix and context).\n\
+        \n\
+        ## Natural English, not Chinglish\n\
+        - Idiomatic, professional, concise. **Avoid literal word-for-word renders** that read like a textbook gloss.\n\
+        - Acronyms (API, SDK, JWT, OAuth, JSON, HTTP, URL, SSE, MCP, CLI, PR, CI/CD) stay uppercase, no expansion.\n\
+        - Tech operations get crisp imperative or declarative English — turn step-by-step Chinese spoken instructions \
+        into clean English steps (\"先调 X 再回 Y\" → \"first call X, then return Y\").\n\
+        - Code identifiers, commands, file paths, env vars, URL segments, config keys, booleans `true / false / null`, \
+        and full version strings (GPT-5.6, Claude 4.7, Gemini 3.5, iOS 26.1) must stay byte-for-byte identical.\n\
+        \n\
+        ## Forbidden in English output\n\
+        - Don't translate clearly broken ASR text literally.\n\
+        - Don't emit Chinese polished text alongside the English translation.\n\
+        - Don't add explanations, change logs, or before/after comparisons.\n\
+        - Don't add information the speaker never said.";
 }
 
 #[cfg(test)]
@@ -2803,6 +2866,35 @@ mod tests {
             assert!(
                 prompt.contains("**高置信度**") && prompt.contains("**低置信度**"),
                 "{mode:?} prompt 缺少分级置信度策略"
+            );
+        }
+    }
+
+    #[test]
+    fn translate_prompt_appends_en_extras_only_for_english() {
+        let en = prompts::translate_system_prompt("English");
+        assert!(en.contains("# 任务（翻译输出）"), "base block missing for English");
+        assert!(
+            en.contains("# English translation — extra guidance"),
+            "English target should append EN-extra block"
+        );
+        assert!(en.contains("Secret Key"));
+        assert!(en.contains("App ID"));
+        assert!(en.contains("authentication failure"));
+
+        let zh_tw = prompts::translate_system_prompt("繁体中文");
+        assert!(zh_tw.contains("# 任务（翻译输出）"));
+        assert!(
+            !zh_tw.contains("# English translation — extra guidance"),
+            "non-English target should not get EN-extra block"
+        );
+
+        // 别名容忍：'美式英文' / '英语' / 'english' 等也算 English。
+        for alias in ["美式英文", "英文", "english", "British English"] {
+            assert!(
+                prompts::translate_system_prompt(alias)
+                    .contains("# English translation — extra guidance"),
+                "alias '{alias}' should match English"
             );
         }
     }

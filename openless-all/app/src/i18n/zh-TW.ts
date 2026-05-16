@@ -119,6 +119,10 @@ export const zhTW: typeof zhCN = {
         withdraw: '下架',
       },
       loadFailed: '我的發布載入失敗：{{err}}',
+      loadingTitle: '正在拉取，請稍後…',
+      loadingHint: '從風格市場獲取你最新發布的風格包。',
+      loadErrorTitle: '載入失敗',
+      loadErrorRetry: '重試',
     },
     upload: {
       confirmBtn: '確定上傳',

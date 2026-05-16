@@ -119,6 +119,10 @@ export const en: typeof zhCN = {
         withdraw: 'Withdraw',
       },
       loadFailed: 'Failed to load my packs: {{err}}',
+      loadingTitle: 'Loading…',
+      loadingHint: 'Fetching your latest publications from the marketplace.',
+      loadErrorTitle: 'Load failed',
+      loadErrorRetry: 'Retry',
     },
     upload: {
       confirmBtn: 'Confirm upload',

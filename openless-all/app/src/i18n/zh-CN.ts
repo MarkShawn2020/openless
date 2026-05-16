@@ -117,6 +117,10 @@ export const zhCN = {
         withdraw: '下架',
       },
       loadFailed: '我的发布加载失败：{{err}}',
+      loadingTitle: '正在拉取，请稍后…',
+      loadingHint: '从风格市场获取你最新发布的风格包。',
+      loadErrorTitle: '加载失败',
+      loadErrorRetry: '重试',
     },
     upload: {
       confirmBtn: '确定上传',

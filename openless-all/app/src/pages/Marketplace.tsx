@@ -85,8 +85,11 @@ export function Marketplace() {
   // （不与外层 marketplace 搜索 query 互相干扰）。
   const [showMyPacks, setShowMyPacks] = useState(false);
   const [myPacksQuery, setMyPacksQuery] = useState('');
-  // 弹框内已下架包 5 分钟自动消失：tick 每 30s 一次，让 visibleMyPacks 重新计算。
-  const [nowTick, setNowTick] = useState(() => Date.now());
+  // 加载/错误三态：loading（首次拉取或重试时）、error（HTTP 失败 / 解析失败）、success（默认）。
+  // 旧版只有 success 状态 + toast，导致：拉取中显示「你还没有发布过风格包」误导用户；
+  // 失败后只弹 toast，没有 inline 重试入口。
+  const [myPacksLoading, setMyPacksLoading] = useState(false);
+  const [myPacksError, setMyPacksError] = useState<string | null>(null);
   // GitHub OAuth Device Flow 状态。点登录 chip → 'starting' → 'pending'（展示 user_code 等待
   // 用户在浏览器授权）→ 'success'（自动保存 marketplaceDevLogin）/ 'error'。
   type OAuthPhase =
@@ -145,21 +148,20 @@ export function Marketplace() {
   }, [items, sort, likedIds]);
 
   const visibleMyPacks = useMemo(() => {
-    // 已下架超过 5 分钟自动隐藏 —— 让用户看到「下架成功」反馈但不长期占位。
-    const WITHDRAWN_VISIBLE_MS = 5 * 60 * 1000;
-    const withdrawnCutoff = nowTick - WITHDRAWN_VISIBLE_MS;
+    // 立刻隐藏 withdrawn / superseded：
+    // - withdrawn：用户已主动下架，留 5 分钟窗口反而让计数对不上（用户原报告：发布 1 个、显示 2 个）。
+    //   下架的反馈通过 actionMsg toast 给即可。
+    // - superseded：新版上架后旧版的服务端 state，对用户来说该旧版本已经"被替换"，
+    //   不应再算进「我的发布」当前在线列表。
     const q = myPacksQuery.trim().toLowerCase();
     return myPacks.filter(pack => {
-      if (pack.state === 'withdrawn') {
-        const updatedAt = Date.parse(pack.updatedAt);
-        if (Number.isFinite(updatedAt) && updatedAt < withdrawnCutoff) return false;
-      }
+      if (pack.state === 'withdrawn' || pack.state === 'superseded') return false;
       if (!q) return true;
       return pack.name.toLowerCase().includes(q)
         || pack.description.toLowerCase().includes(q)
         || pack.tags.some(tag => tag.toLowerCase().includes(q));
     });
-  }, [myPacks, myPacksQuery, nowTick]);
+  }, [myPacks, myPacksQuery]);
 
   useEffect(() => {
     void refresh();
@@ -182,16 +184,25 @@ export function Marketplace() {
   const refreshMyPacks = useCallback(async () => {
     if (!currentLogin) {
       setMyPacks([]);
+      setMyPacksLoading(false);
+      setMyPacksError(null);
       return;
     }
+    setMyPacksLoading(true);
+    setMyPacksError(null);
     try {
       const packs = await marketplaceMyPacks();
       setMyPacks(packs);
     } catch (error) {
       console.warn('[marketplace] fetch my-packs failed', error);
-      setActionMsg({ kind: 'err', text: t('marketplace.myPacks.loadFailed', { err: errorMessage(error) }) });
+      const msg = errorMessage(error);
+      setMyPacksError(msg);
+      // 仍然弹 toast，行为兼容；inline error 让用户在弹框里能直接重试。
+      setActionMsg({ kind: 'err', text: t('marketplace.myPacks.loadFailed', { err: msg }) });
+    } finally {
+      setMyPacksLoading(false);
     }
-  }, [currentLogin]);
+  }, [currentLogin, t]);
 
   useEffect(() => {
     void refreshMyPacks();
@@ -203,14 +214,6 @@ export function Marketplace() {
       void refreshMyPacks();
     }
   }, [showMyPacks, currentLogin, refreshMyPacks]);
-
-  // 弹框打开期间 tick 时间，让已下架自动消失定时生效。
-  useEffect(() => {
-    if (!showMyPacks) return;
-    setNowTick(Date.now());
-    const id = window.setInterval(() => setNowTick(Date.now()), 30_000);
-    return () => window.clearInterval(id);
-  }, [showMyPacks]);
 
   const openDetail = async (id: string) => {
     const seq = ++detailSeqRef.current;
@@ -977,19 +980,21 @@ export function Marketplace() {
             </button>
           </div>
 
-          {/* 第二行：计数信息（左）+ 刷新 + 上传（右）*/}
+          {/* 第二行：计数信息（左）+ 刷新 + 上传（右）。计数走 visibleMyPacks（已剔除
+              withdrawn / superseded），跟列表里看到的卡片数对得上。 */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 12 }}>
             <div style={{ fontSize: 11.5, color: 'var(--ol-ink-3)' }}>
               {(() => {
                 if (!currentLogin) return t('marketplace.myPacks.notLoggedIn');
-                const pendingCount = myPacks.filter(p => p.state === 'pending').length;
+                const activeCount = visibleMyPacks.length;
+                const pendingCount = visibleMyPacks.filter(p => p.state === 'pending').length;
                 return pendingCount > 0
-                  ? t('marketplace.myPacks.summaryPending', { count: myPacks.length, pending: pendingCount })
-                  : t('marketplace.myPacks.summary', { count: myPacks.length });
+                  ? t('marketplace.myPacks.summaryPending', { count: activeCount, pending: pendingCount })
+                  : t('marketplace.myPacks.summary', { count: activeCount });
               })()}
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
-              <Btn icon="refresh" variant="ghost" size="sm" onClick={() => void refreshMyPacks()} disabled={!currentLogin}>
+              <Btn icon="refresh" variant="ghost" size="sm" onClick={() => void refreshMyPacks()} disabled={!currentLogin || myPacksLoading}>
                 {t('common.refresh')}
               </Btn>
               <span title={canUpload ? '' : t('marketplace.uploadDisabledHint')}>
@@ -1000,21 +1005,57 @@ export function Marketplace() {
             </div>
           </div>
 
-          {/* 包列表 */}
-          {visibleMyPacks.length === 0 ? (
-            <div style={{ padding: '32px 12px', textAlign: 'center' }}>
-              <div style={{ fontSize: 13, color: 'var(--ol-ink-3)', marginBottom: 6 }}>
-                {currentLogin
-                  ? (myPacks.length === 0 ? t('marketplace.myPacks.emptyTitle') : t('marketplace.myPacks.noMatch'))
-                  : t('marketplace.myPacks.notLoggedIn')}
-              </div>
-              {currentLogin && myPacks.length === 0 && (
-                <div style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>
-                  {t('marketplace.myPacks.emptyHint')}
+          {/* 包列表。四态：loading（首次拉取/重试中）→ error（HTTP 失败 + inline 重试）
+              → empty（无包/无匹配）→ list。loading 优先级最高，让用户清楚知道在拉数据；
+              error 单独成块带「重试」按钮，比 toast 更稳定可达。 */}
+          {(() => {
+            const hasLoadedAny = visibleMyPacks.length > 0 || myPacks.length > 0;
+            if (myPacksLoading && !hasLoadedAny) {
+              return (
+                <div style={{ padding: '32px 12px', textAlign: 'center' }}>
+                  <div style={{ fontSize: 13, color: 'var(--ol-ink-3)', marginBottom: 6 }}>
+                    {t('marketplace.myPacks.loadingTitle')}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>
+                    {t('marketplace.myPacks.loadingHint')}
+                  </div>
                 </div>
-              )}
-            </div>
-          ) : (
+              );
+            }
+            if (myPacksError && !hasLoadedAny) {
+              return (
+                <div style={{ padding: '24px 12px', textAlign: 'center' }}>
+                  <div style={{ fontSize: 13, color: 'var(--ol-red, #ef4444)', marginBottom: 8 }}>
+                    {t('marketplace.myPacks.loadErrorTitle')}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginBottom: 12, wordBreak: 'break-word' }}>
+                    {myPacksError}
+                  </div>
+                  <Btn variant="blue" size="sm" onClick={() => void refreshMyPacks()}>
+                    {t('marketplace.myPacks.loadErrorRetry')}
+                  </Btn>
+                </div>
+              );
+            }
+            if (visibleMyPacks.length === 0) {
+              return (
+                <div style={{ padding: '32px 12px', textAlign: 'center' }}>
+                  <div style={{ fontSize: 13, color: 'var(--ol-ink-3)', marginBottom: 6 }}>
+                    {currentLogin
+                      ? (myPacks.length === 0 ? t('marketplace.myPacks.emptyTitle') : t('marketplace.myPacks.noMatch'))
+                      : t('marketplace.myPacks.notLoggedIn')}
+                  </div>
+                  {currentLogin && myPacks.length === 0 && (
+                    <div style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>
+                      {t('marketplace.myPacks.emptyHint')}
+                    </div>
+                  )}
+                </div>
+              );
+            }
+            return null;
+          })()}
+          {visibleMyPacks.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               {visibleMyPacks.map(pack => (
                 <div

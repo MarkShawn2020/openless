@@ -121,6 +121,10 @@ export const ko: typeof zhCN = {
         withdraw: '내리기',
       },
       loadFailed: '내 게시물 불러오기 실패: {{err}}',
+      loadingTitle: '불러오는 중…',
+      loadingHint: '마켓에서 최신 게시물을 가져오는 중입니다.',
+      loadErrorTitle: '불러오기 실패',
+      loadErrorRetry: '다시 시도',
     },
     upload: {
       confirmBtn: '업로드 확정',
