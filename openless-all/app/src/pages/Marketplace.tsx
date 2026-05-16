@@ -26,8 +26,10 @@ import {
   marketplaceMyLikes,
   marketplaceMyPacks,
   openExternal,
+  readMarketplaceDetailCache,
   readMarketplaceListCache,
   uploadMarketplacePack,
+  writeMarketplaceDetailCache,
   writeMarketplaceListCache,
 } from '../lib/ipc';
 import { useHotkeySettings } from '../state/HotkeySettingsContext';
@@ -187,7 +189,7 @@ export function Marketplace() {
       setMyPacks(packs);
     } catch (error) {
       console.warn('[marketplace] fetch my-packs failed', error);
-      setActionMsg({ kind: 'err', text: `我的发布加载失败：${errorMessage(error)}` });
+      setActionMsg({ kind: 'err', text: t('marketplace.myPacks.loadFailed', { err: errorMessage(error) }) });
     }
   }, [currentLogin]);
 
@@ -215,9 +217,28 @@ export function Marketplace() {
     setSelectedId(id);
     setDetail(null);
     setDetailLoading(true);
+    // 差量缓存命中：list 已经带 version+updatedAt，按三元组匹配本机 detail。
+    // 命中 = 直接渲染、跳过网络；未命中 = 走 fetchMarketplaceDetail。
+    const listItem = items.find(it => it.id === id);
+    if (listItem) {
+      const cached = readMarketplaceDetailCache(
+        id,
+        listItem.version ?? '',
+        listItem.updatedAt ?? '',
+      );
+      if (cached) {
+        if (seq === detailSeqRef.current) {
+          setDetail(cached);
+          setDetailLoading(false);
+        }
+        return;
+      }
+    }
     try {
       const d = await fetchMarketplaceDetail(id);
       if (seq !== detailSeqRef.current) return; // stale: 用户已切到另一个 pack
+      // 校验后回写：writeMarketplaceDetailCache 会做 ID / 大小校验。
+      writeMarketplaceDetailCache(d);
       setDetail(d);
     } catch (error) {
       if (seq !== detailSeqRef.current) return;
@@ -307,31 +328,31 @@ export function Marketplace() {
     if (!detail) return;
     if (detail.authorLogin !== currentLogin) return; // 只有作者能删
     // eslint-disable-next-line no-alert
-    if (!window.confirm(`确认从风格市场撤回「${detail.name}」？本地副本不会被删除。`)) return;
+    if (!window.confirm(t('marketplace.detail.withdrawConfirm', { name: detail.name }))) return;
     try {
       await marketplaceDelete(detail.id);
-      setActionMsg({ kind: 'ok', text: '已从风格市场撤回' });
+      setActionMsg({ kind: 'ok', text: t('marketplace.detail.withdrawSuccess') });
       setSelectedId(null);
       // 撤回后立即从列表里去掉，再请求一次确认
       setItems(prev => prev.filter(p => p.id !== detail.id));
       void refresh();
     } catch (error) {
-      setActionMsg({ kind: 'err', text: `撤回失败：${errorMessage(error)}` });
+      setActionMsg({ kind: 'err', text: t('marketplace.detail.withdrawFailed', { err: errorMessage(error) }) });
     }
   };
 
   const onDeleteMine = async (pack: MarketplaceMyPackItem) => {
     if (pack.authorLogin !== currentLogin) return;
     // eslint-disable-next-line no-alert
-    if (!window.confirm(`确认从风格市场撤回「${pack.name}」？本地副本不会被删除。`)) return;
+    if (!window.confirm(t('marketplace.detail.withdrawConfirm', { name: pack.name }))) return;
     try {
       await marketplaceDelete(pack.id);
-      setActionMsg({ kind: 'ok', text: '已从风格市场撤回' });
+      setActionMsg({ kind: 'ok', text: t('marketplace.detail.withdrawSuccess') });
       setMyPacks(prev => prev.filter(p => p.id !== pack.id));
       setItems(prev => prev.filter(p => p.id !== pack.id));
       void refreshMyPacks();
     } catch (error) {
-      setActionMsg({ kind: 'err', text: `撤回失败：${errorMessage(error)}` });
+      setActionMsg({ kind: 'err', text: t('marketplace.detail.withdrawFailed', { err: errorMessage(error) }) });
     }
   };
 
@@ -431,7 +452,7 @@ export function Marketplace() {
           } catch (e) {
             console.warn('[oauth] save login to prefs failed', e);
           }
-          setActionMsg({ kind: 'ok', text: `已登录为 @${res.login}` });
+          setActionMsg({ kind: 'ok', text: t('marketplace.oauth.successAs', { login: res.login }) });
           window.setTimeout(() => {
             if (!cancelled) setOauth({ phase: 'idle' });
           }, 1500);
@@ -459,7 +480,7 @@ export function Marketplace() {
     () => [
       { id: 'popular', label: t('marketplace.sortPopular') },
       { id: 'new', label: t('marketplace.sortNew') },
-      { id: 'liked', label: '我赞过的' },
+      { id: 'liked', label: t('marketplace.sortLiked') },
     ],
     [t],
   );
@@ -475,7 +496,7 @@ export function Marketplace() {
             <button
               type="button"
               onClick={() => setShowMyPacks(true)}
-              title={currentLogin ? `查看 ${currentLogin} 的发布` : '先在 Settings → 风格市场 填写发布身份'}
+              title={currentLogin ? t('marketplace.myPacks.buttonTitle', { login: currentLogin }) : t('marketplace.myPacks.buttonTitleEmpty')}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 8,
                 height: 30, padding: '0 12px', borderRadius: 9,
@@ -495,7 +516,7 @@ export function Marketplace() {
               }}>
                 {(currentLogin || '?').slice(0, 1).toUpperCase()}
               </span>
-              <span>我的发布</span>
+              <span>{t('marketplace.myPacks.buttonLabel')}</span>
             </button>
             <Btn icon="refresh" variant="ghost" size="sm" onClick={() => void refresh()}>
               {t('common.refresh')}
@@ -628,11 +649,11 @@ export function Marketplace() {
         ) : visibleItems.length === 0 ? (
           <Card padding={28} style={{ textAlign: 'center' }}>
             <div style={{ fontSize: 13, color: 'var(--ol-ink-3)', marginBottom: 6 }}>
-              {sort === 'liked' && '你还没有赞过任何风格包'}
+              {sort === 'liked' && t('marketplace.likedEmpty')}
               {(sort === 'popular' || sort === 'new') && t('marketplace.empty')}
             </div>
             <div style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>
-              {sort === 'liked' && '点开任一风格包，红色星星点亮后会出现在这里'}
+              {sort === 'liked' && t('marketplace.likedEmptyHint')}
               {(sort === 'popular' || sort === 'new') && t('marketplace.emptyHint')}
             </div>
           </Card>
@@ -664,8 +685,8 @@ export function Marketplace() {
                 <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 2 }}>
                   <Pill size="sm" tone="outline">{p.baseMode}</Pill>
                   {isDerivative(p.originAuthorLogin) && (
-                    <span title={`衍生自 @${p.originAuthorLogin}`}>
-                      <Pill size="sm" tone="ok">衍生自 @{p.originAuthorLogin}</Pill>
+                    <span title={t('marketplace.derivativeBadge', { login: p.originAuthorLogin })}>
+                      <Pill size="sm" tone="ok">{t('marketplace.derivativeBadge', { login: p.originAuthorLogin })}</Pill>
                     </span>
                   )}
                   {p.tags.slice(0, 2).map(tag => <Pill key={tag} size="sm" tone="default">{tag}</Pill>)}
@@ -696,8 +717,8 @@ export function Marketplace() {
                 <h2 style={{ margin: 0, fontSize: 18, fontWeight: 650 }}>{detail.name}</h2>
                 <Pill size="sm" tone="outline">{detail.baseMode}</Pill>
                 {isDerivative(detail.originAuthorLogin) && (
-                  <span title={`衍生自 @${detail.originAuthorLogin}`}>
-                    <Pill size="sm" tone="ok">衍生自 @{detail.originAuthorLogin}</Pill>
+                  <span title={t('marketplace.derivativeBadge', { login: detail.originAuthorLogin })}>
+                    <Pill size="sm" tone="ok">{t('marketplace.derivativeBadge', { login: detail.originAuthorLogin })}</Pill>
                   </span>
                 )}
                 <span style={{ fontSize: 11, color: 'var(--ol-ink-4)', fontFamily: 'var(--ol-font-mono)' }}>
@@ -739,7 +760,7 @@ export function Marketplace() {
                   {detail.authorLogin === currentLogin && currentLogin.length > 0 && (
                     <Btn variant="ghost" size="sm" onClick={() => void onDelete()}>
                       <span style={{ color: '#ef4444', marginRight: 4 }}>🗑</span>
-                      撤回发布
+                      {t('marketplace.detail.withdrawBtn')}
                     </Btn>
                   )}
                 </div>
@@ -792,10 +813,10 @@ export function Marketplace() {
           }}
         >
           <h2 style={{ margin: '0 0 12px', fontSize: 16, fontWeight: 650 }}>
-            {uploadOriginPackId ? `更新「${uploadTargetName ?? '风格包'}」` : t('marketplace.uploadTitle')}
+            {uploadOriginPackId ? t('marketplace.upload.updateTitle', { name: uploadTargetName ?? t('style.pack.title') }) : t('marketplace.uploadTitle')}
           </h2>
           <div style={{ fontSize: 12, color: 'var(--ol-ink-3)', marginBottom: 12 }}>
-            {uploadOriginPackId ? '选中要上传的本地新版本风格包，下方点「确定上传」。同名包默认预选。' : t('marketplace.uploadHint', { login: prefs?.marketplaceDevLogin ?? '' })}
+            {uploadOriginPackId ? t('marketplace.upload.updateHint') : t('marketplace.uploadHint', { login: prefs?.marketplaceDevLogin ?? '' })}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflow: 'auto' }}>
             {localPacks.length === 0 ? (
@@ -838,7 +859,7 @@ export function Marketplace() {
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
                         <div style={{ fontSize: 13, fontWeight: 600 }}>{p.name}</div>
-                        {recommended && <Pill size="sm" tone="blue">建议更新</Pill>}
+                        {recommended && <Pill size="sm" tone="blue">{t('marketplace.upload.recommendedBadge')}</Pill>}
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', marginTop: 2 }}>
                         {p.description || t('marketplace.noDescription')}
@@ -865,7 +886,7 @@ export function Marketplace() {
               disabled={!selectedUploadPackId}
               onClick={() => { if (selectedUploadPackId) void onUpload(selectedUploadPackId); }}
             >
-              确定上传
+              {t('marketplace.upload.confirmBtn')}
             </Btn>
           </div>
         </Modal>
@@ -892,7 +913,7 @@ export function Marketplace() {
               <Icon name="search" size={14} stroke="var(--ol-ink-3)" />
               <input
                 type="search"
-                placeholder="搜索名称、标签"
+                placeholder={t('marketplace.myPacks.searchPlaceholder')}
                 value={myPacksQuery}
                 onChange={e => setMyPacksQuery(e.target.value)}
                 autoFocus
@@ -910,7 +931,7 @@ export function Marketplace() {
                 已登录时再点会重新走一次（切账号）。 */}
             <button
               type="button"
-              title={currentLogin ? `点击重新登录 / 切换账号（当前 @${currentLogin}）` : '点击用 GitHub 登录'}
+              title={currentLogin ? t('marketplace.oauth.reloginTooltip', { login: currentLogin }) : t('marketplace.oauth.loginTooltip')}
               onClick={() => void beginGithubLogin()}
               disabled={oauth.phase === 'starting' || oauth.phase === 'pending'}
               style={{
@@ -933,13 +954,13 @@ export function Marketplace() {
               }}>
                 {(currentLogin || '?').slice(0, 1).toUpperCase()}
               </span>
-              <span>{currentLogin ? `@${currentLogin}` : '登录'}</span>
+              <span>{currentLogin ? `@${currentLogin}` : t('marketplace.oauth.loginBtn')}</span>
             </button>
             {/* 关闭 × */}
             <button
               type="button"
-              aria-label="关闭"
-              title="关闭"
+              aria-label={t('common.close')}
+              title={t('common.close')}
               onClick={() => setShowMyPacks(false)}
               style={{
                 width: 30, height: 30, borderRadius: 9,
@@ -959,9 +980,13 @@ export function Marketplace() {
           {/* 第二行：计数信息（左）+ 刷新 + 上传（右）*/}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 12 }}>
             <div style={{ fontSize: 11.5, color: 'var(--ol-ink-3)' }}>
-              {currentLogin
-                ? `已发布 ${myPacks.length} 个风格包${myPacks.filter(p => p.state === 'pending').length > 0 ? ` · ${myPacks.filter(p => p.state === 'pending').length} 个审核中` : ''}`
-                : '请先在 Settings → 风格市场 填写发布身份'}
+              {(() => {
+                if (!currentLogin) return t('marketplace.myPacks.notLoggedIn');
+                const pendingCount = myPacks.filter(p => p.state === 'pending').length;
+                return pendingCount > 0
+                  ? t('marketplace.myPacks.summaryPending', { count: myPacks.length, pending: pendingCount })
+                  : t('marketplace.myPacks.summary', { count: myPacks.length });
+              })()}
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
               <Btn icon="refresh" variant="ghost" size="sm" onClick={() => void refreshMyPacks()} disabled={!currentLogin}>
@@ -980,12 +1005,12 @@ export function Marketplace() {
             <div style={{ padding: '32px 12px', textAlign: 'center' }}>
               <div style={{ fontSize: 13, color: 'var(--ol-ink-3)', marginBottom: 6 }}>
                 {currentLogin
-                  ? (myPacks.length === 0 ? '你还没有发布过风格包' : '没有匹配的风格包')
-                  : '请先在 Settings → 风格市场 填写发布身份'}
+                  ? (myPacks.length === 0 ? t('marketplace.myPacks.emptyTitle') : t('marketplace.myPacks.noMatch'))
+                  : t('marketplace.myPacks.notLoggedIn')}
               </div>
               {currentLogin && myPacks.length === 0 && (
                 <div style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>
-                  在「风格」页面编辑后点「发布到风格市场」，或点击右上角上传本地风格包。
+                  {t('marketplace.myPacks.emptyHint')}
                 </div>
               )}
             </div>
@@ -1009,7 +1034,7 @@ export function Marketplace() {
                       <div style={{ fontSize: 14, fontWeight: 650, color: 'var(--ol-ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{pack.name}</div>
                       <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', marginTop: 3 }}>v{pack.version} · {new Date(pack.updatedAt).toLocaleDateString()}</div>
                     </div>
-                    <Pill size="sm" tone={pack.state === 'approved' ? 'ok' : 'outline'} style={pack.state === 'rejected' || pack.state === 'withdrawn' ? { color: '#ef4444', borderColor: 'rgba(239,68,68,0.28)' } : undefined}>{statusLabel(pack.state)}</Pill>
+                    <Pill size="sm" tone={pack.state === 'approved' ? 'ok' : 'outline'} style={pack.state === 'rejected' || pack.state === 'withdrawn' ? { color: '#ef4444', borderColor: 'rgba(239,68,68,0.28)' } : undefined}>{statusLabel(pack.state, t)}</Pill>
                   </div>
                   {pack.description && (
                     <div style={{ fontSize: 12, color: 'var(--ol-ink-3)', lineHeight: 1.5 }}>{pack.description}</div>
@@ -1022,11 +1047,11 @@ export function Marketplace() {
                     <span style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>★ {pack.likeCount} · ↓ {pack.downloadCount}</span>
                     <div style={{ display: 'flex', gap: 6 }}>
                       <Btn variant="ghost" size="sm" onClick={() => void openUploadPicker(pack.id, pack.name)} disabled={!canUpload}>
-                        更新
+                        {t('marketplace.myPacks.actions.update')}
                       </Btn>
                       {pack.state !== 'withdrawn' && (
                         <Btn variant="ghost" size="sm" onClick={() => void onDeleteMine(pack)}>
-                          <span style={{ color: '#ef4444' }}>下架</span>
+                          <span style={{ color: '#ef4444' }}>{t('marketplace.myPacks.actions.withdraw')}</span>
                         </Btn>
                       )}
                     </div>
@@ -1045,11 +1070,11 @@ export function Marketplace() {
           setOauth({ phase: 'idle' });
         }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14, gap: 12 }}>
-            <h2 style={{ margin: 0, fontSize: 16, fontWeight: 650 }}>用 GitHub 登录</h2>
+            <h2 style={{ margin: 0, fontSize: 16, fontWeight: 650 }}>{t('marketplace.oauth.title')}</h2>
             <button
               type="button"
-              aria-label="关闭"
-              title="关闭"
+              aria-label={t('common.close')}
+              title={t('common.close')}
               onClick={() => setOauth({ phase: 'idle' })}
               style={{
                 width: 28, height: 28, borderRadius: 8,
@@ -1065,14 +1090,23 @@ export function Marketplace() {
 
           {oauth.phase === 'starting' && (
             <div style={{ padding: '24px 8px', textAlign: 'center', color: 'var(--ol-ink-3)', fontSize: 13 }}>
-              正在生成设备验证码…
+              {t('marketplace.oauth.generating')}
             </div>
           )}
 
           {oauth.phase === 'pending' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <div style={{ fontSize: 13, color: 'var(--ol-ink-2)', lineHeight: 1.6 }}>
-                在浏览器中打开 <span style={{ fontFamily: 'var(--ol-font-mono)', fontSize: 12, padding: '1px 5px', background: 'var(--ol-surface-2)', borderRadius: 4 }}>{oauth.verificationUri}</span> 并输入下方代码：
+                {(() => {
+                  const parts = t('marketplace.oauth.browserHint', { uri: ' URI ' }).split(' URI ');
+                  return (
+                    <>
+                      {parts[0]}
+                      <span style={{ fontFamily: 'var(--ol-font-mono)', fontSize: 12, padding: '1px 5px', background: 'var(--ol-surface-2)', borderRadius: 4 }}>{oauth.verificationUri}</span>
+                      {parts[1] ?? ''}
+                    </>
+                  );
+                })()}
               </div>
               <div style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12,
@@ -1092,21 +1126,21 @@ export function Marketplace() {
                   onClick={async () => {
                     try {
                       await navigator.clipboard.writeText(oauth.userCode);
-                      setActionMsg({ kind: 'ok', text: '已复制设备码' });
+                      setActionMsg({ kind: 'ok', text: t('marketplace.oauth.copied') });
                     } catch (e) {
-                      setActionMsg({ kind: 'err', text: `复制失败：${errorMessage(e)}` });
+                      setActionMsg({ kind: 'err', text: t('marketplace.oauth.copyFailed', { err: errorMessage(e) }) });
                     }
                   }}
                 >
-                  复制
+                  {t('marketplace.oauth.copyBtn')}
                 </Btn>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
                 <Btn variant="ghost" size="sm" onClick={() => void openExternal(oauth.verificationUri)}>
-                  打开浏览器
+                  {t('marketplace.oauth.openBrowserBtn')}
                 </Btn>
                 <Btn variant="ghost" size="sm" onClick={() => setOauth({ phase: 'idle' })}>
-                  取消
+                  {t('marketplace.oauth.cancelBtn')}
                 </Btn>
               </div>
               <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
@@ -1114,7 +1148,7 @@ export function Marketplace() {
                   display: 'inline-block', width: 8, height: 8, borderRadius: 999,
                   background: 'var(--ol-blue)', animation: 'ol-pulse 1.4s ease-in-out infinite',
                 }} />
-                等待你在浏览器中授权…
+                {t('marketplace.oauth.waiting')}
               </div>
               <style>{`
                 @keyframes ol-pulse {
@@ -1128,7 +1162,7 @@ export function Marketplace() {
           {oauth.phase === 'success' && (
             <div style={{ padding: '24px 8px', textAlign: 'center' }}>
               <div style={{ fontSize: 24, color: 'var(--ol-blue)', marginBottom: 8 }}>✓</div>
-              <div style={{ fontSize: 14, fontWeight: 650, color: 'var(--ol-ink)' }}>已登录为 @{oauth.login}</div>
+              <div style={{ fontSize: 14, fontWeight: 650, color: 'var(--ol-ink)' }}>{t('marketplace.oauth.successAs', { login: oauth.login })}</div>
             </div>
           )}
 
@@ -1145,8 +1179,8 @@ export function Marketplace() {
                 {oauth.message}
               </div>
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-                <Btn variant="ghost" size="sm" onClick={() => setOauth({ phase: 'idle' })}>关闭</Btn>
-                <Btn variant="blue" size="sm" onClick={() => void beginGithubLogin()}>重试</Btn>
+                <Btn variant="ghost" size="sm" onClick={() => setOauth({ phase: 'idle' })}>{t('marketplace.oauth.closeBtn')}</Btn>
+                <Btn variant="blue" size="sm" onClick={() => void beginGithubLogin()}>{t('marketplace.oauth.retryBtn')}</Btn>
               </div>
             </div>
           )}
@@ -1218,14 +1252,14 @@ function Modal({
   );
 }
 
-function statusLabel(state: string): string {
+function statusLabel(state: string, t: (key: string) => string): string {
   switch (state) {
-    case 'pending': return '审核中';
-    case 'approved': return '已上架';
-    case 'rejected': return '未通过';
-    case 'withdrawn': return '已下架';
-    case 'superseded': return '已被新版替换';
-    default: return state || '未知';
+    case 'pending': return t('marketplace.state.pending');
+    case 'approved': return t('marketplace.state.approved');
+    case 'rejected': return t('marketplace.state.rejected');
+    case 'withdrawn': return t('marketplace.state.withdrawn');
+    case 'superseded': return t('marketplace.state.superseded');
+    default: return state || t('marketplace.state.unknown');
   }
 }
 

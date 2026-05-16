@@ -2679,13 +2679,13 @@ mod tests {
     fn structured_prompt_anchors_on_high_density_examples_and_term_protection() {
         let prompt = prompts::system_prompt(PolishMode::Structured);
 
-        // v1.3.0 设计哲学回归：简洁规则 + 高密度演示性示例。
-        // 任务首段 + 双层格式 + 事项数规则三件事必须靠前讲清楚。
-        assert!(prompt.contains("# 任务（清晰结构）"));
-        assert!(prompt.contains("# 双层格式"));
+        // v2.0：八节中文序号骨架。结构化判断 + 双层格式 + 事项数规则必须靠前讲清楚。
+        assert!(prompt.contains("# 二、结构化判断（核心）"));
+        assert!(prompt.contains("# 三、双层格式"));
         assert!(prompt.contains("第一层（主题）"));
         assert!(prompt.contains("第二层（子项）"));
-        assert!(prompt.contains("# 事项数 → 输出形态"));
+        assert!(prompt.contains("事项 ≤ 2 条"));
+        assert!(prompt.contains("事项 ≥ 3 条"));
 
         // 防回归：模型名、字段名、布尔值和版本号必须被显式保护。
         assert!(prompt.contains("Claude"));
@@ -2695,7 +2695,8 @@ mod tests {
         assert!(prompt.contains("LongCat"));
         assert!(prompt.contains("Secret Key"));
         assert!(prompt.contains("true / false / null"));
-        assert!(prompt.contains("不要把 GPT 5.5 写成 GPT 5"));
+        assert!(prompt.contains("GPT-5.6"));
+        assert!(prompt.contains("**不**简写成 GPT-5、Claude 4"));
 
         // 4 个核心示例的锚点：超长 GitHub 请求、已编号工作日报、散乱长口述、AI 日报。
         assert!(prompt.contains("帮忙给 GitHub 提个请求，主要包含以下内容："));
@@ -2783,26 +2784,25 @@ mod tests {
 
     #[test]
     fn common_rules_include_auto_correction_and_natural_organization() {
-        // 所有 mode 都要带上"自动纠错"（规则 5）和"按整体意图组织成自然书面表达"
-        // 的扩展（规则 3）。任一缺失说明 COMMON_RULES 被回退掉了。
-        for mode in [
-            PolishMode::Raw,
-            PolishMode::Light,
-            PolishMode::Structured,
-            PolishMode::Formal,
-        ] {
+        // 只有 Raw 仍走标准 ROLE_BLOCK / COMMON_RULES / OUTPUT_BLOCK wrapper。
+        // Light / Structured / Formal 已切到 v2 PRO 自带 prompt（含独立 ASR 纠错 + 分级策略）。
+        let raw = prompts::system_prompt(PolishMode::Raw);
+        assert!(raw.contains("5) 自动纠错"), "Raw prompt 缺少自动纠错规则");
+        assert!(raw.contains("根目录"), "Raw prompt 缺少根目录纠错示例");
+        assert!(
+            raw.contains("按用户的整体意图把零碎口语组织成协调、自然的书面表达"),
+            "Raw prompt 缺少自然组织扩展"
+        );
+
+        // v2 PRO 自带 prompt 必须共享：四/五、ASR 纠错段 + 高/低置信度分级 + 根目录词条。
+        for mode in [PolishMode::Light, PolishMode::Structured, PolishMode::Formal] {
             let prompt = prompts::system_prompt(mode);
+            let has_asr_heading = prompt.contains("# 四、ASR 纠错") || prompt.contains("# 五、ASR 纠错");
+            assert!(has_asr_heading, "{mode:?} prompt 缺少 v2 自带 ASR 纠错段落");
+            assert!(prompt.contains("根目录"), "{mode:?} prompt 缺少根目录纠错示例");
             assert!(
-                prompt.contains("5) 自动纠错"),
-                "{mode:?} prompt 缺少自动纠错规则"
-            );
-            assert!(
-                prompt.contains("根目录"),
-                "{mode:?} prompt 缺少根目录纠错示例"
-            );
-            assert!(
-                prompt.contains("按用户的整体意图把零碎口语组织成协调、自然的书面表达"),
-                "{mode:?} prompt 缺少自然组织扩展"
+                prompt.contains("**高置信度**") && prompt.contains("**低置信度**"),
+                "{mode:?} prompt 缺少分级置信度策略"
             );
         }
     }
