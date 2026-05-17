@@ -792,6 +792,10 @@ export const ko: typeof zhCN = {
       betaChannelRefresh: '새로 고침',
       betaChannelNoBeta: '아직 게시된 Beta 릴리스가 없습니다.',
       betaChannelFetchError: 'Beta 릴리스 정보를 가져오지 못했습니다. 잠시 후 다시 시도하세요.',
+      betaChannelUpToDate: '최신',
+      betaChannelUpdateNow: '지금 업데이트',
+      betaChannelUpdateNowTitle: '최신 Beta를 확인·다운로드하고 업데이트 대화상자를 표시합니다',
+      betaChannelChecking: '확인 중…',
       updateDialog: {
         available: {
           title: '새 버전 발견',

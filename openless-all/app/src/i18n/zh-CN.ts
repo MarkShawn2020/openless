@@ -788,6 +788,10 @@ export const zhCN = {
       betaChannelRefresh: '重新查询',
       betaChannelNoBeta: '暂无已发布的 Beta 版。',
       betaChannelFetchError: '获取 Beta 版本信息失败，请稍后重试。',
+      betaChannelUpToDate: '已是最新',
+      betaChannelUpdateNow: '立即更新',
+      betaChannelUpdateNowTitle: '检查并下载最新 Beta，然后弹出更新对话框',
+      betaChannelChecking: '检查中…',
       updateDialog: {
         available: {
           title: '发现新版本',

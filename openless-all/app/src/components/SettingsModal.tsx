@@ -21,7 +21,37 @@ import {
   type LatestBetaRelease,
   type UpdateChannel,
 } from '../lib/ipc';
+import { APP_VERSION } from '../lib/appVersion';
+import { isDialogStatus, UpdateDialog, useAutoUpdate } from './AutoUpdate';
 import type { OS } from './WindowChrome';
+
+// 把 Beta tag 名（如 "v1.3.4-1-beta-tauri" / "v1.3.2-3-beta-tauri"）解析回 semver 版本号
+// "1.3.4-1" / "1.3.2-3"。失败返回 null（让 UI fallback 到字符串相等比对）。
+function parseVersionFromBetaTag(tag: string): string | null {
+  const trimmed = tag.replace(/^v/, '').replace(/-beta-tauri$/, '');
+  return /^\d+\.\d+\.\d+(-\d+)?$/.test(trimmed) ? trimmed : null;
+}
+
+// 简化版 semver 比较 —— 只覆盖本仓库实际用到的两种形态：X.Y.Z 和 X.Y.Z-N。
+// 返回 true 表示 a > b。按 SemVer 规则：major→minor→patch→prerelease（none > some）。
+function semverGreater(a: string, b: string): boolean {
+  const parse = (v: string) => {
+    const [main, pre] = v.split('-');
+    const [major, minor, patch] = main.split('.').map(n => Number.parseInt(n, 10));
+    const preNum = pre === undefined ? null : Number.parseInt(pre, 10);
+    return { major, minor, patch, preNum };
+  };
+  const A = parse(a);
+  const B = parse(b);
+  if (A.major !== B.major) return A.major > B.major;
+  if (A.minor !== B.minor) return A.minor > B.minor;
+  if (A.patch !== B.patch) return A.patch > B.patch;
+  // pre: null（无 prerelease）> 任何 prerelease
+  if (A.preNum === B.preNum) return false;
+  if (A.preNum === null) return true;
+  if (B.preNum === null) return false;
+  return A.preNum > B.preNum;
+}
 
 interface SettingsModalProps {
   os: OS;
@@ -431,6 +461,18 @@ function BetaChannelControl() {
   const [latest, setLatest] = useState<LatestBetaRelease | null>(null);
   const [status, setStatus] = useState<'idle' | 'fetching' | 'empty' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const updater = useAutoUpdate();
+
+  // 本机 vs 最新 Beta tag 比对：
+  // - 'unknown'  → 还没拿到 latest 或解析失败，按"未知"渲染
+  // - 'up-to-date' → 本机版本 >= 远端最新 Beta，按"已是最新"渲染、隐藏更新按钮
+  // - 'newer'    → 远端有更新版本，渲染「立即更新」按钮触发 auto-update 流程
+  const remoteVersion = latest ? parseVersionFromBetaTag(latest.tagName) : null;
+  const comparison: 'unknown' | 'up-to-date' | 'newer' = !remoteVersion
+    ? 'unknown'
+    : semverGreater(remoteVersion, APP_VERSION)
+      ? 'newer'
+      : 'up-to-date';
 
   useEffect(() => {
     let cancelled = false;
@@ -498,6 +540,24 @@ function BetaChannelControl() {
               <span>
                 {t('settings.about.betaChannelLatestPrefix')} <code style={{ fontFamily: 'var(--ol-font-mono)' }}>{latest.tagName}</code>
               </span>
+              {comparison === 'up-to-date' && (
+                <span style={{
+                  fontSize: 11, padding: '2px 8px', borderRadius: 999,
+                  background: 'var(--ol-blue-soft)', color: 'var(--ol-blue)', fontWeight: 500,
+                }}>{t('settings.about.betaChannelUpToDate')}</span>
+              )}
+              {comparison === 'newer' && (
+                <button
+                  style={{ ...btnGhost, borderColor: 'var(--ol-blue)', color: 'var(--ol-blue)' }}
+                  onClick={() => void updater.checkForUpdates()}
+                  disabled={updater.checking || updater.busy}
+                  title={t('settings.about.betaChannelUpdateNowTitle')}
+                >
+                  {updater.checking
+                    ? t('settings.about.betaChannelChecking')
+                    : t('settings.about.betaChannelUpdateNow')}
+                </button>
+              )}
               <button style={btnGhost} onClick={fetchBeta} title={t('settings.about.betaChannelRefresh')}>
                 <Icon name="refresh" size={12} />
               </button>
@@ -509,6 +569,17 @@ function BetaChannelControl() {
             </button>
           )}
         </div>
+      )}
+      {isDialogStatus(updater.status) && (
+        <UpdateDialog
+          status={updater.status}
+          version={updater.version}
+          progress={updater.progress}
+          downloaded={updater.downloaded}
+          contentLength={updater.contentLength}
+          onInstall={() => void updater.installUpdate()}
+          onClose={() => void updater.dismissDialog()}
+        />
       )}
     </>
   );

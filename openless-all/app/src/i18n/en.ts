@@ -790,6 +790,10 @@ export const en: typeof zhCN = {
       betaChannelRefresh: 'Refresh',
       betaChannelNoBeta: 'No Beta release has been published yet.',
       betaChannelFetchError: 'Failed to fetch Beta release info. Please try again later.',
+      betaChannelUpToDate: 'Up to date',
+      betaChannelUpdateNow: 'Update now',
+      betaChannelUpdateNowTitle: 'Check and download the latest Beta, then show the update dialog',
+      betaChannelChecking: 'Checking…',
       updateDialog: {
         available: {
           title: 'Update available',

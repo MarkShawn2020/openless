@@ -790,6 +790,10 @@ export const zhTW: typeof zhCN = {
       betaChannelRefresh: '重新查詢',
       betaChannelNoBeta: '尚未發佈過 Beta 版。',
       betaChannelFetchError: '獲取 Beta 版本資訊失敗，請稍後重試。',
+      betaChannelUpToDate: '已是最新',
+      betaChannelUpdateNow: '立即更新',
+      betaChannelUpdateNowTitle: '檢查並下載最新 Beta，然後彈出更新對話框',
+      betaChannelChecking: '檢查中…',
       updateDialog: {
         available: {
           title: '發現新版本',

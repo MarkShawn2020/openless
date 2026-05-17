@@ -792,6 +792,10 @@ export const ja: typeof zhCN = {
       betaChannelRefresh: '再取得',
       betaChannelNoBeta: 'まだ Beta リリースは公開されていません。',
       betaChannelFetchError: 'Beta バージョン情報の取得に失敗しました。後で再試行してください。',
+      betaChannelUpToDate: '最新です',
+      betaChannelUpdateNow: '今すぐ更新',
+      betaChannelUpdateNowTitle: '最新 Beta を確認・ダウンロードし、更新ダイアログを表示します',
+      betaChannelChecking: '確認中…',
       updateDialog: {
         available: {
           title: '新しいバージョンがあります',
