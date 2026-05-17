@@ -784,7 +784,7 @@ export const ko: typeof zhCN = {
       privacyDesc: '모든 인식 결과는 로컬에만 저장됩니다. 클라우드 API 는 실시간 전사와 정리에만 사용되며 녹음을 보관하지 않습니다.',
       localFirst: '로컬 우선',
       betaChannelLabel: 'Beta 채널 참여',
-      betaChannelDesc: '기본은 정식 버전입니다. 켜면 최신 Beta 버전 다운로드 링크가 아래에 표시됩니다. Beta 빌드는 자동 업데이트로 배포되지 않으며 직접 다운로드해 설치해야 합니다. 불안정할 수 있으므로 사전 평가와 피드백을 제공할 의향이 있는 사용자에게만 권장합니다.',
+      betaChannelDesc: '기본은 정식 버전입니다. 켜면 앱의 "업데이트 확인"이 최신 Beta 버전(아직 Stable에 올라가지 않은 기능 포함)을 자동으로 가져옵니다. Beta 빌드는 Stable 매니페스트와 물리적으로 분리되어 있어 일반 사용자에게 영향을 주지 않습니다. 불안정할 수 있으므로 사전 평가와 피드백을 제공할 의향이 있는 사용자에게만 권장합니다.',
       betaChannelFetching: '최신 Beta 버전을 가져오는 중…',
       betaChannelFetchBtn: '최신 Beta 확인',
       betaChannelLatestPrefix: '최신 Beta:',

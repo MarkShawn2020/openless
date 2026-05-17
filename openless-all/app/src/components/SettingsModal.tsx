@@ -417,10 +417,13 @@ function AboutMini() {
   );
 }
 
-// Beta 渠道开关：物理隔离的 opt-in，不接 auto-update。
-// - 关闭状态 = 正式版渠道，默认行为，用户从「检查更新」拿正式 release
-// - 打开 = 用户主动加入 Beta；写 prefs（无重启需要）+ 拉一次最新 prerelease 信息
-// - 点"打开 GitHub"跳浏览器到具体的 Beta release 页面，用户手动下载安装
+// Beta 渠道开关：物理隔离的 opt-in，**已接 auto-update**（PR feat/beta-auto-update）。
+// - 关闭 = Stable 渠道，「检查更新」走 tauri.conf 默认 endpoints
+// - 打开 = 写 prefs.update_channel = 'beta'；Rust 端 app_check_update_with_channel
+//   命令会自动拉最新 prerelease tag 拼成 -beta manifest URL，再走 plugin-updater
+//   的 check/download/install 标准流程
+// - 这里拉一次 fetch_latest_beta_release 仅用于「告诉用户最新 Beta 是哪个版本」做
+//   信息透明；不再渲染手动下载按钮（auto-update 接管了那条路）。
 // 不在 Beta 渠道时不发起 GitHub API 请求，避免空切换浪费配额。
 function BetaChannelControl() {
   const { t } = useTranslation();
@@ -495,9 +498,6 @@ function BetaChannelControl() {
               <span>
                 {t('settings.about.betaChannelLatestPrefix')} <code style={{ fontFamily: 'var(--ol-font-mono)' }}>{latest.tagName}</code>
               </span>
-              <button style={btnGhost} onClick={() => openExternal(latest.htmlUrl)}>
-                {t('settings.about.betaChannelDownloadBtn')}
-              </button>
               <button style={btnGhost} onClick={fetchBeta} title={t('settings.about.betaChannelRefresh')}>
                 <Icon name="refresh" size={12} />
               </button>
