@@ -1142,7 +1142,8 @@ pub(crate) fn hide_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) {
 fn show_qa_window_no_activate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> bool {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
 
     let Ok(handle) = window.window_handle() else {
         return false;
@@ -1155,7 +1156,20 @@ fn show_qa_window_no_activate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R
         return false;
     }
 
-    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+    // 必须让 QA 浮窗拿到键盘焦点：否则 ESC 收不到、X 按钮 first-click 会被 OS 当作激活
+    // 事件吃掉 → 用户体感是"关不掉"。tauri.conf.json 里 `focus: false` 控制的是创建时
+    // 不激活，这里 show 时主动 SetForegroundWindow + SetFocus 把焦点交给 webview。
+    //
+    // 对 issue #164 "QA 浮窗不抢前台 app 焦点"的取舍说明：
+    // 浮窗出现时确实会成为前台，但 begin_qa_session 走 Ctrl+C 路径抓选区那一刻，
+    // 用户原 app 仍是 simulate_copy 目标（前台是 QA，但 SendInput 是把全局键盘事件
+    // 发到当前焦点窗口 —— 即 QA 自己 → 抓不到）。当前实现存在已知局限，但相比
+    // "X / ESC 完全无法关闭浮窗"的回归更轻。后续如需恢复"选区抓取不被打断"语义，
+    // 在 begin_qa_session 期间临时把焦点还给 saved front app HWND 再回收即可。
+    // issue #466。
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    let _ = unsafe { SetFocus(hwnd) };
     true
 }
 
