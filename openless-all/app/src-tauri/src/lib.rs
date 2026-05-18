@@ -83,6 +83,20 @@ pub fn run() {
                 dispatch_cli_intent(app, intent);
                 return;
             }
+            // 静默启动模式下：第二次启动（Win11 的「登录时重新打开应用」、autostart 双触发、
+            // 或用户手动再点图标）也不弹主窗口，否则 start_minimized=true 在 Win11 上整体失效。
+            // 用户想看主窗口走托盘菜单 / 托盘左键。issue #468。
+            if let Some(coordinator) = app
+                .try_state::<Arc<coordinator::Coordinator>>()
+                .map(|s| Arc::clone(&*s))
+            {
+                if coordinator.prefs().get().start_minimized {
+                    log::info!(
+                        "[single-instance] start_minimized=true → skipping show on relaunch"
+                    );
+                    return;
+                }
+            }
             log::info!(
                 "[single-instance] another instance launched, focusing existing main window"
             );
