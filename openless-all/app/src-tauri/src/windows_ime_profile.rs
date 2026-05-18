@@ -319,16 +319,27 @@ mod windows_impl {
     }
 
     pub fn restore_profile(snapshot: &ImeProfileSnapshot) -> WindowsImeProfileResult<()> {
+        // 必须与 activate_openless_profile 路径对称：激活同时调了 legacy
+        // ITfInputProcessorProfiles 的 ChangeCurrentLanguage + ActivateLanguageProfile，
+        // 单独调现代 ITfInputProcessorProfileMgr::ActivateProfile 不会更新 legacy
+        // current language / active profile 状态，OS 仍认 OpenLess 是当前输入法 →
+        // 用户的输入法切不回去。issue #469。
         match snapshot.kind() {
             ImeProfileKind::TextService => {
                 let clsid = parse_required_guid("text service CLSID", snapshot.clsid())?;
                 let profile_guid =
                     parse_required_guid("text service profile GUID", snapshot.profile_guid())?;
+                let lang_id = snapshot.lang_id();
+
+                with_input_processor_profiles(|profiles| unsafe {
+                    profiles.ChangeCurrentLanguage(lang_id)?;
+                    profiles.ActivateLanguageProfile(&clsid, lang_id, &profile_guid)
+                })?;
 
                 with_profile_manager(|manager| unsafe {
                     manager.ActivateProfile(
                         TF_PROFILETYPE_INPUTPROCESSOR,
-                        snapshot.lang_id(),
+                        lang_id,
                         &clsid,
                         &profile_guid,
                         null_hkl(),
@@ -339,11 +350,16 @@ mod windows_impl {
             ImeProfileKind::KeyboardLayout => {
                 let hkl = HKL(snapshot.hkl().unwrap_or_default() as *mut c_void);
                 let zero_guid = GUID::zeroed();
+                let lang_id = snapshot.lang_id();
+
+                with_input_processor_profiles(|profiles| unsafe {
+                    profiles.ChangeCurrentLanguage(lang_id)
+                })?;
 
                 with_profile_manager(|manager| unsafe {
                     manager.ActivateProfile(
                         TF_PROFILETYPE_KEYBOARDLAYOUT,
-                        snapshot.lang_id(),
+                        lang_id,
                         &zero_guid,
                         &zero_guid,
                         hkl,
