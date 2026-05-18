@@ -91,6 +91,8 @@ fn capsule_show_strategy_for_platform() -> CapsuleShowStrategy {
 }
 
 static CAPSULE_NO_ACTIVATE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+static CAPSULE_SUPPRESSED_BY_TOGGLE_LOGGED: AtomicBool = AtomicBool::new(false);
+static CAPSULE_FIRST_SHOW_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn show_capsule_window_for_recording<R: tauri::Runtime>(
     app: &AppHandle<R>,
@@ -4217,12 +4219,31 @@ fn emit_capsule(
         // 处理，不依赖把 Done/Cancelled/Error 打成 invisible。详见 PR #140 评论。
         maybe_position_capsule_bottom_center(&inner_for_main, &window, translation);
         if show_capsule && visible {
+            // 用户报"看不到胶囊"时第一时间能在 log 里确认：胶囊路径有跑、show_capsule
+            // 开关是 true、当前进入 visible 帧 —— 排除 prefs 没存住 / emit_capsule 没触
+            // 发 / state 一直 Idle 这几类常见 root cause。issue #470。
+            if !CAPSULE_FIRST_SHOW_LOGGED.swap(true, Ordering::SeqCst) {
+                log::info!(
+                    "[capsule] first show this session: show_capsule=true visible=true state={state:?}"
+                );
+            }
             show_capsule_window_for_recording(&app_for_main, &window);
             // macOS/Windows 优先走 no-activate show，避免录音胶囊抢走当前工作 app 焦点。
             // 若 fallback 到 show()，OpenLess 已是前台 app 时再把 key window 还给 main。
             #[cfg(target_os = "macos")]
             crate::restore_main_window_key_if_active(&app_for_main);
         } else {
+            // show_capsule 开关被用户关掉但本次确实想显示（visible=true）的情况：
+            // 一次性 info log，让用户报"胶囊没显示"时能在日志里一眼看到根因 —— 维护者
+            // 不必再让用户"去打开设置确认"。issue #470。
+            if !show_capsule
+                && visible
+                && !CAPSULE_SUPPRESSED_BY_TOGGLE_LOGGED.swap(true, Ordering::SeqCst)
+            {
+                log::info!(
+                    "[capsule] suppressed by user toggle: show_capsule=false visible=true state={state:?}"
+                );
+            }
             hide_capsule_window_if_present();
             let _ = window.hide();
         }
