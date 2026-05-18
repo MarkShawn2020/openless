@@ -2581,10 +2581,18 @@ async fn begin_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
     //   抓完选区后下半场再把焦点交还 QA，让 ESC/X 继续可用。
     #[cfg(target_os = "windows")]
     {
-        if let Some(current_external) = capture_external_focus_target() {
-            inner.qa_state.lock().qa_focus_target = Some(current_external);
-        }
-        let saved_target = inner.qa_state.lock().qa_focus_target;
+        // 合并两次 lock：原来分 lock #1 写 + lock #2 读，两者之间 close_qa_panel 在别的
+        // 线程把 qa_focus_target 清成 None 会被覆盖回旧 HWND。Cloud 评审指出的 TOCTOU。
+        // 单次加锁里既写最新外部前台、再读出来交给后面的 restore_focus_target_if_possible
+        // —— capture_external_focus_target() 内部只调 GetForegroundWindow / pid 查询，
+        // 不会反向取 qa_state 锁，持锁期间调用安全。
+        let saved_target = {
+            let mut state = inner.qa_state.lock();
+            if let Some(current_external) = capture_external_focus_target() {
+                state.qa_focus_target = Some(current_external);
+            }
+            state.qa_focus_target
+        };
         let _ = restore_focus_target_if_possible(saved_target);
     }
     let selection = capture_selection();
