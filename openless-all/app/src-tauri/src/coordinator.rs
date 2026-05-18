@@ -2552,8 +2552,23 @@ async fn begin_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
     inner.qa_stream_cancelled.store(false, Ordering::SeqCst);
 
     // 抓选区。每轮按 Option 都重新抓一次：用户多轮提问中可以重新选别处文字。
-    // 浮窗 focus:false，原 app 仍是 frontmost，AX/Cmd+C fallback 都能拿到。
+    //
+    // - macOS：浮窗走 orderFrontRegardless，不成为 key window，原 app 仍是 frontmost，
+    //   AX/Cmd+C fallback 都能拿到。
+    // - Windows：#466 修复后 show_qa_window_no_activate 主动抓焦点，QA 此刻已是前台，
+    //   simulate_copy 会跑在 QA 自己 webview 上 → 抓不到。focus-dance 上半场：把焦点临时
+    //   还给 open_qa_panel 时记下的 saved HWND，抓完选区后下半场再把焦点交还 QA，让 ESC/X
+    //   继续可用。多轮场景下用户自己切回原 app 时 saved == current，restore 是 no-op。
+    #[cfg(target_os = "windows")]
+    {
+        let saved_target = inner.qa_state.lock().qa_focus_target;
+        let _ = restore_focus_target_if_possible(saved_target);
+    }
     let selection = capture_selection();
+    #[cfg(target_os = "windows")]
+    if let Some(app) = inner.app.lock().clone() {
+        crate::refocus_qa_window(&app);
+    }
     let selection_preview_text = selection.as_ref().map(|s| s.text.clone());
     inner.qa_state.lock().selection = selection.clone();
 

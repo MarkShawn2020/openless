@@ -1138,6 +1138,18 @@ pub(crate) fn hide_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// 抓完选区后把焦点重新交回 QA 浮窗（Windows focus-dance 下半场）。begin_qa_session
+/// 在 capture_selection 跑完时调；非 Windows 平台是 no-op。issue #466。
+#[cfg(target_os = "windows")]
+pub(crate) fn refocus_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("qa") {
+        let _ = show_qa_window_no_activate(&window);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn refocus_qa_window<R: tauri::Runtime>(_app: &AppHandle<R>) {}
+
 #[cfg(target_os = "windows")]
 fn show_qa_window_no_activate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> bool {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
