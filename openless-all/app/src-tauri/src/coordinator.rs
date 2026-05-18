@@ -2572,10 +2572,18 @@ async fn begin_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
     //   AX/Cmd+C fallback 都能拿到。
     // - Windows：#466 修复后 show_qa_window_no_activate 主动抓焦点，QA 此刻已是前台，
     //   simulate_copy 会跑在 QA 自己 webview 上 → 抓不到。focus-dance 上半场：把焦点临时
-    //   还给 open_qa_panel 时记下的 saved HWND，抓完选区后下半场再把焦点交还 QA，让 ESC/X
-    //   继续可用。多轮场景下用户自己切回原 app 时 saved == current，restore 是 no-op。
+    //   还给"用户原 app 的 HWND"。
+    //
+    //   多轮场景的目标刷新：用户开 QA 后可能 Alt+Tab 切到别的 app 选新文字。如果还死认
+    //   open_qa_panel 时记下的初始 HWND，会把焦点抢回错的 app（pr_agent stale-focus 关注点）。
+    //   策略：每轮先看当前前台是不是本进程的窗口（QA / capsule / main）—— 是 → 用户没切
+    //   走，沿用 saved；不是 → 用户切到了真正的外部 app，刷新 saved 为当前 HWND。
+    //   抓完选区后下半场再把焦点交还 QA，让 ESC/X 继续可用。
     #[cfg(target_os = "windows")]
     {
+        if let Some(current_external) = capture_external_focus_target() {
+            inner.qa_state.lock().qa_focus_target = Some(current_external);
+        }
         let saved_target = inner.qa_state.lock().qa_focus_target;
         let _ = restore_focus_target_if_possible(saved_target);
     }
@@ -3889,6 +3897,33 @@ fn schedule_capsule_idle(inner: &Arc<Inner>, delay_ms: u64) {
             emit_capsule(&inner_clone, CapsuleState::Idle, 0.0, 0, None, None);
         }
     });
+}
+
+/// 与 capture_focus_target 类似，但前台窗口属于本进程（即用户停在 QA / capsule / main
+/// 等自家窗口）时返回 None，让 caller 区分"用户没切到别处" vs "用户切到了另一个真正的
+/// 外部 app"。issue #466 多轮场景下用来刷新 qa_focus_target。
+#[cfg(target_os = "windows")]
+fn capture_external_focus_target() -> Option<usize> {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == GetCurrentProcessId() {
+            return None;
+        }
+        Some(hwnd.0 as usize)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn capture_external_focus_target() -> Option<usize> {
+    None
 }
 
 #[cfg(target_os = "windows")]
