@@ -1152,36 +1152,24 @@ pub(crate) fn refocus_qa_window<R: tauri::Runtime>(_app: &AppHandle<R>) {}
 
 #[cfg(target_os = "windows")]
 fn show_qa_window_no_activate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> bool {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-    use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
-
-    let Ok(handle) = window.window_handle() else {
-        return false;
-    };
-    let RawWindowHandle::Win32(raw) = handle.as_raw() else {
-        return false;
-    };
-    let hwnd = HWND(raw.hwnd.get() as *mut _);
-    if hwnd.0.is_null() {
+    // 函数名沿用历史命名，实际行为已切到「show + focus」—— 让 QA webview 真正拿到键盘
+    // 焦点，ESC 才能到 React 监听、X 按钮 first-click 才不会被 OS 当作激活点击吃掉。
+    //
+    // 走 Tauri 的 show() / set_focus() 而不是 Win32 SetForegroundWindow + SetFocus
+    // 的原因（pr_agent 关注点二轮回应）：
+    //   - 直接 SetFocus(host_hwnd) 不保证 WebView2 child 收键盘事件，WebView2 子窗口
+    //     有自己的 focus 模型。Tauri 内部走 webview 专用路径，能把焦点真正送到 webview。
+    //   - SetForegroundWindow 在 Win11 focus-stealing prevention 下可能被拒。Tauri
+    //     2.x 在跨平台 abstraction 里做了兜底（按 SPI 临时调整 / attach input queue）。
+    //
+    // 对 issue #164 "QA 浮窗不抢前台 app 焦点"的取舍：浮窗出现时会短暂成为前台，
+    // 但 begin_qa_session 抓选区前 focus-dance 会把焦点临时还给用户原 app（见
+    // coordinator.rs 同 issue 注释），抓完再 refocus_qa_window 收回 —— 选区路径
+    // 仍能正常工作，issue #164 在「QA 出现的那一帧」短暂被违背是 #466 修复的代价。
+    if window.show().is_err() {
         return false;
     }
-
-    // 必须让 QA 浮窗拿到键盘焦点：否则 ESC 收不到、X 按钮 first-click 会被 OS 当作激活
-    // 事件吃掉 → 用户体感是"关不掉"。tauri.conf.json 里 `focus: false` 控制的是创建时
-    // 不激活，这里 show 时主动 SetForegroundWindow + SetFocus 把焦点交给 webview。
-    //
-    // 对 issue #164 "QA 浮窗不抢前台 app 焦点"的取舍说明：
-    // 浮窗出现时确实会成为前台，但 begin_qa_session 走 Ctrl+C 路径抓选区那一刻，
-    // 用户原 app 仍是 simulate_copy 目标（前台是 QA，但 SendInput 是把全局键盘事件
-    // 发到当前焦点窗口 —— 即 QA 自己 → 抓不到）。当前实现存在已知局限，但相比
-    // "X / ESC 完全无法关闭浮窗"的回归更轻。后续如需恢复"选区抓取不被打断"语义，
-    // 在 begin_qa_session 期间临时把焦点还给 saved front app HWND 再回收即可。
-    // issue #466。
-    let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
-    let _ = unsafe { SetForegroundWindow(hwnd) };
-    let _ = unsafe { SetFocus(hwnd) };
+    let _ = window.set_focus();
     true
 }
 
