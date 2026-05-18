@@ -94,6 +94,21 @@ static CAPSULE_NO_ACTIVATE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 static CAPSULE_SUPPRESSED_BY_TOGGLE_LOGGED: AtomicBool = AtomicBool::new(false);
 static CAPSULE_FIRST_SHOW_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// 给 #470 诊断日志用的 capsule 状态短名。显式枚举每个变体到 &'static str，
+/// 不走 `Debug` —— 哪天 CapsuleState 加了 `String` 字段，`:?` 会把 ASR / polish
+/// 内容意外灌进日志（pr_agent 提的 forward-looking 隐患）；这里只输出状态名。
+fn capsule_state_log_name(state: CapsuleState) -> &'static str {
+    match state {
+        CapsuleState::Idle => "idle",
+        CapsuleState::Recording => "recording",
+        CapsuleState::Transcribing => "transcribing",
+        CapsuleState::Polishing => "polishing",
+        CapsuleState::Done => "done",
+        CapsuleState::Cancelled => "cancelled",
+        CapsuleState::Error => "error",
+    }
+}
+
 fn show_capsule_window_for_recording<R: tauri::Runtime>(
     app: &AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
@@ -4239,7 +4254,8 @@ fn emit_capsule(
             // 发 / state 一直 Idle 这几类常见 root cause。issue #470。
             if !CAPSULE_FIRST_SHOW_LOGGED.swap(true, Ordering::SeqCst) {
                 log::info!(
-                    "[capsule] first show this session: show_capsule=true visible=true state={state:?}"
+                    "[capsule] first show this session: show_capsule=true visible=true state={}",
+                    capsule_state_log_name(state)
                 );
             }
             show_capsule_window_for_recording(&app_for_main, &window);
@@ -4256,7 +4272,8 @@ fn emit_capsule(
                 && !CAPSULE_SUPPRESSED_BY_TOGGLE_LOGGED.swap(true, Ordering::SeqCst)
             {
                 log::info!(
-                    "[capsule] suppressed by user toggle: show_capsule=false visible=true state={state:?}"
+                    "[capsule] suppressed by user toggle: show_capsule=false visible=true state={}",
+                    capsule_state_log_name(state)
                 );
             }
             hide_capsule_window_if_present();
