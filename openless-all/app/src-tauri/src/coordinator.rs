@@ -80,11 +80,14 @@ enum CapsuleShowStrategy {
 }
 
 fn capsule_show_strategy_for_platform() -> CapsuleShowStrategy {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    // ⚠️ 如果改下面的 cfg 列表，**必须**同步更新单元测试
+    // `capsule_show_strategy_matches_platform_activation_contract` 的两组 cfg —
+    // 否则 Linux CI 直接红（PR #451 即是这种漏改）。
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
         CapsuleShowStrategy::NoActivate
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         CapsuleShowStrategy::FallbackShow
     }
@@ -537,6 +540,8 @@ impl Coordinator {
                         .name("openless-combo-hotkey-bridge".into())
                         .spawn(move || combo_hotkey_bridge_loop(bridge_inner, rx))
                         .ok();
+                    #[cfg(target_os = "linux")]
+                    sync_custom_dictation_to_plugin(&inner_clone);
                 }
                 Err(e) => {
                     log::warn!("[coord] update combo hotkey binding 失败: {e}");
@@ -756,10 +761,20 @@ impl Coordinator {
 
     fn ensure_modifier_hotkey_monitor(&self, binding: crate::types::HotkeyBinding) {
         if let Some(monitor) = self.inner.hotkey.lock().as_ref() {
+            #[cfg(target_os = "linux")]
+            let plugin_binding = binding.clone();
             monitor.update_binding(binding);
+            #[cfg(target_os = "linux")]
+            if plugin_binding.trigger == crate::types::HotkeyTrigger::Custom {
+                sync_custom_dictation_to_plugin(&self.inner);
+            } else {
+                crate::linux_fcitx::sync_binding_to_plugin(&plugin_binding);
+            }
             return;
         }
         let (tx, rx) = mpsc::channel::<HotkeyEvent>();
+        #[cfg(target_os = "linux")]
+        let (fcitx_tx, fcitx_binding) = (tx.clone(), binding.clone());
         match HotkeyMonitor::start(binding, tx) {
             Ok(monitor) => {
                 let adapter = monitor.kind();
@@ -775,6 +790,16 @@ impl Coordinator {
                     .name("openless-hotkey-bridge".into())
                     .spawn(move || hotkey_bridge_loop(inner_clone, rx))
                     .ok();
+                // Linux: 启动 fcitx5 插件信号监听作为热键源。
+                #[cfg(target_os = "linux")]
+                {
+                    crate::linux_fcitx::start_dictation_signal_listener(fcitx_tx);
+                    if fcitx_binding.trigger == crate::types::HotkeyTrigger::Custom {
+                        sync_custom_dictation_to_plugin(&self.inner);
+                    } else {
+                        crate::linux_fcitx::sync_binding_to_plugin(&fcitx_binding);
+                    }
+                }
             }
             Err(e) => {
                 *self.inner.hotkey_status.lock() = HotkeyStatus {
@@ -820,16 +845,14 @@ impl Coordinator {
 
     /// 返回当前听写阶段（read-only 快照），供 CLI 入口在 dispatch toggle 时决策。
     /// 与原热键边沿走的 `handle_pressed` 分支完全相同的判定逻辑：Idle → start，
-    /// Listening → stop。Linux/Wayland 下桌面快捷键 → CLI 转发是唯一触发路径，
-    /// 必须复用这套语义。
+    /// Listening → stop。可用于桌面快捷键 → CLI 转发的备用触发路径。
     pub fn dictation_phase_for_cli(&self) -> SessionPhase {
         self.inner.state.lock().phase
     }
 
     /// CLI 入口的 QA toggle：直接复用 modifier-only QA 热键边沿的处理函数。
     /// 与 `handle_qa_hotkey_pressed` 同语义 — Idle → 开浮窗 / Recording → 收尾 /
-    /// Processing → 忽略。Wayland 下没有 modifier-only / global-hotkey 监听，CLI
-    /// 是唯一进入点。
+    /// Processing → 忽略。桌面快捷键 → CLI 转发的备用进入点。
     pub async fn cli_toggle_qa_panel(&self) {
         handle_qa_hotkey_pressed(&self.inner).await;
     }
@@ -990,13 +1013,29 @@ fn hotkey_supervisor_loop(inner: Arc<Inner>) {
         if inner.hotkey.lock().is_some() {
             return;
         }
+        // Linux: 启动前检查 fcitx5 插件是否可用
+        #[cfg(target_os = "linux")]
+        if !crate::linux_fcitx::available() {
+            *inner.hotkey_status.lock() = HotkeyStatus {
+                adapter: capability.adapter,
+                state: HotkeyStatusState::Failed,
+                message: Some("fcitx5 插件不可用 — 请确保 fcitx5 已安装且在运行".into()),
+                last_error: Some(crate::types::HotkeyInstallError {
+                    code: "fcitx5_unavailable".into(),
+                    message: "fcitx5 插件 DBus 接口无响应".into(),
+                }),
+            };
+            log::warn!("[hotkey-supervisor] fcitx5 plugin unavailable, retrying...");
+            attempts += 1;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            continue;
+        }
         *inner.hotkey_status.lock() = HotkeyStatus {
             adapter: capability.adapter,
             state: HotkeyStatusState::Starting,
             message: Some(format!("正在安装全局快捷键监听（第 {} 次）", attempts + 1)),
             last_error: None,
         };
-        let (tx, rx) = mpsc::channel::<HotkeyEvent>();
         let trigger = crate::shortcut_binding::legacy_modifier_trigger(&prefs.dictation_hotkey)
             .unwrap_or(crate::types::HotkeyTrigger::Custom);
         let binding = crate::types::HotkeyBinding {
@@ -1004,6 +1043,9 @@ fn hotkey_supervisor_loop(inner: Arc<Inner>) {
             mode: prefs.hotkey.mode,
             keys: None,
         };
+        let (tx, rx) = mpsc::channel::<HotkeyEvent>();
+        #[cfg(target_os = "linux")]
+        let (fcitx_tx, fcitx_binding) = (tx.clone(), binding.clone());
         match HotkeyMonitor::start(binding, tx) {
             Ok(monitor) => {
                 let adapter = monitor.kind();
@@ -1027,6 +1069,16 @@ fn hotkey_supervisor_loop(inner: Arc<Inner>) {
                     .name("openless-hotkey-bridge".into())
                     .spawn(move || hotkey_bridge_loop(inner_clone, rx))
                     .ok();
+                // Linux: 启动 fcitx5 插件信号监听作为热键源。
+                #[cfg(target_os = "linux")]
+                {
+                    crate::linux_fcitx::start_dictation_signal_listener(fcitx_tx);
+                    if fcitx_binding.trigger == crate::types::HotkeyTrigger::Custom {
+                        sync_custom_dictation_to_plugin(&inner);
+                    } else {
+                        crate::linux_fcitx::sync_binding_to_plugin(&fcitx_binding);
+                    }
+                }
                 return;
             }
             Err(e) => {
@@ -1253,11 +1305,17 @@ fn combo_hotkey_bridge_loop(inner: Arc<Inner>, rx: mpsc::Receiver<ComboHotkeyEve
         }
         let inner_cloned = Arc::clone(&inner);
         match evt {
+            // P0 #468/#475: 同 hotkey_bridge_loop —— Pressed/Released 必须串行 await，
+            // 否则 latch 竞态导致 combo 快捷键二次按键失效。
             ComboHotkeyEvent::Pressed => {
-                async_runtime::spawn(async move { handle_pressed_edge(&inner_cloned).await });
+                async_runtime::block_on(async {
+                    handle_pressed_edge(&inner_cloned).await;
+                });
             }
             ComboHotkeyEvent::Released => {
-                async_runtime::spawn(async move { handle_released_edge(&inner_cloned).await });
+                async_runtime::block_on(async {
+                    handle_released_edge(&inner_cloned).await;
+                });
             }
         }
     }
@@ -1594,6 +1652,21 @@ fn is_builtin_translation_shift(binding: &crate::types::ShortcutBinding) -> bool
     binding.modifiers.is_empty() && binding.primary.eq_ignore_ascii_case("shift")
 }
 
+/// Linux: 从 prefs 读取自定义组合键，同步到 fcitx5 插件。
+#[cfg(target_os = "linux")]
+fn sync_custom_dictation_to_plugin(inner: &Arc<Inner>) {
+    let prefs = inner.prefs.get();
+    let dictation = &prefs.dictation_hotkey;
+    let key_string = crate::linux_fcitx::binding_to_fcitx_key_string(dictation);
+    if key_string.is_empty() {
+        return;
+    }
+    match crate::linux_fcitx::set_custom_dictation_trigger(&key_string) {
+        Ok(()) => log::info!("[fcitx] Synced custom dictation trigger '{}' to plugin", key_string),
+        Err(e) => log::warn!("[fcitx] Failed to sync custom dictation trigger: {e}"),
+    }
+}
+
 fn modifier_shortcut_triggers(
     inner: &Arc<Inner>,
 ) -> (
@@ -1630,11 +1703,25 @@ fn hotkey_bridge_loop(inner: Arc<Inner>, rx: mpsc::Receiver<HotkeyEvent>) {
         }
         let inner_cloned = Arc::clone(&inner);
         match evt {
+            // P0 #468/#475: Pressed/Released 必须串行处理，否则在 Windows 上 WH_KEYBOARD_LL
+            // 边沿间隔微秒级 → 两个独立 spawn 的 task 被 work-stealing 调度器并行执行 →
+            // `hotkey_trigger_held` latch 翻转顺序错乱 → 下次按键被静默吞掉
+            // (UI 关不掉 / 录音停不下来)。改为 bridge 线程内 block_on 顺序 await，
+            // recv 的 FIFO 顺序就是 handler 执行顺序。
+            // 注意：handle_pressed_edge / handle_released_edge 内部走 .await（含网络
+            // 握手），会暂时阻塞本 bridge 线程；Hold 模式短按时 Released 会排队在 channel
+            // 里直到 begin_session 完成，但 SessionPhase::Starting 已经有
+            // request_stop_during_starting 兜底，begin_session 完成进 Listening 后
+            // bridge 立刻 recv Released → end_session，行为正确，仅有短暂 stop 延迟。
             HotkeyEvent::Pressed => {
-                async_runtime::spawn(async move { handle_pressed_edge(&inner_cloned).await });
+                async_runtime::block_on(async {
+                    handle_pressed_edge(&inner_cloned).await;
+                });
             }
             HotkeyEvent::Released => {
-                async_runtime::spawn(async move { handle_released_edge(&inner_cloned).await });
+                async_runtime::block_on(async {
+                    handle_released_edge(&inner_cloned).await;
+                });
             }
             HotkeyEvent::Cancelled => {
                 cancel_session(&inner_cloned);
@@ -1939,16 +2026,107 @@ fn should_try_non_tsf_insertion_fallback(
 fn insert_via_non_tsf_fallback(
     inner: &Arc<Inner>,
     polished: &str,
-    restore_clipboard: bool,
-    paste_shortcut: PasteShortcut,
+    _restore_clipboard: bool,
+    _paste_shortcut: PasteShortcut,
 ) -> InsertStatus {
-    if inner.inserter.insert_via_unicode_keystrokes(polished) == InsertStatus::Inserted {
-        log::info!("[windows-ime] TSF unavailable; inserted via Unicode SendInput");
-        InsertStatus::Inserted
-    } else {
-        inner
-            .inserter
-            .insert_via_clipboard_fallback(polished, restore_clipboard, paste_shortcut)
+    let status = finish_non_tsf_insertion_fallback(
+        || inner.inserter.insert_via_unicode_keystrokes(polished),
+        || inner.inserter.copy_fallback(polished),
+    );
+
+    match status {
+        InsertStatus::Inserted => {
+            log::warn!(
+                "[windows-ime] TSF unavailable; inserted via paced Unicode SendInput fallback"
+            );
+        }
+        InsertStatus::CopiedFallback => {
+            log::warn!(
+                "[windows-ime] TSF unavailable; Unicode SendInput failed, left text on clipboard"
+            );
+        }
+        InsertStatus::PasteSent | InsertStatus::Failed => {
+            log::warn!(
+                "[windows-ime] TSF unavailable; Unicode SendInput fallback failed and copy fallback failed"
+            );
+        }
+    }
+
+    status
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn finish_non_tsf_insertion_fallback<U, C>(
+    mut unicode_fallback: U,
+    mut copy_only_fallback: C,
+) -> InsertStatus
+where
+    U: FnMut() -> InsertStatus,
+    C: FnMut() -> InsertStatus,
+{
+    match unicode_fallback() {
+        InsertStatus::Inserted => InsertStatus::Inserted,
+        InsertStatus::PasteSent | InsertStatus::CopiedFallback | InsertStatus::Failed => {
+            match copy_only_fallback() {
+                InsertStatus::CopiedFallback => InsertStatus::CopiedFallback,
+                // TextInserter::copy_fallback is copy-only: success is CopiedFallback.
+                // Treat any other status as failure so this helper never invents an insert.
+                InsertStatus::Inserted | InsertStatus::PasteSent | InsertStatus::Failed => {
+                    InsertStatus::Failed
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod non_tsf_fallback_tests {
+    use super::finish_non_tsf_insertion_fallback;
+    use crate::types::InsertStatus;
+
+    #[test]
+    fn unicode_fallback_runs_before_copy_fallback() {
+        let mut copy_called = false;
+        let status = finish_non_tsf_insertion_fallback(
+            || InsertStatus::Inserted,
+            || {
+                copy_called = true;
+                InsertStatus::CopiedFallback
+            },
+        );
+
+        assert_eq!(status, InsertStatus::Inserted);
+        assert!(!copy_called);
+    }
+
+    #[test]
+    fn copy_fallback_runs_after_unicode_failure() {
+        let mut copy_called = false;
+        let status = finish_non_tsf_insertion_fallback(
+            || InsertStatus::Failed,
+            || {
+                copy_called = true;
+                InsertStatus::CopiedFallback
+            },
+        );
+
+        assert_eq!(status, InsertStatus::CopiedFallback);
+        assert!(copy_called);
+    }
+
+    #[test]
+    fn double_failure_does_not_pretend_text_was_copied() {
+        let mut copy_called = false;
+        let status = finish_non_tsf_insertion_fallback(
+            || InsertStatus::Failed,
+            || {
+                copy_called = true;
+                InsertStatus::Failed
+            },
+        );
+
+        assert_eq!(status, InsertStatus::Failed);
+        assert!(copy_called);
     }
 }
 
@@ -2024,7 +2202,10 @@ fn ensure_asr_credentials() -> Result<(), String> {
         {
             return Err("Foundry Local Whisper 当前仅支持 Windows".to_string());
         }
-        return Ok(());
+        #[cfg(target_os = "windows")]
+        {
+            return Ok(());
+        }
     }
 
     if is_whisper_compatible_provider(&active_asr) || is_bailian_provider(&active_asr) {
@@ -3591,13 +3772,16 @@ mod tests {
 
     #[test]
     fn capsule_show_strategy_matches_platform_activation_contract() {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        // 平台列表必须与 capsule_show_strategy_for_platform 的 cfg 完全一致：
+        // 改实现里的 #[cfg] 时，一并改这两个 #[cfg]，否则 Linux CI 直接红
+        // （fcitx5 PR #451 把 Linux 加进 NoActivate 但漏改本测试，CI 失败）。
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         assert_eq!(
             capsule_show_strategy_for_platform(),
             CapsuleShowStrategy::NoActivate
         );
 
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         assert_eq!(
             capsule_show_strategy_for_platform(),
             CapsuleShowStrategy::FallbackShow
@@ -3704,7 +3888,7 @@ mod tests {
     #[test]
     fn focus_restore_failure_uses_specific_error_code_when_insert_fails() {
         assert_eq!(
-            dictation_error_code(InsertStatus::Failed, false, false, false, false),
+            dictation_error_code(InsertStatus::Failed, false, false, false),
             Some("focusRestoreFailed")
         );
     }
@@ -3721,7 +3905,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn tsf_required_failure_keeps_tsf_error_when_focus_was_ready() {
         assert_eq!(
-            dictation_error_code(InsertStatus::Failed, false, true, false, false),
+            dictation_error_code(InsertStatus::Failed, false, true, false),
             Some("windowsImeTsfRequired")
         );
     }
@@ -3814,6 +3998,7 @@ mod tests {
             "key".to_string(),
             "http://localhost".to_string(),
             "model".to_string(),
+            None,
             None,
         ));
         *coordinator.inner.asr.lock() = Some(SessionResource::new(
@@ -4201,7 +4386,17 @@ fn show_capsule_window_no_activate<R: tauri::Runtime>(
     true
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+fn show_capsule_window_no_activate<R: tauri::Runtime>(
+    _app: &AppHandle<R>,
+    _window: &tauri::WebviewWindow<R>,
+) -> bool {
+    // Linux/fcitx5: Wayland 上弹胶囊窗口会触发 workspace 跳转且无法可靠
+    // no-activate。返回 true 抑制胶囊窗口，不让 wrapper fallback 到 window.show()。
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn show_capsule_window_no_activate<R: tauri::Runtime>(
     _app: &AppHandle<R>,
     _window: &tauri::WebviewWindow<R>,
@@ -4285,6 +4480,13 @@ fn emit_capsule(
             return;
         };
         let show_capsule = inner_for_main.prefs.get().show_capsule;
+        // Linux: 不操作胶囊窗口（不 show/hide，不 reposition）。
+        // 文字通过 fcitx5 插件直接 commit，用户始终在目标 app 中。
+        #[cfg(target_os = "linux")]
+        {
+            return;
+        }
+
         // 三平台统一：Done / Cancelled / Error 状态保留 ~1.5s toast
         // （schedule_capsule_idle 之后会回 Idle 隐藏）。
         // Windows 上 linger 的真实问题（截图选中 / 死区 / 拖拽卡顿）由 #140 加的

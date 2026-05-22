@@ -12,6 +12,7 @@ use super::*;
 /// 同一个 hotkey 边沿之间的最小间隔。低于此阈值的连按整体作为误触丢弃 ——
 /// 避免微动开关回弹 / 用户手抖双击造成的空转写报错和 ASR session 抢资源。
 const HOTKEY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+const STREAMING_INSERT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
 
 /// 跑流式润色路径（opt-in，跨平台）。
 ///
@@ -21,12 +22,12 @@ const HOTKEY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(25
 /// - **Windows**：`switch_to_ascii` 是 no-op（SendInput Unicode 绕过 TSF）；
 ///   `type_unicode_chunk` 走 `SendInput(KEYEVENTF_UNICODE)`。
 /// - **Linux（实验）**：`switch_to_ascii` 是 no-op；`type_unicode_chunk` 走 enigo
-///   `Keyboard::text`。X11 / XTest 稳定，Wayland 看 compositor 给不给 libei 权限。
+///   `Keyboard::text`。X11 / XTest 稳定。
 ///
 /// 通用流程：
 /// 1. `switch_to_ascii`（macOS）/ no-op（其他）；失败则降级回一次性 `polish_or_passthrough`。
-/// 2. 起一个 `spawn_blocking` 后台任务，从 mpsc 收 SSE delta，逐 delta 调
-///    `type_unicode_chunk` 模拟键盘事件落到光标处。串行有序，无竞态。
+/// 2. 起一个 `spawn_blocking` 后台任务，从 mpsc 收 SSE delta，按 12ms flush window
+///    合并后调 `type_unicode_chunk` 模拟键盘事件落到光标处。串行有序，无竞态。
 /// 3. 调 `polish_or_passthrough_streaming`，`on_delta` 把 chunk 塞进 mpsc。
 /// 4. 流结束 / 失败 / 取消 → drop mpsc 发送端 → typer 任务 drain 完剩余 delta 退出 →
 ///    `restore_input_source` 恢复用户原输入源（macOS 才有意义，其他平台 no-op）。
@@ -111,45 +112,9 @@ async fn run_streaming_polish(
     // 同时累积 typed_text：屏幕上真正落字的内容，用于（a）SSE 中途失败时让 history
     // 与用户实际看到的内容一致；（b）pr-agent #412 反馈 \"saved output diverges
     // from what the user actually sees\"。
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
     let typer_handle = tokio::task::spawn_blocking(move || {
-        let mut rx = rx;
-        let mut typed_text = String::new();
-        let mut first_failure: Option<String> = None;
-        while let Some(delta) = rx.blocking_recv() {
-            if first_failure.is_some() {
-                // 一旦类型链路出错（如 Secure Input 启用），后续 delta 全部丢弃，但仍
-                // 把 mpsc drain 完，避免发送端阻塞。
-                continue;
-            }
-            let delta_chars = delta.chars().count();
-            match crate::unicode_keystroke::type_unicode_chunk(&delta) {
-                Ok(typed_chars) => {
-                    let appended = append_typed_prefix(&mut typed_text, &delta, typed_chars);
-                    if appended < delta_chars {
-                        let reason = format!(
-                            "type_unicode_chunk typed only {appended}/{delta_chars} chars without error"
-                        );
-                        log::error!(
-                            "[coord] streaming_insert: {reason} at typed={} chars; \
-                             dropping remaining deltas",
-                            typed_text.chars().count()
-                        );
-                        first_failure = Some(reason);
-                    }
-                }
-                Err(e) => {
-                    append_typed_prefix(&mut typed_text, &delta, e.typed_chars());
-                    log::error!(
-                        "[coord] streaming_insert: type_unicode_chunk failed at typed={} chars: {e}; \
-                         dropping remaining deltas",
-                        typed_text.chars().count()
-                    );
-                    first_failure = Some(e.to_string());
-                }
-            }
-        }
-        (typed_text, first_failure)
+        drain_streaming_insert_deltas(rx, STREAMING_INSERT_FLUSH_INTERVAL)
     });
 
     // 3. 调流式润色，on_delta 塞 mpsc；should_cancel 检查 dictation 取消旗。
@@ -286,6 +251,105 @@ async fn run_streaming_polish(
     }
 }
 
+fn drain_streaming_insert_deltas(
+    rx: std::sync::mpsc::Receiver<String>,
+    flush_interval: std::time::Duration,
+) -> (String, Option<String>) {
+    drain_streaming_insert_deltas_with(rx, flush_interval, flush_streaming_insert_buffer)
+}
+
+fn drain_streaming_insert_deltas_with<F>(
+    rx: std::sync::mpsc::Receiver<String>,
+    flush_interval: std::time::Duration,
+    mut flush_pending: F,
+) -> (String, Option<String>)
+where
+    F: FnMut(&mut String, &mut String) -> Option<String>,
+{
+    let mut typed_text = String::new();
+    let mut first_failure: Option<String> = None;
+    let mut pending = String::new();
+    while let Ok(delta) = rx.recv() {
+        pending.push_str(&delta);
+        let flush_at = std::time::Instant::now() + flush_interval;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= flush_at {
+                break;
+            }
+            match rx.recv_timeout(flush_at.duration_since(now)) {
+                Ok(delta) => pending.push_str(&delta),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    first_failure = flush_pending(&mut pending, &mut typed_text);
+                    return (typed_text, first_failure);
+                }
+            }
+        }
+        first_failure = flush_pending(&mut pending, &mut typed_text);
+        if first_failure.is_some() {
+            // 一旦类型链路出错（如 Secure Input 启用），后续 delta 全部丢弃，但仍
+            // 把 mpsc drain 完，避免发送端阻塞。
+            while rx.recv().is_ok() {}
+            break;
+        }
+    }
+    if first_failure.is_none() {
+        first_failure = flush_pending(&mut pending, &mut typed_text);
+    }
+    (typed_text, first_failure)
+}
+
+fn flush_streaming_insert_buffer(pending: &mut String, typed_text: &mut String) -> Option<String> {
+    flush_streaming_insert_buffer_with(
+        pending,
+        typed_text,
+        crate::unicode_keystroke::type_unicode_chunk,
+    )
+}
+
+fn flush_streaming_insert_buffer_with<F>(
+    pending: &mut String,
+    typed_text: &mut String,
+    mut type_chunk: F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Result<usize, crate::unicode_keystroke::TypeError>,
+{
+    if pending.is_empty() {
+        return None;
+    }
+    let delta = std::mem::take(pending);
+    let delta_chars = delta.chars().count();
+    match type_chunk(&delta) {
+        Ok(typed_chars) => {
+            let appended = append_typed_prefix(typed_text, &delta, typed_chars);
+            if appended < delta_chars {
+                let reason = format!(
+                    "type_unicode_chunk typed only {appended}/{delta_chars} chars without error"
+                );
+                log::error!(
+                    "[coord] streaming_insert: {reason} at typed={} chars; \
+                     dropping remaining deltas",
+                    typed_text.chars().count()
+                );
+                Some(reason)
+            } else {
+                None
+            }
+        }
+        Err(e) => {
+            append_typed_prefix(typed_text, &delta, e.typed_chars());
+            log::error!(
+                "[coord] streaming_insert: type_unicode_chunk failed at typed={} chars: {e}; \
+                 dropping remaining deltas",
+                typed_text.chars().count()
+            );
+            Some(e.to_string())
+        }
+    }
+}
+
 fn finalize_polished_text(
     polished: String,
     translation_active: bool,
@@ -329,24 +393,8 @@ fn streaming_insert_eligible(
     translation_active: bool,
     mode: PolishMode,
     raw_uses_llm: bool,
-    wayland_session: bool,
 ) -> bool {
-    streaming_insert_enabled
-        && !translation_active
-        && (mode != PolishMode::Raw || raw_uses_llm)
-        && !wayland_session
-}
-
-fn wayland_done_message(status: InsertStatus, polish_failed: bool) -> Option<String> {
-    match status {
-        InsertStatus::Inserted | InsertStatus::PasteSent => None,
-        InsertStatus::CopiedFallback => Some(if polish_failed {
-            "Wayland 未启用自动输入，已复制原文到剪贴板，请手动粘贴".to_string()
-        } else {
-            "Wayland 未启用自动输入，已复制到剪贴板，请手动粘贴".to_string()
-        }),
-        InsertStatus::Failed => Some("Wayland 未启用自动输入，剪贴板写入失败".to_string()),
-    }
+    streaming_insert_enabled && !translation_active && (mode != PolishMode::Raw || raw_uses_llm)
 }
 
 fn default_done_message(status: InsertStatus, polish_failed: bool) -> Option<String> {
@@ -693,6 +741,7 @@ pub(super) async fn begin_session(inner: &Arc<Inner>) -> Result<(), String> {
             base_url,
             model,
             whisper_prompt,
+            batch_asr_chunk_limit_ms(&active_asr),
         ));
         store_asr_for_session(
             inner,
@@ -780,6 +829,13 @@ pub(super) async fn begin_session(inner: &Arc<Inner>) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn batch_asr_chunk_limit_ms(provider_id: &str) -> Option<u64> {
+    match provider_id {
+        "zhipu" => Some(30_000),
+        _ => None,
+    }
 }
 
 pub(super) async fn start_recorder_for_starting(
@@ -1410,16 +1466,14 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     };
     // 流式插入 opt-in 路径：开关打开 + 非翻译 + 非 Raw 模式 → 进入流式分支。
     // 任何不满足都走原一次性 polish_or_passthrough 路径，行为跟历史完全一致。
-    let wayland_session = crate::hotkey::is_wayland_session();
     let streaming_eligible = streaming_insert_eligible(
         prefs.streaming_insert,
         translation_active,
         mode,
         raw_uses_llm,
-        wayland_session,
     );
     log::info!(
-        "[coord] polish dispatch: translation={translation_active} mode={mode:?} wayland_session={wayland_session} streaming_eligible={streaming_eligible}"
+        "[coord] polish dispatch: translation={translation_active} mode={mode:?} streaming_eligible={streaming_eligible}"
     );
 
     let (polished, polish_error, already_streamed) = if translation_active {
@@ -1523,24 +1577,6 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             polish_error
         );
         InsertStatus::Inserted
-    } else if wayland_session {
-        log::info!(
-            "[coord] Wayland session detected; skipping synthetic paste and attempting copy-only fallback ({} chars)",
-            polished.chars().count()
-        );
-        let status = inner.inserter.copy_fallback(&polished);
-        match status {
-            InsertStatus::CopiedFallback => {
-                log::info!("[coord] Wayland copy-only fallback succeeded")
-            }
-            InsertStatus::Failed => {
-                log::error!("[coord] Wayland copy-only fallback failed: clipboard write failed")
-            }
-            other => log::warn!(
-                "[coord] Wayland copy-only fallback returned unexpected status: {other:?}"
-            ),
-        }
-        status
     } else if focus_ready_for_paste {
         #[cfg(target_os = "windows")]
         {
@@ -1563,13 +1599,23 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                 .insert(&polished, restore_clipboard, paste_shortcut)
         }
     } else {
-        log::warn!(
-            "[coord] original insertion target is not foreground; copied output without paste"
-        );
-        if allow_non_tsf_insertion_fallback {
-            inner.inserter.copy_fallback(&polished)
-        } else {
-            InsertStatus::Failed
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: fcitx5 commitString 无需窗口焦点，始终尝试插入。
+            inner
+                .inserter
+                .insert(&polished, restore_clipboard, paste_shortcut)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            log::warn!(
+                "[coord] original insertion target is not foreground; copied output without paste"
+            );
+            if allow_non_tsf_insertion_fallback {
+                inner.inserter.copy_fallback(&polished)
+            } else {
+                InsertStatus::Failed
+            }
         }
     };
     restore_prepared_windows_ime_session(inner, current_session_id);
@@ -1599,7 +1645,6 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         polish_error.is_some(),
         focus_ready_for_paste,
         allow_non_tsf_insertion_fallback,
-        wayland_session,
     )
     .map(str::to_string);
     let tsf_required_insert_failed = error_code.as_deref() == Some("windowsImeTsfRequired");
@@ -1636,8 +1681,6 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     }
     let done_message = if tsf_required_insert_failed {
         Some("TSF 未上屏，已禁止非 TSF 兜底".to_string())
-    } else if wayland_session {
-        wayland_done_message(status, polish_error.is_some())
     } else {
         default_done_message(status, polish_error.is_some())
     };
@@ -1666,11 +1709,8 @@ pub(super) fn dictation_error_code(
     polish_failed: bool,
     focus_ready_for_paste: bool,
     allow_non_tsf_insertion_fallback: bool,
-    wayland_session: bool,
 ) -> Option<&'static str> {
-    if wayland_session && status == InsertStatus::Failed {
-        Some("waylandClipboardWriteFailed")
-    } else if !focus_ready_for_paste && status == InsertStatus::Failed {
+    if !focus_ready_for_paste && status == InsertStatus::Failed {
         Some("focusRestoreFailed")
     } else if cfg!(target_os = "windows")
         && focus_ready_for_paste
@@ -1726,8 +1766,9 @@ fn append_typed_prefix(target: &mut String, delta: &str, typed_chars: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        append_typed_prefix, default_done_message, dictation_error_code, finalize_polished_text,
-        streaming_insert_eligible, wayland_done_message,
+        append_typed_prefix, batch_asr_chunk_limit_ms, default_done_message,
+        drain_streaming_insert_deltas_with, finalize_polished_text,
+        flush_streaming_insert_buffer_with, streaming_insert_eligible,
     };
     use crate::types::{ChineseScriptPreference, CorrectionRule, InsertStatus, PolishMode};
 
@@ -1814,45 +1855,26 @@ mod tests {
     }
 
     #[test]
-    fn wayland_disables_streaming_insert_even_when_pref_enabled() {
-        assert!(!streaming_insert_eligible(
-            true,
-            false,
-            PolishMode::Light,
-            false,
-            true
-        ));
-    }
-
-    #[test]
-    fn x11_linux_can_still_use_streaming_insert_when_other_gates_pass() {
+    fn streaming_insert_eligible_when_gates_allow() {
         assert!(streaming_insert_eligible(
             true,
             false,
             PolishMode::Light,
             false,
-            false
         ));
     }
 
     #[test]
-    fn wayland_done_message_tells_user_manual_paste_is_required() {
-        assert_eq!(
-            wayland_done_message(InsertStatus::CopiedFallback, false),
-            Some("Wayland 未启用自动输入，已复制到剪贴板，请手动粘贴".to_string())
-        );
-        assert_eq!(
-            wayland_done_message(InsertStatus::CopiedFallback, true),
-            Some("Wayland 未启用自动输入，已复制原文到剪贴板，请手动粘贴".to_string())
-        );
-        assert_eq!(
-            wayland_done_message(InsertStatus::Failed, false),
-            Some("Wayland 未启用自动输入，剪贴板写入失败".to_string())
-        );
+    fn batch_asr_chunk_limit_applies_only_to_zhipu() {
+        assert_eq!(batch_asr_chunk_limit_ms("zhipu"), Some(30_000));
+        assert_eq!(batch_asr_chunk_limit_ms("whisper"), None);
+        assert_eq!(batch_asr_chunk_limit_ms("siliconflow"), None);
+        assert_eq!(batch_asr_chunk_limit_ms("groq"), None);
+        assert_eq!(batch_asr_chunk_limit_ms("volcengine"), None);
     }
 
     #[test]
-    fn default_done_message_keeps_existing_non_wayland_behavior() {
+    fn default_done_message_works_correctly() {
         assert_eq!(
             default_done_message(InsertStatus::PasteSent, false),
             Some("已尝试粘贴".to_string())
@@ -1864,10 +1886,59 @@ mod tests {
     }
 
     #[test]
-    fn wayland_clipboard_failure_uses_specific_error_code() {
-        assert_eq!(
-            dictation_error_code(InsertStatus::Failed, false, false, true, true),
-            Some("waylandClipboardWriteFailed")
+    fn streaming_insert_batches_queued_deltas_before_flush() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send("你".to_string()).unwrap();
+        tx.send("好".to_string()).unwrap();
+        tx.send("🙂".to_string()).unwrap();
+        drop(tx);
+
+        let mut flushed = Vec::new();
+        let (typed, failure) = drain_streaming_insert_deltas_with(
+            rx,
+            std::time::Duration::from_millis(50),
+            |pending, typed_text| {
+                flushed.push(pending.clone());
+                typed_text.push_str(pending);
+                pending.clear();
+                None
+            },
         );
+
+        assert_eq!(flushed, vec!["你好🙂".to_string()]);
+        assert_eq!(typed, "你好🙂");
+        assert_eq!(failure, None);
+    }
+
+    #[test]
+    fn flush_streaming_insert_buffer_keeps_partial_unicode_prefix() {
+        let mut pending = "a你🙂b".to_string();
+        let mut typed = String::new();
+
+        let failure = flush_streaming_insert_buffer_with(&mut pending, &mut typed, |_| {
+            Err(crate::unicode_keystroke::TypeError::Partial {
+                typed_chars: 3,
+                source: Box::new(platform_type_error()),
+            })
+        });
+
+        assert_eq!(typed, "a你🙂");
+        assert!(pending.is_empty());
+        assert!(failure.is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn platform_type_error() -> crate::unicode_keystroke::TypeError {
+        crate::unicode_keystroke::TypeError::EventAllocFailed
+    }
+
+    #[cfg(target_os = "windows")]
+    fn platform_type_error() -> crate::unicode_keystroke::TypeError {
+        crate::unicode_keystroke::TypeError::SendInputFailed("fail".into())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn platform_type_error() -> crate::unicode_keystroke::TypeError {
+        crate::unicode_keystroke::TypeError::EnigoText("fail".into())
     }
 }

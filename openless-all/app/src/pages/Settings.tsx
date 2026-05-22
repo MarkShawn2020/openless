@@ -16,7 +16,6 @@ import {
 import { createHotkeyRecorderState, orderHotkeyCodes, updateHotkeyRecorderState } from '../lib/hotkeyRecorder';
 import {
   isTauri,
-  isWaylandCliMode,
   listMicrophoneDevices,
   openExternal,
   listProviderModels,
@@ -47,7 +46,7 @@ import {
   type LocalAsrModelStatus,
   type LocalAsrSettings,
 } from '../lib/localAsr';
-import { SettingRow, Toggle, inputStyle, type AsrPresetId } from './settings/shared';
+import { SettingRow, Toggle, inputStyle, SectionTitle, SectionDesc, type AsrPresetId } from './settings/shared';
 import { AdvancedSection } from './settings/AdvancedSection';
 import { ShortcutsSection } from './settings/ShortcutsSection';
 import { PermissionsSection } from './settings/PermissionsSection';
@@ -112,7 +111,6 @@ export function Settings({ embedded = false, initialSection = 'recording' }: Set
         <PageHeader
           kicker={t('settings.kicker')}
           title={t('settings.title')}
-          desc={t('settings.desc')}
         />
       )}
       {/* embedded（在 SettingsModal 里）模式下：mini-sidebar 固定，仅右栏 scroll。
@@ -200,24 +198,6 @@ function RecordingSection() {
   const [microphoneDevicesLoaded, setMicrophoneDevicesLoaded] = useState(false);
   const [microphoneDevicesError, setMicrophoneDevicesError] = useState<string | null>(null);
   const [microphonePickerOpen, setMicrophonePickerOpen] = useState(false);
-  // Wayland 下 rdev 监听不可用（issue #420）。改用 pull 模型：mount 时 invoke 拉状态。
-  // 不能依赖一次性 event — Settings 模态是按需 mount，emit 早在 setup 阶段发完了。
-  // XDG_SESSION_TYPE 在进程生命周期内不会变，拉一次即可，无需 polling 或 listener。
-  const [waylandCliMode, setWaylandCliMode] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    void isWaylandCliMode()
-      .then(value => {
-        if (!cancelled) setWaylandCliMode(value);
-      })
-      .catch((err: unknown) => {
-        console.warn('[settings] is_wayland_cli_mode query failed', err);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   const loadMicrophoneDevices = useCallback(async (
     signal?: { cancelled: boolean },
@@ -366,8 +346,7 @@ function RecordingSection() {
   return (
     <>
     <Card>
-      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{t('settings.recording.title')}</div>
-      <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginBottom: 6 }}>{t('settings.recording.desc')}</div>
+      <SectionTitle>{t('settings.recording.title')}</SectionTitle>
       {isHotkeyModeMigrationNoticeActive() && (
         <div
           style={{
@@ -383,12 +362,11 @@ function RecordingSection() {
             {t('settings.recording.migrationNoticeTitle')}
           </div>
           <div style={{ fontSize: 11.5, color: 'var(--ol-ink-3)', lineHeight: 1.55 }}>
-            {t('settings.recording.migrationNoticeDesc')}
+                        {t('settings.recording.migrationNoticeDesc')}
           </div>
         </div>
       )}
-      {waylandCliMode && <WaylandHotkeyCallout />}
-      <SettingRow label={t('settings.recording.hotkeyLabel')} desc={hotkeyDesc}>
+      <SettingRow label={t('settings.recording.hotkeyLabel')}>
         <ShortcutRecorder
           value={prefs.dictationHotkey}
           onSave={async binding => {
@@ -397,7 +375,7 @@ function RecordingSection() {
           }}
         />
       </SettingRow>
-      <SettingRow label={t('settings.recording.modeLabel')} desc={t('settings.recording.modeDesc')}>
+      <SettingRow label={t('settings.recording.modeLabel')}>
         <div style={{ display: 'inline-flex', padding: 2, borderRadius: 8, background: 'rgba(0,0,0,0.05)' }}>
           {choices.map(([v, l]) => (
             <button
@@ -418,7 +396,7 @@ function RecordingSection() {
           ))}
         </div>
       </SettingRow>
-      <SettingRow label={t('settings.recording.microphoneLabel')} desc={t('settings.recording.microphoneDesc')}>
+      <SettingRow label={t('settings.recording.microphoneLabel')}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           <button
             type="button"
@@ -479,12 +457,11 @@ function RecordingSection() {
           }}
         />
       )}
-      <SettingRow label={t('settings.recording.capsuleLabel')} desc={t('settings.recording.capsuleDesc')}>
+      <SettingRow label={t('settings.recording.capsuleLabel')}>
         <Toggle on={prefs.showCapsule} onToggle={onShowCapsuleChange} />
       </SettingRow>
       <SettingRow
         label={t('settings.recording.muteDuringRecordingLabel')}
-        desc={t('settings.recording.muteDuringRecordingDesc')}
       >
         <Toggle on={prefs.muteDuringRecording} onToggle={onMuteDuringRecordingChange} />
       </SettingRow>
@@ -494,14 +471,12 @@ function RecordingSection() {
     <Collapsible title={t('settings.recording.insertGroupTitle')}>
       <SettingRow
         label={t('settings.recording.restoreClipboardLabel')}
-        desc={t('settings.recording.restoreClipboardDesc')}
       >
         <Toggle on={prefs.restoreClipboardAfterPaste} onToggle={onRestoreClipboardChange} />
       </SettingRow>
       {capability.adapter !== 'macEventTap' && (
         <SettingRow
           label={t('settings.recording.pasteShortcutLabel')}
-          desc={t('settings.recording.pasteShortcutDesc')}
         >
           <SelectLite
             value={prefs.pasteShortcut}
@@ -519,7 +494,6 @@ function RecordingSection() {
       {capability.adapter === 'windowsLowLevel' && (
         <SettingRow
           label={t('settings.recording.allowNonTsfFallbackLabel')}
-          desc={t('settings.recording.allowNonTsfFallbackDesc')}
         >
           <Toggle
             on={prefs.allowNonTsfInsertionFallback}
@@ -533,7 +507,6 @@ function RecordingSection() {
     <Collapsible title={t('settings.recording.historyGroupTitle')}>
       <SettingRow
         label={t('settings.recording.historyRetentionLabel')}
-        desc={t('settings.recording.historyRetentionDesc')}
       >
         <input
           type="number"
@@ -546,7 +519,6 @@ function RecordingSection() {
       </SettingRow>
       <SettingRow
         label={t('settings.recording.historyMaxEntriesLabel')}
-        desc={t('settings.recording.historyMaxEntriesDesc')}
       >
         <input
           type="number"
@@ -560,7 +532,6 @@ function RecordingSection() {
       </SettingRow>
       <SettingRow
         label={t('settings.recording.polishContextWindowLabel')}
-        desc={t('settings.recording.polishContextWindowDesc')}
       >
         <input
           type="number"
@@ -573,13 +544,11 @@ function RecordingSection() {
       </SettingRow>
       <SettingRow
         label={t('settings.recording.recordAudioForDebugLabel')}
-        desc={t('settings.recording.recordAudioForDebugDesc')}
       >
         <Toggle on={prefs.recordAudioForDebug} onToggle={onRecordAudioForDebugChange} />
       </SettingRow>
       <SettingRow
         label={t('settings.recording.audioRecordingMaxEntriesLabel')}
-        desc={t('settings.recording.audioRecordingMaxEntriesDesc')}
       >
         <input
           type="number"
@@ -599,13 +568,11 @@ function RecordingSection() {
       <AutostartRow />
       <SettingRow
         label={t('settings.recording.startMinimizedLabel')}
-        desc={t('settings.recording.startMinimizedDesc')}
       >
         <Toggle on={prefs.startMinimized} onToggle={onStartMinimizedChange} />
       </SettingRow>
       <SettingRow
         label={t('settings.recording.autoUpdateCheckLabel')}
-        desc={t('settings.recording.autoUpdateCheckDesc')}
       >
         <Toggle on={prefs.autoUpdateCheck} onToggle={onAutoUpdateCheckChange} />
       </SettingRow>
@@ -622,7 +589,6 @@ function RecordingSection() {
     <Collapsible title={t('settings.recording.marketplaceGroupTitle')}>
       <SettingRow
         label={t('settings.recording.marketplaceDevLoginLabel')}
-        desc={t('settings.recording.marketplaceDevLoginDesc')}
       >
         <input
           type="text"
@@ -634,171 +600,6 @@ function RecordingSection() {
       </SettingRow>
     </Collapsible>
     </>
-  );
-}
-
-/// Wayland 引导 callout：告诉用户绑桌面环境快捷键到 `openless --toggle-dictation`。
-/// 显示条件由父组件控制（mount 时 invoke `is_wayland_cli_mode` 拉状态后渲染）。
-/// 文案逐桌面环境列出步骤，每段 ≤ 5 行，详细的命令在 README 里。
-function WaylandHotkeyCallout() {
-  const { t } = useTranslation();
-  const [helpOpen, setHelpOpen] = useState(false);
-  // 三条命令各自独立的"已复制"反馈。用 string 而非 boolean 数组，
-  // 避免 stale state（重复点击不同按钮时旧 timer 把别人擦掉）。
-  const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
-
-  const onCopy = useCallback(async (command: string) => {
-    try {
-      await navigator.clipboard.writeText(command);
-      setCopiedCommand(command);
-      // 1.5s 后还原按钮文案；同时校验仍是这条命令，避免被后点的覆盖。
-      setTimeout(() => {
-        setCopiedCommand(prev => (prev === command ? null : prev));
-      }, 1500);
-    } catch (err) {
-      console.warn('[wayland-callout] clipboard write failed', err);
-    }
-  }, []);
-
-  // 三条 CLI 命令 + 用途短标签。aeoform 在 #420 反馈 1.3.1-19 没提
-  // --toggle-qa / --cancel-dictation，本次补全。
-  const commandRows: Array<readonly [string, string]> = [
-    ['openless --toggle-dictation', t('settings.recording.wayland.commandToggleDictationLabel')],
-    ['openless --toggle-qa', t('settings.recording.wayland.commandToggleQaLabel')],
-    ['openless --cancel-dictation', t('settings.recording.wayland.commandCancelDictationLabel')],
-  ];
-
-  const helpEntries: Array<readonly [string, string]> = [
-    [t('settings.recording.wayland.gnomeTitle'), t('settings.recording.wayland.gnomeSteps')],
-    [t('settings.recording.wayland.kdeTitle'), t('settings.recording.wayland.kdeSteps')],
-    [t('settings.recording.wayland.hyprlandTitle'), t('settings.recording.wayland.hyprlandSteps')],
-    [t('settings.recording.wayland.swayTitle'), t('settings.recording.wayland.swaySteps')],
-  ];
-
-  return (
-    <div
-      style={{
-        marginTop: 10,
-        marginBottom: 8,
-        padding: '12px 14px',
-        borderRadius: 10,
-        background: 'rgba(217,119,6,0.08)',
-        border: '0.5px solid rgba(217,119,6,0.22)',
-      }}
-    >
-      <div style={{ fontSize: 12.5, fontWeight: 600, color: '#b45309', marginBottom: 4 }}>
-        {t('settings.recording.wayland.calloutTitle')}
-      </div>
-      <div style={{ fontSize: 11.5, color: 'var(--ol-ink-3)', lineHeight: 1.55, marginBottom: 8 }}>
-        {t('settings.recording.wayland.calloutBody')}
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 8 }}>
-        {commandRows.map(([command, label]) => (
-          <div
-            key={command}
-            style={{ display: 'flex', alignItems: 'center', gap: 10 }}
-          >
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '8px 10px',
-                borderRadius: 8,
-                background: 'rgba(255,255,255,0.7)',
-                border: '0.5px solid rgba(0,0,0,0.08)',
-                flex: 1,
-                minWidth: 0,
-              }}
-            >
-              <code
-                style={{
-                  flex: 1,
-                  minWidth: 0,
-                  fontSize: 12,
-                  fontFamily: 'ui-monospace, SF Mono, Menlo, Consolas, monospace',
-                  color: 'var(--ol-ink)',
-                  userSelect: 'all',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {command}
-              </code>
-              <button
-                type="button"
-                onClick={() => onCopy(command)}
-                style={{
-                  padding: '4px 10px',
-                  fontSize: 11,
-                  fontWeight: 500,
-                  border: '0.5px solid rgba(0,0,0,0.12)',
-                  borderRadius: 6,
-                  background: '#fff',
-                  color: 'var(--ol-ink-2)',
-                  cursor: 'pointer',
-                  fontFamily: 'inherit',
-                  flexShrink: 0,
-                }}
-              >
-                {copiedCommand === command
-                  ? t('settings.recording.wayland.copyButtonCopied')
-                  : t('settings.recording.wayland.copyButton')}
-              </button>
-            </div>
-            <span
-              style={{
-                fontSize: 11,
-                color: 'var(--ol-ink-3)',
-                whiteSpace: 'nowrap',
-                flexShrink: 0,
-              }}
-            >
-              {label}
-            </span>
-          </div>
-        ))}
-      </div>
-      <button
-        type="button"
-        onClick={() => setHelpOpen(prev => !prev)}
-        style={{
-          padding: 0,
-          background: 'transparent',
-          border: 0,
-          color: '#b45309',
-          fontSize: 11.5,
-          fontWeight: 500,
-          cursor: 'pointer',
-          fontFamily: 'inherit',
-        }}
-      >
-        {helpOpen ? '▾ ' : '▸ '}
-        {t('settings.recording.wayland.helpToggle')}
-      </button>
-      {helpOpen && (
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {helpEntries.map(([title, body]) => (
-            <div key={title}>
-              <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--ol-ink-2)', marginBottom: 2 }}>
-                {title}
-              </div>
-              <div
-                style={{
-                  fontSize: 11,
-                  color: 'var(--ol-ink-3)',
-                  lineHeight: 1.55,
-                  whiteSpace: 'pre-line',
-                }}
-              >
-                {body}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -1358,7 +1159,6 @@ function AutostartRow() {
   return (
     <SettingRow
       label={t('settings.recording.startupAtBoot')}
-      desc={t('settings.recording.startupAtBootDesc')}
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
         {loaded ? <Toggle on={enabled} onToggle={onToggle} /> : null}
@@ -1652,10 +1452,7 @@ function ProvidersSection() {
       </div>
       <Card>
         <div style={{ marginBottom: 10 }}>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>{t('settings.providers.llmTitle')}</div>
-          <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginTop: 2 }}>
-            {t('settings.providers.llmDesc')}
-          </div>
+          <SectionTitle>{t('settings.providers.llmTitle')}</SectionTitle>
         </div>
         {/* desc 已去掉——'选择后将自动填入 Base URL 默认值' 在 180px label 列必换行成两行，
             视觉上 label 区出现"字体单独占一行"。下拉自身已经表达了"切换"含义，desc 冗余。 */}
@@ -1668,7 +1465,7 @@ function ProvidersSection() {
               label: t(`settings.providers.presets.${p.nameKey}`),
             }))}
             ariaLabel={t('settings.providers.providerLabel')}
-            style={{ ...inputStyle, maxWidth: 200 }}
+            style={{ ...inputStyle, width: '100%', maxWidth: 200 }}
           />
         </SettingRow>
         {codexOAuthSelected ? (
@@ -1696,8 +1493,7 @@ function ProvidersSection() {
 
       <Card>
         <div style={{ marginBottom: 10 }}>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>{t('settings.providers.asrTitle')}</div>
-          <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginTop: 2 }}>{t('settings.providers.asrDesc')}</div>
+          <SectionTitle>{t('settings.providers.asrTitle')}</SectionTitle>
         </div>
         {/* 下拉只放云端选项；本地引擎激活时锁住 + 在下方放一行"ASR 提供商已被接管"提示，
             未激活时不显示提示。 */}
@@ -1738,7 +1534,7 @@ function ProvidersSection() {
                       : []),
                   ]}
                   ariaLabel={t('settings.providers.providerLabel')}
-                  style={{ ...inputStyle, maxWidth: 200 }}
+                  style={{ ...inputStyle, width: '100%', maxWidth: 200 }}
                 />
                 {isLocked && (
                   <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', lineHeight: 1.5 }}>
@@ -1876,7 +1672,7 @@ function ProviderTools({ kind, modelAccount, onModelSelected }: { kind: 'llm' | 
   };
 
   return (
-    <SettingRow label={t('settings.providers.toolsLabel')} desc={t('settings.providers.toolsDesc')}>
+    <SettingRow label={t('settings.providers.toolsLabel')}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 420 }}>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
           <button onClick={validate} style={miniBtnStyle} disabled={status === 'loading'}>{t('settings.providers.validate')}</button>
@@ -2111,12 +1907,13 @@ function CredentialField({ label, account, placeholder, mono, mask, defaultValue
 }
 
 const miniBtnStyle: CSSProperties = {
-  height: 32, padding: '0 10px',
+  height: 32, padding: '0 12px',
   border: '0.5px solid var(--ol-line-strong)',
   borderRadius: 8, background: 'var(--ol-surface)',
+  boxShadow: '0 1px 2px rgba(0,0,0,0.04), 0 0 0 0.5px rgba(255,255,255,0.2) inset',
   color: 'var(--ol-ink-2)', cursor: 'default', flexShrink: 0,
-  fontSize: 12, fontWeight: 500,
-  transition: 'background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick), color 0.16s var(--ol-motion-quick)',
+  fontSize: 12.5, fontWeight: 500, letterSpacing: '0.01em',
+  transition: 'background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick), color 0.16s var(--ol-motion-quick), box-shadow 0.16s var(--ol-motion-quick)',
 };
 
 const recordingHotkeyControlWidth = 178;
@@ -2124,10 +1921,11 @@ const recordingHotkeyControlWidth = 178;
 const hotkeyRecorderButtonStyle: CSSProperties = {
   width: recordingHotkeyControlWidth,
   height: 32,
-  padding: '0 8px 0 11px',
+  padding: '0 8px 0 12px',
   border: '0.5px solid var(--ol-line-strong)',
   borderRadius: 8,
-  background: 'var(--ol-surface-2)',
+  background: 'var(--ol-surface)',
+  boxShadow: '0 1px 2px rgba(0,0,0,0.04), 0 0 0 0.5px rgba(255,255,255,0.2) inset',
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'space-between',
@@ -2141,15 +1939,16 @@ const hotkeyRecorderButtonStyle: CSSProperties = {
 const recordingHotkeySegmentedStyle: CSSProperties = {
   width: recordingHotkeyControlWidth,
   display: 'inline-flex',
-  padding: 2,
+  padding: 3,
   borderRadius: 8,
-  background: 'rgba(0,0,0,0.05)',
+  background: 'rgba(0,0,0,0.06)',
+  boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.04)',
 };
 
 const recordingHotkeyGroupStyle: CSSProperties = {
   display: 'grid',
   gridTemplateColumns: 'auto',
-  rowGap: 10,
+  rowGap: 12,
   justifyItems: 'start',
 };
 
@@ -2157,20 +1956,21 @@ const recordingHotkeyLineStyle: CSSProperties = {
   display: 'grid',
   gridTemplateColumns: '64px auto',
   alignItems: 'center',
-  columnGap: 10,
+  columnGap: 12,
 };
 
 const recordingHotkeyFieldLabelStyle: CSSProperties = {
-  fontSize: 12,
+  fontSize: 12.5,
   color: 'var(--ol-ink-4)',
   textAlign: 'right',
   whiteSpace: 'nowrap',
 };
 
 const recordingHotkeyStatusStyle: CSSProperties = {
-  marginLeft: 74,
+  marginLeft: 76,
   fontSize: 12,
-  lineHeight: 1.3,
+  lineHeight: 1.4,
+  color: 'var(--ol-ink-3)',
 };
 
 const hotkeyRecorderLabelStyle: CSSProperties = {
@@ -2188,17 +1988,19 @@ const hotkeyClearButtonStyle: CSSProperties = {
   alignItems: 'center',
   justifyContent: 'center',
   flexShrink: 0,
-  background: 'rgba(0,0,0,0.2)',
+  background: 'rgba(0,0,0,0.15)',
   color: '#fff',
+  transition: 'background 0.16s ease',
 };
 
 const iconBtnStyle: CSSProperties = {
   width: 32, height: 32,
   border: '0.5px solid var(--ol-line-strong)',
   borderRadius: 8, background: 'var(--ol-surface)',
+  boxShadow: '0 1px 2px rgba(0,0,0,0.04), 0 0 0 0.5px rgba(255,255,255,0.2) inset',
   display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
   color: 'var(--ol-ink-3)', cursor: 'default', flexShrink: 0,
-  transition: 'background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick), color 0.16s var(--ol-motion-quick)',
+  transition: 'background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick), color 0.16s var(--ol-motion-quick), transform 0.12s var(--ol-motion-quick)',
 };
 
 

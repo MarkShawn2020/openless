@@ -474,6 +474,38 @@ async fn resolve_beta_manifest_endpoints() -> Result<Vec<url::Url>, String> {
     Ok(vec![mirror_url, direct_url])
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkCheckResult {
+    pub online: bool,
+    pub latency_ms: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn check_network() -> NetworkCheckResult {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    let client = match client {
+        Ok(c) => c,
+        Err(_) => return NetworkCheckResult { online: false, latency_ms: None },
+    };
+    let start = std::time::Instant::now();
+    let endpoints = [
+        "https://apic.openless.top/health",
+        "https://github.com",
+    ];
+    for url in &endpoints {
+        if let Ok(resp) = client.head(*url).send().await {
+            if resp.status().is_success() || resp.status().is_redirection() {
+                let ms = start.elapsed().as_millis() as u64;
+                return NetworkCheckResult { online: true, latency_ms: Some(ms) };
+            }
+        }
+    }
+    NetworkCheckResult { online: false, latency_ms: None }
+}
+
 #[tauri::command]
 pub fn get_hotkey_status(coord: CoordinatorState<'_>) -> HotkeyStatus {
     coord.hotkey_status()
@@ -482,18 +514,6 @@ pub fn get_hotkey_status(coord: CoordinatorState<'_>) -> HotkeyStatus {
 #[tauri::command]
 pub fn get_hotkey_capability(coord: CoordinatorState<'_>) -> HotkeyCapability {
     coord.hotkey_capability()
-}
-
-/// Pull-style 查询：当前是否处于 Linux/Wayland session（rdev 不可用、需要走 CLI 路径）。
-/// 前端 RecordingSection mount 时调一次拿状态，直接渲染 callout。
-///
-/// 用 pull 而不是单纯依赖 ready-time 的 `wayland_cli_mode` event：Settings 模态是
-/// 条件渲染（用户首次打开 Settings 才 mount RecordingSection），但 emit 发生在 setup
-/// 末尾——一次性 event 不缓冲也不 replay，listener 99% 情况下错过事件 → callout
-/// 永远不显示。XDG_SESSION_TYPE 本身在进程生命周期内不会变，多次调用结果一致。
-#[tauri::command]
-pub fn is_wayland_cli_mode() -> bool {
-    crate::hotkey::is_wayland_session()
 }
 
 #[tauri::command]
@@ -2824,7 +2844,10 @@ pub struct GithubDeviceStartResponse {
 #[tauri::command]
 pub async fn github_device_flow_start() -> Result<GithubDeviceStartResponse, String> {
     let client_id = get_github_oauth_client_id()?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
     let resp = client
         .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
@@ -2869,7 +2892,10 @@ pub async fn github_device_flow_poll(
     device_code: String,
 ) -> Result<GithubDevicePollResult, String> {
     let client_id = get_github_oauth_client_id()?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
     let token_resp = client
         .post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
@@ -3083,6 +3109,8 @@ mod tests {
         assert!(
             validate_foundry_model_alias(crate::asr::local::foundry::DEFAULT_MODEL_ALIAS).is_ok()
         );
+        assert!(validate_foundry_model_alias("whisper-medium").is_ok());
+        assert!(validate_foundry_model_alias("whisper-large-v3-turbo").is_ok());
         assert!(validate_foundry_model_alias("whisper-large").is_err());
     }
 
@@ -3097,6 +3125,18 @@ mod tests {
             active_foundry_model_from_prefs(&prefs),
             crate::asr::local::foundry::DEFAULT_MODEL_ALIAS
         );
+    }
+
+    #[test]
+    fn foundry_active_model_pref_preserves_large_model_aliases() {
+        for alias in ["whisper-medium", "whisper-large-v3-turbo"] {
+            let prefs = UserPreferences {
+                foundry_local_asr_model: alias.to_string(),
+                ..Default::default()
+            };
+
+            assert_eq!(active_foundry_model_from_prefs(&prefs), alias);
+        }
     }
 
     #[test]

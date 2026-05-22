@@ -42,6 +42,21 @@ impl TextInserter {
         if text.is_empty() {
             return InsertStatus::CopiedFallback;
         }
+        // Linux: 始终优先使用 fcitx5 CommitText 直写（支持中文）。
+        // 如果插件未加载，降级到剪贴板拷贝（统一路径，不单独维护 enigo XTest）。
+        #[cfg(target_os = "linux")]
+        {
+            match crate::linux_fcitx::commit_text(text) {
+                Ok(()) => return InsertStatus::Inserted,
+                Err(e) => {
+                    log::warn!("[insertion] fcitx commit_text failed: {e}, fallback to clipboard only");
+                    if copy_to_clipboard(text) {
+                        return InsertStatus::CopiedFallback;
+                    }
+                    return InsertStatus::Failed;
+                }
+            }
+        }
         insert_with_clipboard_restore(text, restore_clipboard_after_paste, paste_shortcut)
     }
 
@@ -371,15 +386,30 @@ fn insertion_success_status() -> InsertStatus {
 
 #[cfg(target_os = "windows")]
 mod windows_unicode {
+    use std::time::Duration;
+
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
         KEYEVENTF_UNICODE, VIRTUAL_KEY,
     };
 
+    const SENDINPUT_CHUNK_CHARS: usize = 16;
+    const SENDINPUT_CHUNK_DELAY: Duration = Duration::from_millis(12);
+
     pub fn send_text(text: &str) -> Result<(), String> {
-        for unit in text.encode_utf16() {
-            send_utf16_unit(unit, false)?;
-            send_utf16_unit(unit, true)?;
+        let mut sent_in_chunk = 0usize;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            let mut buf = [0u16; 2];
+            for unit in ch.encode_utf16(&mut buf) {
+                send_utf16_unit(*unit, false)?;
+                send_utf16_unit(*unit, true)?;
+            }
+            sent_in_chunk += 1;
+            if sent_in_chunk >= SENDINPUT_CHUNK_CHARS && chars.peek().is_some() {
+                std::thread::sleep(SENDINPUT_CHUNK_DELAY);
+                sent_in_chunk = 0;
+            }
         }
         Ok(())
     }

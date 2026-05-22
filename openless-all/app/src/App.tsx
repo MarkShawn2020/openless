@@ -8,6 +8,7 @@ import {
   checkAccessibilityPermission,
   checkMicrophonePermission,
   getHotkeyStatus,
+  getSettings,
   handleWindowHotkeyEvent,
   isTauri,
 } from './lib/ipc';
@@ -43,14 +44,36 @@ export function App({ isCapsule, isQa }: AppProps) {
     let cancelled = false;
     requestAnimationFrame(() => {
       if (cancelled) return;
-      import('@tauri-apps/api/window')
-        .then(async ({ getCurrentWindow }) => {
-          const currentWindow = getCurrentWindow();
-          if (!(await currentWindow.isVisible())) {
-            await currentWindow.show();
-          }
-        })
-        .catch(error => console.warn('[startup] show main window failed', error));
+      (async () => {
+        // 尊重 prefs.startMinimized：开了静默启动就别在前端强 show 主窗口。否则
+        // Rust 端 setup() 抑制掉的窗口，会被这条 useEffect 在 webview 加载完成后
+        // 再通过 IPC 拉出来 —— issue #468 在 Rust 修复后用户仍能在 Win11 上复现
+        // 的最后一条路径（Rust log 里看不到，因为走的是 plugin-window 的 IPC）。
+        try {
+          const prefs = await getSettings();
+          if (prefs.startMinimized) return;
+        } catch (err) {
+          // 安全侧默认 = 不弹窗。Rust 端 get_settings 签名是
+          // `pub fn get_settings(...) -> UserPreferences`（非 Result），所以
+          // 该 catch 唯一会被触发的场景是 Tauri IPC 基础设施抖动（autostart 早期
+          // __TAURI_INTERNALS__ 还没就绪）。旧逻辑 fall-through to show 会在用户
+          // 开了静默启动时仍把主窗口弹出来 —— #468 复现路径。
+          //
+          // 此时 tray 已由 Rust 端 setup() 在 webview 加载前注册完成，是稳定的
+          // 兜底入口；宁可让用户从 tray 手动唤起，也不要在抖动时强 show 一个白色
+          // / 透明主窗口。首次安装的"prefs 不存在"场景不走这里 —— Rust 端会返回
+          // 默认 UserPreferences。
+          const detail = err instanceof Error ? err.message : String(err);
+          console.warn('[startup] read startMinimized failed; staying hidden to avoid #468:', detail, err);
+          return;
+        }
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        if (cancelled) return;
+        const currentWindow = getCurrentWindow();
+        if (!(await currentWindow.isVisible())) {
+          await currentWindow.show();
+        }
+      })().catch(error => console.warn('[startup] show main window failed', error));
     });
     return () => {
       cancelled = true;

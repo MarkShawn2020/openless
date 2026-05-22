@@ -544,7 +544,8 @@ pub struct UserPreferences {
     /// 行为一致，不破坏既有用户。
     #[serde(default)]
     pub paste_shortcut: PasteShortcut,
-    /// Windows: 是否允许 TSF 失败后继续使用 SendInput / 粘贴类非 TSF 兜底。
+    /// Windows: 是否允许 TSF 失败后继续使用分批 Unicode SendInput / 剪贴板兜底。
+    /// Unicode SendInput 失败时才复制到剪贴板，避免文本丢失。
     /// 默认开启以保持可用性；关闭后可验证文本是否真正由 TSF 上屏。
     #[serde(default = "default_true")]
     pub allow_non_tsf_insertion_fallback: bool,
@@ -636,7 +637,7 @@ pub struct UserPreferences {
     /// 平台原语：
     /// - macOS：CGEvent Unicode FFI；CJK / 日文 IME 会拦截，session 期间临时切到 ABC
     /// - Windows：SendInput Unicode（绕过 TSF）；不需要切输入法
-    /// - Linux（实验性）：enigo `Keyboard::text`；X11 稳定，Wayland 看 compositor
+    /// - Linux：通过 fcitx5 插件 commitString 直写或剪贴板回落。
     ///
     /// 限制：
     /// - 不再走剪贴板路径，对 secure input 框（密码框 / 1Password）静默拒绝
@@ -1825,7 +1826,7 @@ pub enum HotkeyMode {
 pub enum HotkeyAdapterKind {
     MacEventTap,
     WindowsLowLevel,
-    Rdev,
+    Fcitx5,
 }
 
 impl HotkeyAdapterKind {
@@ -1833,7 +1834,7 @@ impl HotkeyAdapterKind {
         match self {
             HotkeyAdapterKind::MacEventTap => "macOS Event Tap",
             HotkeyAdapterKind::WindowsLowLevel => "Windows 低层键盘 hook",
-            HotkeyAdapterKind::Rdev => "rdev 监听器",
+            HotkeyAdapterKind::Fcitx5 => "fcitx5 输入法插件",
         }
     }
 }
@@ -2034,7 +2035,7 @@ impl HotkeyCapability {
         #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             Self {
-                adapter: HotkeyAdapterKind::Rdev,
+                adapter: HotkeyAdapterKind::Fcitx5,
                 available_triggers: vec![
                     HotkeyTrigger::RightAlt,
                     HotkeyTrigger::RightControl,
@@ -2046,7 +2047,7 @@ impl HotkeyCapability {
                 supports_side_specific_modifiers: true,
                 explicit_fallback_available: false,
                 status_hint: Some(
-                    "Linux 仅 best-effort：X11 可尝试 rdev 监听；Wayland 请在桌面环境中绑定 openless --toggle-dictation 等 CLI 命令。".into(),
+                    "Linux 使用 fcitx5 插件监听热键和提交文字；无需桌面环境额外配置。".into(),
                 ),
             }
         }
