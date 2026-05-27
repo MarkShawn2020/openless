@@ -695,10 +695,13 @@ pub fn set_credential(window: Window, account: String, value: String) -> Result<
     ensure_main_window(&window)?;
     let acc = parse_account(&account)?;
     if value.is_empty() {
-        CredentialsVault::remove(acc).map_err(|e| e.to_string())
+        CredentialsVault::remove(acc).map_err(|e| e.to_string())?;
     } else {
-        CredentialsVault::set(acc, &value).map_err(|e| e.to_string())
+        CredentialsVault::set(acc, &value).map_err(|e| e.to_string())?;
     }
+    // 通知前端凭据已变更（如 Overview 页需要刷新 asrConfigured 状态）。
+    let _ = window.emit("credentials:changed", ());
+    Ok(())
 }
 
 #[tauri::command]

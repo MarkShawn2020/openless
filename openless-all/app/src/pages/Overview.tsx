@@ -87,6 +87,42 @@ export function Overview({ onOpenHistory }: OverviewProps) {
       });
   }, [refreshHistory]);
 
+  // 凭据被保存后重新拉取状态（issue #532：在 Settings 中填写/更新凭据
+  // 但不切换提供商时，原有的 useEffect 不会重跑，导致概览页的状态仍停留在「未配置」）。
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const handle = await listen('credentials:changed', () => {
+          getCredentials()
+            .then(status => {
+              if (cancelled) return;
+              setCreds(status);
+              setCredsError(false);
+            })
+            .catch(error => {
+              if (cancelled) return;
+              console.error('[overview] failed to load credentials status', error);
+              setCredsError(true);
+            });
+        });
+        if (cancelled) {
+          handle();
+        } else {
+          unlisten = handle;
+        }
+      } catch {
+        // browser dev mock — 没有 Tauri event bridge
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const metrics = useMemo(() => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
