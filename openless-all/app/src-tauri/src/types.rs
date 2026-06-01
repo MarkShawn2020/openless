@@ -606,6 +606,11 @@ pub struct UserPreferences {
     /// 默认 300（5 分钟）：兼顾连续听写不重加载、长时间不用释放 1.2GB+ RAM。
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     pub local_asr_keep_loaded_secs: u32,
+    /// 本地模型自定义父目录。空字符串 = 使用系统默认 app data 下的 `models/`。
+    /// 非空时，实际模型根目录为 `<local_asr_models_base_dir>/OpenLess/models/`，
+    /// 让用户选择一个普通磁盘目录即可隔离 OpenLess 模型文件。
+    #[serde(default)]
+    pub local_asr_models_base_dir: String,
     /// Windows Foundry Local Whisper 当前激活的模型 alias。
     #[serde(default = "default_foundry_local_asr_model")]
     pub foundry_local_asr_model: String,
@@ -793,6 +798,8 @@ struct UserPreferencesWire {
     local_asr_mirror: String,
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     local_asr_keep_loaded_secs: u32,
+    #[serde(default)]
+    local_asr_models_base_dir: String,
     #[serde(default = "default_foundry_local_asr_model")]
     foundry_local_asr_model: String,
     #[serde(default = "default_foundry_local_runtime_source")]
@@ -870,6 +877,7 @@ impl Default for UserPreferencesWire {
             local_asr_active_model: prefs.local_asr_active_model,
             local_asr_mirror: prefs.local_asr_mirror,
             local_asr_keep_loaded_secs: prefs.local_asr_keep_loaded_secs,
+            local_asr_models_base_dir: prefs.local_asr_models_base_dir,
             foundry_local_asr_model: prefs.foundry_local_asr_model,
             foundry_local_runtime_source: prefs.foundry_local_runtime_source,
             foundry_local_asr_language_hint: prefs.foundry_local_asr_language_hint,
@@ -953,6 +961,7 @@ impl<'de> Deserialize<'de> for UserPreferences {
             local_asr_active_model: wire.local_asr_active_model,
             local_asr_mirror: wire.local_asr_mirror,
             local_asr_keep_loaded_secs: wire.local_asr_keep_loaded_secs,
+            local_asr_models_base_dir: wire.local_asr_models_base_dir,
             foundry_local_asr_model: wire.foundry_local_asr_model,
             foundry_local_runtime_source:
                 crate::asr::local::foundry_native::normalize_runtime_source_str(
@@ -1643,6 +1652,7 @@ impl Default for UserPreferences {
             local_asr_active_model: default_local_asr_model(),
             local_asr_mirror: default_local_asr_mirror(),
             local_asr_keep_loaded_secs: default_local_asr_keep_loaded_secs(),
+            local_asr_models_base_dir: String::new(),
             foundry_local_asr_model: default_foundry_local_asr_model(),
             foundry_local_runtime_source: default_foundry_local_runtime_source(),
             foundry_local_asr_language_hint: String::new(),
@@ -1837,6 +1847,7 @@ pub enum HotkeyTrigger {
     RightCommand,
     Fn,
     RightAlt, // Windows synonym for RightOption
+    MediaPlayPause,
     Custom,
 }
 
@@ -1850,6 +1861,7 @@ impl HotkeyTrigger {
             HotkeyTrigger::RightCommand => "右 Command",
             HotkeyTrigger::Fn => "Fn (地球键)",
             HotkeyTrigger::RightAlt => "右 Alt",
+            HotkeyTrigger::MediaPlayPause => "⏯ Media 播放/暂停",
             HotkeyTrigger::Custom => "自定义组合键",
         }
     }
@@ -1941,6 +1953,7 @@ fn legacy_trigger_code(trigger: HotkeyTrigger) -> &'static str {
         HotkeyTrigger::Fn => "ControlRight",
         #[cfg(not(target_os = "windows"))]
         HotkeyTrigger::Fn => "Fn",
+        HotkeyTrigger::MediaPlayPause => "MediaPlayPause",
         HotkeyTrigger::Custom => "",
     }
 }
@@ -2061,6 +2074,7 @@ impl HotkeyCapability {
                     HotkeyTrigger::RightAlt,
                     HotkeyTrigger::LeftControl,
                     HotkeyTrigger::RightCommand,
+                    HotkeyTrigger::MediaPlayPause,
                     HotkeyTrigger::Custom,
                 ],
                 requires_accessibility_permission: false,

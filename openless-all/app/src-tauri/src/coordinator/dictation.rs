@@ -460,6 +460,20 @@ pub(super) async fn handle_pressed(inner: &Arc<Inner>) {
     log::info!("[coord] hotkey pressed (mode={mode:?}, phase={phase:?})");
     match (mode, phase) {
         (HotkeyMode::Toggle, SessionPhase::Idle) => {
+            // 冷却检查：end_session 刚收尾时禁止短时间内再次激活，
+            // 避免三连按第 3 次误触（此时胶囊仍在离场动画周期内，issue #545）。
+            let now = std::time::Instant::now();
+            let on_cooldown = inner
+                .session_cooldown_until
+                .lock()
+                .map(|deadline| now < deadline)
+                .unwrap_or(false);
+            if on_cooldown {
+                log::info!(
+                    "[coord] toggle activation blocked by cooldown (session still winding down)"
+                );
+                return;
+            }
             let _ = begin_session(inner).await;
         }
         (HotkeyMode::Toggle, SessionPhase::Listening) => {
@@ -803,6 +817,7 @@ pub(super) async fn begin_session(inner: &Arc<Inner>) -> Result<(), String> {
             model,
             whisper_prompt,
             batch_asr_chunk_limit_ms(&active_asr),
+            whisper_supports_verbose_json(&active_asr),
         ));
         store_asr_for_session(
             inner,
@@ -890,13 +905,6 @@ pub(super) async fn begin_session(inner: &Arc<Inner>) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn batch_asr_chunk_limit_ms(provider_id: &str) -> Option<u64> {
-    match provider_id {
-        "zhipu" => Some(30_000),
-        _ => None,
-    }
 }
 
 pub(super) async fn start_recorder_for_starting(
@@ -1280,7 +1288,10 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                 .await
             {
                 Ok(r) => {
-                    schedule_foundry_local_asr_release(inner, current_session_id);
+                    schedule_foundry_local_asr_release(
+                        inner,
+                        AsrReleaseSession::Dictation(current_session_id),
+                    );
                     r
                 }
                 Err(e) => {
@@ -1288,13 +1299,19 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                         log::info!(
                             "[coord] Foundry Local Whisper transcribe cancelled — discarding transcript"
                         );
-                        schedule_foundry_local_asr_release(inner, current_session_id);
+                        schedule_foundry_local_asr_release(
+                            inner,
+                            AsrReleaseSession::Dictation(current_session_id),
+                        );
                         restore_prepared_windows_ime_session(inner, current_session_id);
                         set_phase_idle_if_session_matches(inner, current_session_id);
                         return Ok(());
                     }
                     log::error!("[coord] Foundry Local Whisper transcribe failed: {e:#}");
-                    schedule_foundry_local_asr_release(inner, current_session_id);
+                    schedule_foundry_local_asr_release(
+                        inner,
+                        AsrReleaseSession::Dictation(current_session_id),
+                    );
                     emit_capsule(
                         inner,
                         CapsuleState::Error,
@@ -1320,7 +1337,10 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                 .await
             {
                 Ok(r) => {
-                    schedule_sherpa_onnx_release(inner, current_session_id);
+                    schedule_sherpa_onnx_release(
+                        inner,
+                        AsrReleaseSession::Dictation(current_session_id),
+                    );
                     r
                 }
                 Err(e) => {
@@ -1328,13 +1348,19 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                         log::info!(
                             "[coord] sherpa-onnx transcribe cancelled — discarding transcript"
                         );
-                        schedule_sherpa_onnx_release(inner, current_session_id);
+                        schedule_sherpa_onnx_release(
+                            inner,
+                            AsrReleaseSession::Dictation(current_session_id),
+                        );
                         restore_prepared_windows_ime_session(inner, current_session_id);
                         set_phase_idle_if_session_matches(inner, current_session_id);
                         return Ok(());
                     }
                     log::error!("[coord] sherpa-onnx transcribe failed: {e:#}");
-                    schedule_sherpa_onnx_release(inner, current_session_id);
+                    schedule_sherpa_onnx_release(
+                        inner,
+                        AsrReleaseSession::Dictation(current_session_id),
+                    );
                     emit_capsule(
                         inner,
                         CapsuleState::Error,
@@ -1803,6 +1829,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         state.phase = SessionPhase::Idle;
         state.focus_target = None;
     }
+    // Toggle 模式冷却：设冷却时间戳，POST_SESSION_COOLDOWN_MS 内禁止新的 activate。
+    // 覆盖胶囊离场动画周期，避免三连按第 3 次误激活（issue #545）。
+    {
+        let now = std::time::Instant::now();
+        *inner.session_cooldown_until.lock() =
+            Some(now + std::time::Duration::from_millis(POST_SESSION_COOLDOWN_MS));
+    }
     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
 
     Ok(())
@@ -1850,6 +1883,10 @@ pub(super) fn cancel_session(inner: &Arc<Inner>) {
     if decision.phase != SessionPhase::Processing {
         let mut state = inner.state.lock();
         finish_cancel_session_state(&mut state, decision);
+        // 只有真正把 phase 设为 Idle 时才设冷却（避免离场动画期间误激活）。
+        let now = std::time::Instant::now();
+        *inner.session_cooldown_until.lock() =
+            Some(now + std::time::Duration::from_millis(POST_SESSION_COOLDOWN_MS));
     }
     emit_capsule(inner, CapsuleState::Cancelled, 0.0, 0, None, None);
     log::info!("[coord] session cancelled (was {:?})", decision.phase);
