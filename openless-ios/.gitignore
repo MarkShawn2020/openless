@@ -1,0 +1,19 @@
+# XcodeGen 生成物（project.yml 是唯一真源）
+*.xcodeproj/
+
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+
+# SwiftPM
+.build/
+.swiftpm/
+
+# 设计参考截图（个人，不入库）
+refs/
+
+# macOS
+.DS_Store
