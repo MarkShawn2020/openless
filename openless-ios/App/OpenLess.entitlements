@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 主 App 与键盘扩展共享容器：偏好、风格包、识别结果回传 -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.top.openless.ios</string>
+	</array>
+</dict>
+</plist>

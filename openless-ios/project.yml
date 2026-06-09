@@ -1,0 +1,76 @@
+# OpenLess for iOS — XcodeGen 工程定义
+# 源码只提交本文件 + Swift 源；.xcodeproj 由 `xcodegen generate` 生成，不入库。
+#
+# 生成：  xcodegen generate
+# 打开：  open OpenLess.xcodeproj
+# 编译(模拟器)： xcodebuild -scheme OpenLess -destination 'generic/platform=iOS Simulator' build
+
+name: OpenLess
+options:
+  bundleIdPrefix: top.openless.ios
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.9"
+    # 签名：各开发者在本地填自己的 Team（真机需要）；模拟器无需。
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    TARGETED_DEVICE_FAMILY: "1"  # iPhone（输入法主要面向手机）
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+targets:
+  # ── 共享框架：数据模型 / ASR&润色客户端 / App Group 存储 ──
+  OpenLessShared:
+    type: framework
+    platform: iOS
+    sources:
+      - Shared/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: top.openless.ios.shared
+        INFOPLIST_FILE: Shared/Info.plist
+        DEFINES_MODULE: "YES"
+        SKIP_INSTALL: "YES"
+
+  # ── 主 App（SwiftUI）：麦克风/录音/ASR/润色/配置/市场 ──
+  OpenLess:
+    type: application
+    platform: iOS
+    sources:
+      - App/Sources
+      - App/Resources
+    dependencies:
+      - target: OpenLessShared
+        embed: true
+      - target: OpenLessKeyboard
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: top.openless.ios
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/OpenLess.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: "YES"
+
+  # ── 键盘扩展（app-extension）：复刻键盘 + 语音按钮，不能碰麦克风 ──
+  # 暂不依赖共享框架 / App Group：键盘当前自包含，去掉未用到的依赖可避免真机上扩展加载失败。
+  # 语音闭环（Phase 3）需要 App Group 时再加回，届时需配套的签名/容器权限。
+  OpenLessKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Keyboard/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: top.openless.ios.keyboard
+        INFOPLIST_FILE: Keyboard/Info.plist
+        # App Group：键盘从共享容器读取主 App 识别好的文本并插入（不依赖共享框架，仅用 UserDefaults suite）
+        CODE_SIGN_ENTITLEMENTS: Keyboard/OpenLessKeyboard.entitlements
