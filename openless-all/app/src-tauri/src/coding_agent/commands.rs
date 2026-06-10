@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Window};
 
 use super::detect::{has_computer_use_mcp, McpServerStatus};
 use super::guard::build_guard_settings_json;
+use super::opencode::detect_opencode;
 use super::{
     claude_mcp_list, create_git_snapshot, detect_claude, run_claude_agent,
     CodingAgentPermissionMode, CodingAgentRequest,
@@ -120,6 +121,34 @@ pub async fn coding_agent_detect(
         mcp_servers,
         has_computer_use,
     })
+}
+
+/// OpenCode 检测结果（回前端，camelCase）。issue #579。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeDetectionWire {
+    /// 是否检测到可运行的 opencode。
+    pub installed: bool,
+    /// 版本号（如 "0.x.y"）。
+    pub version: Option<String>,
+    /// 实际使用的可执行文件名/路径。
+    pub exe: String,
+}
+
+/// 检测 `opencode` 是否安装、版本。语音 Agent 选了 OpenCode 后端时，设置页据此提示
+/// 用户是否需要先 `npm i -g opencode-ai` / 登录。
+#[tauri::command]
+pub async fn coding_agent_detect_opencode(exe: Option<String>) -> OpenCodeDetectionWire {
+    let exe = exe
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| "opencode".to_string());
+    let version = detect_opencode(&exe).await;
+    OpenCodeDetectionWire {
+        installed: version.is_some(),
+        version,
+        exe,
+    }
 }
 
 /// 护栏化地无头跑一次 claude，事件流式 emit 到前端 `coding-agent:test`。
