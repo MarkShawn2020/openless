@@ -217,11 +217,10 @@ async fn run_less_computer_once(
     extra_allow_patterns: &[String],
     continue_session: bool,
 ) -> LessComputerOutcome {
-    // 护栏 deny：默认全量；审批放行的模式从 deny 中剔除。
-    // 审批 UI 只回传命中的单个高风险子串，但同一风险有等价写法（如 --force / -f）。
-    // 按「风险等价组」整组放行：只放行被点那一个会让等价写法仍卡在 deny（deny 优先级高于
-    // allow）→ 命令仍被拦。见 guard::risk_equivalent_patterns。
-    let mut deny = crate::coding_agent::guard::default_deny_rules();
+    use crate::coding_agent::CodingAgentProvider;
+
+    // 审批放行的高风险子串按「风险等价组」整组放行（如 --force / -f）：只放行被点那一个会让
+    // 等价写法仍被拦。见 guard::risk_equivalent_patterns。Claude / OpenCode 共用这组前缀。
     let approved_patterns: Vec<String> = extra_allow_patterns
         .iter()
         .flat_map(|p| {
@@ -233,56 +232,13 @@ async fn run_less_computer_once(
             }
         })
         .collect();
-    let allow_rules: Vec<String> = approved_patterns
-        .iter()
-        .map(|p| format!("Bash({p}:*)"))
-        .collect();
-    if !allow_rules.is_empty() {
-        deny.retain(|d| !allow_rules.iter().any(|a| a == d));
-    }
-    let settings_json = serde_json::json!({
-        "permissions": { "defaultMode": mode.as_cli_arg(), "deny": deny }
-    });
-    let settings_path = std::env::temp_dir().join(format!(
-        "openless-less-computer-guard-{}.json",
-        uuid::Uuid::new_v4()
-    ));
-    // fail-closed：序列化或写入失败时立即中止，绝不在「无护栏」下把无效路径交给
-    // `claude -p --settings`（找不到文件 = 完全裸跑）。宁可不跑也不裸跑。
-    let settings_bytes = match serde_json::to_vec_pretty(&settings_json) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("[less-computer] 序列化护栏配置失败: {e}");
-            return LessComputerOutcome::Failed {
-                message: "护栏配置写入失败，已中止（拒绝在无护栏下执行）".into(),
-            };
-        }
-    };
-    if let Err(e) = std::fs::write(&settings_path, settings_bytes) {
-        log::warn!("[less-computer] 写护栏配置失败: {e}");
-        return LessComputerOutcome::Failed {
-            message: "护栏配置写入失败，已中止（拒绝在无护栏下执行）".into(),
-        };
-    }
+
+    let provider = CodingAgentProvider::from_pref(&inner.prefs.get().coding_agent_provider);
 
     let mut req = crate::coding_agent::CodingAgentRequest::new("less-computer", prompt.to_string());
     req.cwd = cwd.map(|p| p.to_path_buf());
     req.model = model.map(|m| m.to_string());
     req.permission_mode = mode;
-    // 写护栏成功后才设置：写失败已在上面 fail-closed 返回，不会带无效路径裸跑。
-    req.settings_json_path = Some(settings_path.clone());
-    // 去掉 WebFetch：无出站白名单时它是 prompt 注入 SSRF 面（诱导拉取内网/元数据端点）。
-    // 保留 WebSearch（走搜索引擎，不直接抓任意 URL）。
-    req.allowed_tools = vec![
-        "Bash".into(),
-        "Read".into(),
-        "Edit".into(),
-        "Write".into(),
-        "Glob".into(),
-        "Grep".into(),
-        "WebSearch".into(),
-    ];
-    req.allowed_tools.extend(allow_rules);
     // 真实任务（开应用、多步操作、读写文件）常超过 120s/0.5$ → 老是「运行超时」。放宽到
     // 5 分钟 / 2$，给多步任务足够空间；仍有硬上限兜底，不会无限跑/烧钱。
     req.max_budget_usd = Some(2.0);
@@ -294,9 +250,90 @@ async fn run_less_computer_once(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_runner = Arc::clone(&cancel);
-    let run = async_runtime::spawn(async move {
-        crate::coding_agent::run_claude_agent("claude", req, tx, cancel_for_runner).await
-    });
+
+    // 护栏 + 运行器按 provider 分派。两条路径都 fail-closed：护栏配置生成失败一律中止，
+    // 绝不在无护栏下裸跑。`settings_path` 仅 Claude 路径用临时文件（OpenCode 走 env 注入，
+    // 无临时文件需清理）。
+    let settings_path: Option<std::path::PathBuf>;
+    let run = match provider {
+        CodingAgentProvider::ClaudeCodeCli => {
+            // 护栏 deny：默认全量；审批放行的模式从 deny 中剔除。
+            let mut deny = crate::coding_agent::guard::default_deny_rules();
+            let allow_rules: Vec<String> = approved_patterns
+                .iter()
+                .map(|p| format!("Bash({p}:*)"))
+                .collect();
+            if !allow_rules.is_empty() {
+                deny.retain(|d| !allow_rules.iter().any(|a| a == d));
+            }
+            let settings_json = serde_json::json!({
+                "permissions": { "defaultMode": mode.as_cli_arg(), "deny": deny }
+            });
+            let path = std::env::temp_dir().join(format!(
+                "openless-less-computer-guard-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            // fail-closed：序列化或写入失败时立即中止，绝不把无效路径交给 `claude -p --settings`
+            //（找不到文件 = 完全裸跑）。宁可不跑也不裸跑。
+            let settings_bytes = match serde_json::to_vec_pretty(&settings_json) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("[less-computer] 序列化护栏配置失败: {e}");
+                    return LessComputerOutcome::Failed {
+                        message: "护栏配置写入失败，已中止（拒绝在无护栏下执行）".into(),
+                    };
+                }
+            };
+            if let Err(e) = std::fs::write(&path, settings_bytes) {
+                log::warn!("[less-computer] 写护栏配置失败: {e}");
+                return LessComputerOutcome::Failed {
+                    message: "护栏配置写入失败，已中止（拒绝在无护栏下执行）".into(),
+                };
+            }
+            settings_path = Some(path.clone());
+            req.settings_json_path = Some(path);
+            // 去掉 WebFetch：无出站白名单时它是 prompt 注入 SSRF 面。保留 WebSearch（走搜索引擎）。
+            req.allowed_tools = vec![
+                "Bash".into(),
+                "Read".into(),
+                "Edit".into(),
+                "Write".into(),
+                "Glob".into(),
+                "Grep".into(),
+                "WebSearch".into(),
+            ];
+            req.allowed_tools.extend(allow_rules);
+            async_runtime::spawn(async move {
+                crate::coding_agent::run_claude_agent("claude", req, tx, cancel_for_runner).await
+            })
+        }
+        CodingAgentProvider::OpenCodeCli => {
+            // OpenCode 无 `--settings`，护栏走 `permission` 配置经 OPENCODE_CONFIG_CONTENT 注入。
+            // build_opencode_guard_config 默认 bash deny 高风险前缀、webfetch deny，审批放行的
+            // 前缀显式 allow。fail-closed：序列化失败立即中止，绝不无护栏裸跑。
+            let guard = crate::coding_agent::guard::build_opencode_guard_config(&approved_patterns);
+            let guard_str = match serde_json::to_string(&guard) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("[less-computer] 序列化 OpenCode 护栏配置失败: {e}");
+                    return LessComputerOutcome::Failed {
+                        message: "护栏配置写入失败，已中止（拒绝在无护栏下执行）".into(),
+                    };
+                }
+            };
+            settings_path = None;
+            async_runtime::spawn(async move {
+                crate::coding_agent::run_opencode_agent(
+                    "opencode",
+                    req,
+                    Some(guard_str),
+                    tx,
+                    cancel_for_runner,
+                )
+                .await
+            })
+        }
+    };
     let cancel_for_watcher = Arc::clone(&cancel);
     let inner_for_cancel = Arc::clone(inner);
     let cancel_watcher = async_runtime::spawn(async move {
@@ -341,7 +378,10 @@ async fn run_less_computer_once(
     let run_result = run.await;
     cancel.store(true, Ordering::Relaxed);
     let _ = cancel_watcher.await;
-    let _ = std::fs::remove_file(&settings_path);
+    // 仅 Claude 路径有临时护栏文件需清理；OpenCode 走 env 注入无文件。
+    if let Some(path) = &settings_path {
+        let _ = std::fs::remove_file(path);
+    }
 
     if cancelled
         || matches!(
