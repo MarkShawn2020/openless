@@ -614,6 +614,7 @@ export const zhCN = {
       modelPlaceholder: '默认 sonnet',
       modelDefault: '默认（自动 sonnet）',
       modelHint: 'Haiku 最快 · Sonnet 均衡 · Opus 最强',
+      exe: '可执行文件路径',
     },
     debug: {
       title: '调试工具',

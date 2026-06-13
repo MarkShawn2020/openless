@@ -234,6 +234,16 @@ async fn run_less_computer_once(
         .collect();
 
     let provider = CodingAgentProvider::from_pref(&inner.prefs.get().coding_agent_provider);
+    // 可配置可执行文件：用户在「高级 → Less Computer」填了路径就用它，留空/空白按后端取默认
+    // （claude / opencode）。trim 后为空视作未配置。
+    let configured_exe: Option<String> = inner
+        .prefs
+        .get()
+        .coding_agent_exe
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let mut req = crate::coding_agent::CodingAgentRequest::new("less-computer", prompt.to_string());
     req.cwd = cwd.map(|p| p.to_path_buf());
@@ -303,8 +313,9 @@ async fn run_less_computer_once(
                 "WebSearch".into(),
             ];
             req.allowed_tools.extend(allow_rules);
+            let exe = configured_exe.unwrap_or_else(|| "claude".to_string());
             async_runtime::spawn(async move {
-                crate::coding_agent::run_claude_agent("claude", req, tx, cancel_for_runner).await
+                crate::coding_agent::run_claude_agent(&exe, req, tx, cancel_for_runner).await
             })
         }
         CodingAgentProvider::OpenCodeCli => {
@@ -322,9 +333,10 @@ async fn run_less_computer_once(
                 }
             };
             settings_path = None;
+            let exe = configured_exe.unwrap_or_else(|| "opencode".to_string());
             async_runtime::spawn(async move {
                 crate::coding_agent::run_opencode_agent(
-                    "opencode",
+                    &exe,
                     req,
                     Some(guard_str),
                     tx,
