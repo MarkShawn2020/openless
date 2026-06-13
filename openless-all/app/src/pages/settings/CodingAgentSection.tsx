@@ -32,13 +32,14 @@ export function CodingAgentSection() {
       return
     }
     let alive = true
-    void codingAgentDetectOpencode().then(d => {
+    // 把配置的可执行路径传给检测，用户改了路径后能重新探测对应二进制。
+    void codingAgentDetectOpencode(prefs?.codingAgentExe ?? undefined).then(d => {
       if (alive) setOpencode(d)
     })
     return () => {
       alive = false
     }
-  }, [useOpencode])
+  }, [useOpencode, prefs?.codingAgentExe])
 
   if (os === 'win') return null
 
@@ -143,6 +144,20 @@ export function CodingAgentSection() {
               onChange={e => {
                 const v = e.target.value.trim()
                 void savePrefs({ ...prefs, codingAgentWorkdir: v === '' ? null : v })
+              }}
+              style={inputStyle}
+            />
+          </SettingRow>
+
+          <SettingRow label={t('settings.codingAgent.exe')}>
+            <input
+              type="text"
+              value={prefs.codingAgentExe ?? ''}
+              placeholder={prefs.codingAgentProvider === 'opencode-cli' ? 'opencode' : 'claude'}
+              spellCheck={false}
+              onChange={e => {
+                const v = e.target.value.trim()
+                void savePrefs({ ...prefs, codingAgentExe: v === '' ? null : v })
               }}
               style={inputStyle}
             />

@@ -618,6 +618,7 @@ export const zhTW: typeof zhCN = {
       modelPlaceholder: '預設 sonnet',
       modelDefault: '預設（自動 sonnet）',
       modelHint: 'Haiku 最快 · Sonnet 均衡 · Opus 最強',
+      exe: '可執行檔路徑',
     },
     debug: {
       title: '除錯工具',

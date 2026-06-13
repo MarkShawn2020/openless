@@ -620,6 +620,7 @@ export const ko: typeof zhCN = {
       modelPlaceholder: '기본: sonnet',
       modelDefault: '기본(자동 sonnet)',
       modelHint: 'Haiku = 가장 빠름 · Sonnet = 균형 · Opus = 최강',
+      exe: '실행 파일 경로',
     },
     debug: {
       title: '디버그 도구',

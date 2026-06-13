@@ -44,7 +44,13 @@ fn skip_permissions_flag(mode: CodingAgentPermissionMode) -> bool {
 }
 
 /// 构造 `opencode run` 的命令行参数（不含可执行文件本身，也不含 prompt——prompt 在运行器
-/// 里作为**最后一个位置参数**追加，避免和带空格的 prompt 混进 flag 解析）。
+/// 里作为**最后一个位置参数**追加在末尾的 `--` 之后）。
+///
+/// 安全（参数注入防护）：参数列表以 `--`（end-of-options 标记）结尾，运行器把 prompt 接在
+/// 其后。这样以 `-` / `--` 开头的 prompt（语音转写或被 prompt 注入诱导而成）都只会被当作
+/// 位置参数，绝不会被 OpenCode 解析成 flag —— 杜绝经 prompt 混入 `--dangerously-skip-
+/// permissions` 绕过护栏、`--dir` 改写工作目录等参数注入。model / cwd 作为各自 flag 的取值
+/// 紧跟在 flag 之后，天然不会被当成独立 flag。
 pub fn build_opencode_args(req: &CodingAgentRequest) -> Vec<String> {
     let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
     if let Some(model) = &req.model {
@@ -58,6 +64,8 @@ pub fn build_opencode_args(req: &CodingAgentRequest) -> Vec<String> {
     if skip_permissions_flag(req.permission_mode) {
         args.push("--dangerously-skip-permissions".into());
     }
+    // end-of-options：其后由运行器追加的 prompt 一律按位置参数处理，不再解析成 flag。
+    args.push("--".into());
     args
 }
 
@@ -269,6 +277,23 @@ mod tests {
         assert_eq!(arg_value(&args, "--format"), Some("json"));
         // prompt 不进 build_opencode_args（运行器单独追加）。
         assert!(!args.iter().any(|a| a.contains("hello world")));
+        // 参数注入防护：末尾必须是 `--`，运行器把 prompt 接在其后。
+        assert_eq!(args.last().map(|s| s.as_str()), Some("--"));
+    }
+
+    #[test]
+    fn end_of_options_marker_is_last_even_with_flags() {
+        // 即便带 --model / --dir / --dangerously-skip-permissions，`--` 仍在最末，
+        // 保证以 `-` 开头的 prompt 不会被解析成 flag。
+        let mut req = CodingAgentRequest::new("s", "p");
+        req.model = Some("anthropic/claude-sonnet-4".into());
+        req.cwd = Some(PathBuf::from("/tmp/work"));
+        req.permission_mode = CodingAgentPermissionMode::AcceptEdits;
+        let args = build_opencode_args(&req);
+        assert_eq!(args.last().map(|s| s.as_str()), Some("--"));
+        // `--` 之前才是各 flag，`--dangerously-skip-permissions` 不在 `--` 之后。
+        let dd = args.iter().rposition(|a| a == "--").unwrap();
+        assert!(args[..dd].iter().any(|a| a == "--dangerously-skip-permissions"));
     }
 
     #[test]

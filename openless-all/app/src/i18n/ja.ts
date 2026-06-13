@@ -620,6 +620,7 @@ export const ja: typeof zhCN = {
       modelPlaceholder: 'デフォルト: sonnet',
       modelDefault: 'デフォルト（自動 sonnet）',
       modelHint: 'Haiku = 最速 · Sonnet = バランス · Opus = 最強',
+      exe: '実行ファイルのパス',
     },
     debug: {
       title: 'デバッグツール',

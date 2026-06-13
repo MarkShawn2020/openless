@@ -618,6 +618,7 @@ export const en: typeof zhCN = {
       modelPlaceholder: 'Default: sonnet',
       modelDefault: 'Default (auto sonnet)',
       modelHint: 'Haiku = fastest · Sonnet = balanced · Opus = strongest',
+      exe: 'Executable path',
     },
     debug: {
       title: 'Debug tools',
