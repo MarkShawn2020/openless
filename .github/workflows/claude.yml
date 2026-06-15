@@ -3,8 +3,11 @@ name: Claude Code
 # 触发策略：
 # - 默认不主动 review；任何 PR 打开 / 同步都不会自动调用模型，避免烧 OAuth token 额度。
 # - 评论 / review / issue 中出现 `@claude` 才触发，且发起者必须是 Open-Less 组织成员（OWNER 或 MEMBER）。
-# - 模型默认 claude-sonnet-4-6（量大、成本低）；评论里写 `--opus` 或包含 `claude-opus`
-#   字样会切到 claude-opus-4-7（用于需要更深推理的任务）。
+# - 模型默认 claude-opus-4-8（深推理；复杂时可自行派发子 Agent）；评论里写 `--sonnet` 或包含 `claude-sonnet`
+#   字样会降级到 claude-sonnet-4-6（量大、成本低，用于简单任务省 OAuth token 额度）。
+# - 默认单个主 Agent 审核；仅当改动较大 / 较复杂时，主 Agent 可自行用 Task 派发子 Agent 协助再汇总。
+#   --allowedTools 放行 Task 及读码所需的 Read/Grep/Glob（不放行 Bash，保持只读、不执行 PR 代码）。
+#   注意：Opus 4.8 token 消耗高于 sonnet，简单提问写 `--sonnet` 降级即可。
 
 on:
   issue_comment:
@@ -50,7 +53,7 @@ jobs:
       - name: Detach HEAD to free local branch ref
         run: git checkout --detach
 
-      - name: Pick model (default sonnet, opt-in opus)
+      - name: Pick model (default opus-4-8, opt-down sonnet)
         id: pick_model
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
@@ -60,10 +63,11 @@ jobs:
         run: |
           set -eu
           body="${COMMENT_BODY}${REVIEW_BODY}${ISSUE_BODY}${ISSUE_TITLE}"
-          if [[ "$body" == *"--opus"* ]] || [[ "$body" == *"claude-opus"* ]]; then
-            echo "model=claude-opus-4-7" >> "$GITHUB_OUTPUT"
-          else
+          # 默认 opus-4-8（深推理；复杂时可自行派发子 Agent）；评论里写 --sonnet 或 claude-sonnet 才降级省额度
+          if [[ "$body" == *"--sonnet"* ]] || [[ "$body" == *"claude-sonnet"* ]]; then
             echo "model=claude-sonnet-4-6" >> "$GITHUB_OUTPUT"
+          else
+            echo "model=claude-opus-4-8" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run Claude Code
@@ -76,5 +80,13 @@ jobs:
           additional_permissions: |
             actions: read
 
-          # 模型策略：默认 sonnet，评论里 --opus 才升级到 opus
-          claude_args: '--model ${{ steps.pick_model.outputs.model }}'
+          # 模型策略：默认 opus-4-8，评论里 --sonnet 才降级到 sonnet。
+          # 单主 Agent：默认自己审；仅当改动较大 / 复杂时主 Agent 才用 Task 自行派发子 Agent。
+          # --allowedTools 放行 Task + Read/Grep/Glob（不放行 Bash，保持只读、不执行 PR 代码）。
+          # append-system-prompt 内置「全平台适配性」审核要求：本仓库 macOS/Windows/Linux 三端、
+          # 大量 #[cfg(target_os=...)] 分支，根目录带跨平台告警的 CLAUDE.md 不在本 git 仓库内，
+          # 云端 action 看不到，故把该约束直接写进 system prompt 保证生效。
+          claude_args: |
+            --model ${{ steps.pick_model.outputs.model }}
+            --allowedTools "Task,Read,Grep,Glob"
+            --append-system-prompt "默认以单个主 Agent 完成审核与回答；仅当本次改动较大或较复杂时，你可自行用 Task 工具派发子 Agent 协助并汇总其结论。本仓库 OpenLess 是 macOS / Windows / Linux 跨平台桌面应用，大量代码按 #[cfg(target_os = ...)] 分平台，插入法 / IME / ASR / 依赖在三端各有独立实现（Linux 在多处为 allow(dead_code)，最易被漏）。扫描与审核代码时务必考虑全平台适配性：改动跨平台符号时核对 macOS / Windows / Linux 三个 cfg 分支是否同步，识别仅在单一平台生效、或会破坏其他平台编译与行为的问题。审核为只读，不要修改代码，输出简洁的中文结论。"
