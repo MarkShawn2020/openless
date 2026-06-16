@@ -2505,6 +2505,12 @@ fn append_typed_prefix(target: &mut String, delta: &str, typed_chars: usize) -> 
     appended
 }
 
+/// 上下文感知润色最多回看的历史轮数。`sessions` 为 newest-first，故 take 保留最近 N 轮。
+/// 这是对「5 分钟窗口内不限条数」的硬上限：不限条数时历史堆积会无限拉长 LLM 请求、抬高
+/// 首 token 时间（流式插入下 = 「出第一个字」的时刻），拖慢全体用户的转写（见 issue #678）。
+/// 取值偏小以优先延迟；若要更长的多轮连续性可上调。
+const MAX_POLISH_CONTEXT_TURNS: usize = 4;
+
 fn eligible_polish_context_turns(
     sessions: Vec<DictationSession>,
     active_style_pack_id: &str,
@@ -2533,6 +2539,8 @@ fn eligible_polish_context_turns(
                 Some((s.raw_transcript, s.final_text))
             }
         })
+        // 最近 N 轮上限：newest-first，take 保留最近的，杜绝历史堆积拖慢首字延迟（#678）。
+        .take(MAX_POLISH_CONTEXT_TURNS)
         .collect()
 }
 
@@ -2541,7 +2549,7 @@ mod tests {
     use super::{
         append_typed_prefix, batch_asr_chunk_limit_ms, default_done_message,
         drain_streaming_insert_deltas_with, eligible_polish_context_turns, finalize_polished_text,
-        flush_streaming_insert_buffer_with, streaming_insert_eligible,
+        flush_streaming_insert_buffer_with, streaming_insert_eligible, MAX_POLISH_CONTEXT_TURNS,
     };
     use crate::types::{
         ChineseScriptPreference, CorrectionRule, DictationSession, InsertStatus, PolishMode,
@@ -2583,6 +2591,37 @@ mod tests {
             translation_active,
             polish_source: polish_source.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn polish_context_is_capped_to_most_recent_turns() {
+        // newest-first：堆积多于上限的历史时，只保留最近 MAX_POLISH_CONTEXT_TURNS 轮，
+        // 避免无限拼接拖慢首字延迟（issue #678）。
+        let sessions: Vec<DictationSession> = (0..MAX_POLISH_CONTEXT_TURNS + 3)
+            .map(|i| {
+                history_session(
+                    &format!("s{i}"),
+                    &format!("raw {i}"),
+                    &format!("final {i}"),
+                    Some("pack.new"),
+                    false,
+                    None,
+                )
+            })
+            .collect();
+
+        let turns = eligible_polish_context_turns(sessions, "pack.new", false);
+
+        assert_eq!(turns.len(), MAX_POLISH_CONTEXT_TURNS);
+        // 保留的是最近的（newest-first 输入的前 N 条）。
+        assert_eq!(turns[0], ("raw 0".to_string(), "final 0".to_string()));
+        assert_eq!(
+            turns[MAX_POLISH_CONTEXT_TURNS - 1],
+            (
+                format!("raw {}", MAX_POLISH_CONTEXT_TURNS - 1),
+                format!("final {}", MAX_POLISH_CONTEXT_TURNS - 1)
+            )
+        );
     }
 
     #[test]
