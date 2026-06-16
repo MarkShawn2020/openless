@@ -319,7 +319,11 @@ async fn run_download(
         .iter()
         .map(|f| {
             let d = dir.join(&f.path);
-            if d.exists() {
+            // 只把「确实完整」的已存在文件计入已完成字节，与下面 run_download 的「完整才跳过、
+            // 否则删除重下」一致。若对大小不符的坏文件也按 f.size 计入，重下时 in_flight 又从 0
+            // 涨到 f.size，会双重计数、进度条短暂 >100%。
+            let actual = std::fs::metadata(&d).ok().map(|m| m.len());
+            if existing_file_is_complete(actual, f.size) {
                 f.size
             } else {
                 0
