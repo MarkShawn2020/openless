@@ -1250,6 +1250,17 @@ pub(crate) fn http_client_builder(base_url: &str, timeout_secs: u64) -> reqwest:
     }
 }
 
+/// 判定一个「TCP 握手 / 请求写出」阶段的网络错误是否可安全重试。
+///
+/// 只对 connect / request 这两类「服务端必然没收到」的失败重试，且**必须排除超时**：
+/// reqwest 会把「请求体写出阶段超时」归类为 `is_request()`（有时同时 `is_timeout()`），
+/// 若只判 `is_connect() || is_request()` 会让这类超时先命中重试臂，重发已发出的非幂等
+/// 请求 → 重复 LLM completion + 双重计费，与本函数文档意图相悖（#680）。抽成纯函数便于
+/// 单测覆盖（reqwest::Error 无法在测试里构造任意 flag 组合）。
+fn should_retry_transient(is_connect: bool, is_request: bool, is_timeout: bool) -> bool {
+    (is_connect || is_request) && !is_timeout
+}
+
 /// 发请求 + 网络抖动 retry：**只**对 `is_connect()` / `is_request()` 这两类「服务端
 /// 必然没收到」的失败重试一次。`is_timeout()` 故意**不**重试——超时时服务端可能已经
 /// 在处理请求并扣计费（LLM completion 是非幂等动作），重试会导致重复 billing + 重复
@@ -1277,7 +1288,7 @@ async fn send_with_transient_retry(
     };
     match initial.send().await {
         Ok(r) => Ok(r),
-        Err(e) if e.is_connect() || e.is_request() => {
+        Err(e) if should_retry_transient(e.is_connect(), e.is_request(), e.is_timeout()) => {
             log::warn!(
                 "[llm] send transient failure, retry in {}ms: {}",
                 RETRY_DELAY_MS,
@@ -2463,6 +2474,20 @@ mod tests {
 
     static CODEX_AUTH_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn retries_connect_or_request_only_when_not_timeout() {
+        // connect / request 失败（非超时）→ 服务端必然没收到，重试安全。
+        assert!(should_retry_transient(true, false, false));
+        assert!(should_retry_transient(false, true, false));
+        // 请求体写出阶段超时（reqwest 归类 is_request + is_timeout）→ 服务端可能已扣费，
+        // 不重试，避免重复 LLM completion 与双重计费（#680）。
+        assert!(!should_retry_transient(false, true, true));
+        assert!(!should_retry_transient(true, false, true));
+        // 纯超时 / 其它错误也不重试。
+        assert!(!should_retry_transient(false, false, true));
+        assert!(!should_retry_transient(false, false, false));
+    }
 
     struct EnvSnapshot {
         values: Vec<(&'static str, Option<OsString>)>,
