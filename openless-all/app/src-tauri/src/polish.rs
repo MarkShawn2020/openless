@@ -1250,6 +1250,14 @@ pub(crate) fn http_client_builder(base_url: &str, timeout_secs: u64) -> reqwest:
     }
 }
 
+/// 是否对一次发送失败做「网络抖动」重试。**只**对「服务端必然没收到」的 connect /
+/// request 类失败重试；任何 `is_timeout()` 都不重试——非幂等的 LLM completion 在请求体
+/// 写出阶段超时时（reqwest 会把这类错误同时标记成 `is_request()` + `is_timeout()`），服务端
+/// 可能已收到并计费，重试会导致重复 billing + 重复 completion。抽成纯函数便于穷举单测。
+fn should_retry_transient(is_connect: bool, is_request: bool, is_timeout: bool) -> bool {
+    (is_connect || is_request) && !is_timeout
+}
+
 /// 发请求 + 网络抖动 retry：**只**对 `is_connect()` / `is_request()` 这两类「服务端
 /// 必然没收到」的失败重试一次。`is_timeout()` 故意**不**重试——超时时服务端可能已经
 /// 在处理请求并扣计费（LLM completion 是非幂等动作），重试会导致重复 billing + 重复
@@ -1277,7 +1285,7 @@ async fn send_with_transient_retry(
     };
     match initial.send().await {
         Ok(r) => Ok(r),
-        Err(e) if e.is_connect() || e.is_request() => {
+        Err(e) if should_retry_transient(e.is_connect(), e.is_request(), e.is_timeout()) => {
             log::warn!(
                 "[llm] send transient failure, retry in {}ms: {}",
                 RETRY_DELAY_MS,
@@ -2463,6 +2471,30 @@ mod tests {
 
     static CODEX_AUTH_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn retries_connect_and_request_failures_without_timeout() {
+        // 纯 connect / 纯 request 失败（服务端必然没收到）→ 重试一次。
+        assert!(should_retry_transient(true, false, false));
+        assert!(should_retry_transient(false, true, false));
+        assert!(should_retry_transient(true, true, false));
+    }
+
+    #[test]
+    fn never_retries_when_timeout_flagged() {
+        // 关键回归：请求体写出阶段超时，reqwest 同时标记 is_request + is_timeout——
+        // 服务端可能已收到并对非幂等 LLM completion 计费，绝不能重试（否则重复扣费）。
+        assert!(!should_retry_transient(false, true, true));
+        assert!(!should_retry_transient(true, false, true));
+        assert!(!should_retry_transient(true, true, true));
+        // 纯超时同样不重试。
+        assert!(!should_retry_transient(false, false, true));
+    }
+
+    #[test]
+    fn does_not_retry_unrelated_failures() {
+        assert!(!should_retry_transient(false, false, false));
+    }
 
     struct EnvSnapshot {
         values: Vec<(&'static str, Option<OsString>)>,
