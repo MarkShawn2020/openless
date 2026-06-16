@@ -299,10 +299,6 @@ impl OpenAICompatibleLLMProvider {
         Self { config, client }
     }
 
-    pub fn config(&self) -> &OpenAICompatibleConfig {
-        &self.config
-    }
-
     pub async fn polish(
         &self,
         raw_text: &str,
@@ -922,10 +918,6 @@ impl CodexOAuthLLMProvider {
                 .unwrap_or_else(|_| reqwest::Client::new())
         });
         Self { config, client }
-    }
-
-    pub fn config(&self) -> &CodexOAuthConfig {
-        &self.config
     }
 
     pub async fn polish(
