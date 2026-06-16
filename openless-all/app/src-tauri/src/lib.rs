@@ -2362,6 +2362,11 @@ pub(crate) struct ForegroundMonitor {
     pub(crate) top: i32,
     pub(crate) right: i32,
     pub(crate) bottom: i32,
+    /// 工作区矩形（rcWork，= 显示器矩形减去任务栏），用于把胶囊夹在任务栏之外。
+    pub(crate) work_left: i32,
+    pub(crate) work_top: i32,
+    pub(crate) work_right: i32,
+    pub(crate) work_bottom: i32,
     /// 该显示器的有效 DPI 缩放（1.0 = 96dpi）。
     pub(crate) scale: f64,
 }
@@ -2399,6 +2404,10 @@ pub(crate) fn foreground_window_monitor() -> Option<ForegroundMonitor> {
             top: mi.rcMonitor.top,
             right: mi.rcMonitor.right,
             bottom: mi.rcMonitor.bottom,
+            work_left: mi.rcWork.left,
+            work_top: mi.rcWork.top,
+            work_right: mi.rcWork.right,
+            work_bottom: mi.rcWork.bottom,
             scale: (dpi_x as f64 / 96.0).max(0.1),
         })
     }
@@ -2431,15 +2440,24 @@ pub(crate) fn position_capsule_bottom_center<R: tauri::Runtime>(
             let offset_from_bottom =
                 (capsule_visual_height(translation_active) + 80.0 + bounds.bottom_inset) * scale;
             let y = ((mon.bottom as f64) - offset_from_bottom).round() as i32;
-            let clamped_y = y.max(mon.top);
-            // #470 诊断 v2：当前只夹了上边（.max(mon.top)），未夹下/左/右。多显示器、
-            // 负坐标或异常 DPI 下胶囊可能被算到屏幕外却无任何观测。记录显示器几何与
-            // 最终落点，用于证伪/证实「胶囊定位到屏幕外」(C 子嫌疑)。
+            // #470：用工作区（rcWork，已避开任务栏）四边夹住整窗，防止多显示器、负坐标或异常
+            // DPI 下胶囊被算到屏幕外、或压在任务栏上。取不到 rcWork 时（理论上不会，rcWork 总
+            // 随 rcMonitor 一同填）退回整屏矩形。
+            let (work_l, work_t, work_r, work_b) =
+                if mon.work_right > mon.work_left && mon.work_bottom > mon.work_top {
+                    (mon.work_left, mon.work_top, mon.work_right, mon.work_bottom)
+                } else {
+                    (mon.left, mon.top, mon.right, mon.bottom)
+                };
+            let (clamped_x, clamped_y) =
+                clamp_to_monitor(x, y, phys_w, phys_h, work_l, work_t, work_r, work_b);
             log::debug!(
-                "[capsule] win position: mon=({},{})..({},{}) scale={:.2} size=({}x{}) -> x={} y={} clamped_y={}",
-                mon.left, mon.top, mon.right, mon.bottom, scale, phys_w, phys_h, x, y, clamped_y
+                "[capsule] win position: mon=({},{})..({},{}) work=({},{})..({},{}) scale={:.2} size=({}x{}) -> x={} y={} -> clamped=({},{})",
+                mon.left, mon.top, mon.right, mon.bottom,
+                work_l, work_t, work_r, work_b,
+                scale, phys_w, phys_h, x, y, clamped_x, clamped_y
             );
-            window.set_position(PhysicalPosition::new(x, clamped_y))?;
+            window.set_position(PhysicalPosition::new(clamped_x, clamped_y))?;
             return Ok(());
         }
         // 仅当 Win32 取不到前台显示器时，落回下面的 current_monitor 逻辑。
@@ -2619,6 +2637,35 @@ mod tests {
         assert_eq!(
             (bounds.width, bounds.height, bounds.bottom_inset),
             (220.0, 110.0, 0.0)
+        );
+    }
+
+    // #470：胶囊四边 clamp（工作区，避开任务栏 + 不溢出屏外）。clamp_to_monitor 是纯函数，
+    // 三平台都跑。area = (0,0)..(1920,1040)，窗口 264x126。
+    #[test]
+    fn clamp_to_monitor_leaves_on_screen_position_untouched() {
+        // 完全在工作区内 → 不改动。
+        assert_eq!(
+            clamp_to_monitor(800, 900, 264, 126, 0, 0, 1920, 1040),
+            (800, 900)
+        );
+    }
+
+    #[test]
+    fn clamp_to_monitor_pulls_back_off_screen_right_and_bottom() {
+        // 右/下溢出 → 收回到「整窗仍可见」的最大位置（area_right-w, area_bottom-h）。
+        assert_eq!(
+            clamp_to_monitor(2000, 1200, 264, 126, 0, 0, 1920, 1040),
+            (1920 - 264, 1040 - 126)
+        );
+    }
+
+    #[test]
+    fn clamp_to_monitor_pulls_back_when_right_edge_overflows_inside_area() {
+        // 左上角在区域内、但右缘 x+w 超出 area_right → 仍需收回 x。
+        assert_eq!(
+            clamp_to_monitor(1800, 500, 264, 126, 0, 0, 1920, 1040),
+            (1920 - 264, 500)
         );
     }
 
