@@ -82,6 +82,16 @@ import { useHotkeySettings } from "../../state/HotkeySettingsContext"
 import { detectOS } from "../../components/WindowChrome"
 import { SelectLite } from "../../components/ui/SelectLite"
 import { Btn, Card, PageHeader, Pill } from "../_atoms"
+import {
+    formatBytes,
+    formatFoundrySizeMb,
+    isFoundryAlias,
+    isSherpaAlias,
+    isWindowsLikePlatform,
+    normalizeFoundryLanguageHintForUi,
+    normalizeFoundryRuntimeSourceForUi,
+    normalizeSherpaLanguageHintForUi,
+} from "./helpers"
 
 // Foundry Local Whisper 后端只在 Windows 编译实体（foundry_local_sdk 仅 Windows），
 // 非 Windows 平台 runtime 是 stub 永远 unavailable。前端这一页对应的卡片、状态拉取、
@@ -3441,57 +3451,5 @@ function TestResultBlock({
     )
 }
 
-function isFoundryAlias(value: string): value is FoundryLocalAsrModelAlias {
-    return FOUNDRY_LOCAL_ASR_MODELS.some((model) => model.alias === value)
-}
-
-function isSherpaAlias(value: string): value is SherpaOnnxModelAlias {
-    return SHERPA_ONNX_ASR_MODELS.some((model) => model.alias === value)
-}
-
-function normalizeFoundryLanguageHintForUi(
-    value: string,
-): FoundryLocalAsrLanguageHint {
-    return value === "zh" || value === "en" ? value : ""
-}
-
-function normalizeSherpaLanguageHintForUi(
-    value: string,
-): SherpaOnnxLanguageHint {
-    return value === "zh" ||
-        value === "en" ||
-        value === "ja" ||
-        value === "ko" ||
-        value === "yue"
-        ? value
-        : ""
-}
-
-function normalizeFoundryRuntimeSourceForUi(
-    value: string,
-): FoundryRuntimeSource {
-    return value === "nuget" || value === "ort-nightly" ? value : "auto"
-}
-
-function isWindowsLikePlatform(): boolean {
-    const nav = navigator as Navigator & {
-        userAgentData?: { platform?: string }
-    }
-    const platform =
-        nav.userAgentData?.platform || navigator.platform || navigator.userAgent
-    return /win/i.test(platform)
-}
-
-function formatFoundrySizeMb(
-    fileSizeMb: number | null | undefined,
-): string | null {
-    if (typeof fileSizeMb !== "number" || fileSizeMb <= 0) return null
-    return Math.round(fileSizeMb).toLocaleString()
-}
-
-function formatBytes(n: number): string {
-    if (n < 1024) return `${n} B`
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(0)} MB`
-    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
-}
+// Pure UI helpers (alias/language-hint guards, platform detection, size
+// formatting) live in ./helpers — imported at the top of this file.
