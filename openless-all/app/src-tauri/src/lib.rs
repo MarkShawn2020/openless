@@ -2670,6 +2670,24 @@ mod tests {
     }
 
     #[test]
+    fn clamp_to_monitor_pushes_into_negative_origin_left_monitor() {
+        // 副屏在主屏左侧（负 X 原点），落点算到了副屏左外侧 → 夹回 area_left。
+        // 1.5x DPI 下尺寸偏大，但 area 仍宽于窗口，左上角夹到 (-2560, top)。
+        let (x, y) = clamp_to_monitor(-3000, -100, 294, 138, -2560, 0, 0, 1440);
+        assert_eq!(x, -2560);
+        assert_eq!(y, 0);
+    }
+
+    #[test]
+    fn clamp_to_monitor_respects_work_area_above_taskbar() {
+        // 工作区底部 = 1040（任务栏占了 1040..1080）。落点本在任务栏区域（y=1030），
+        // 应被夹到「工作区底 - 窗口高」之上，胶囊整窗不压任务栏。
+        let (_x, y) = clamp_to_monitor(800, 1030, 264, 126, 0, 0, 1920, 1040);
+        assert_eq!(y, 1040 - 126);
+        assert!(y + 126 <= 1040);
+    }
+
+    #[test]
     fn capsule_window_bounds_expand_for_translation_badge() {
         let bounds = capsule_window_bounds(true);
         #[cfg(target_os = "windows")]
