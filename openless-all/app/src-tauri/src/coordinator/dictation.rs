@@ -2406,6 +2406,14 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     ) {
         log::error!("[coord] history append failed: {e}");
     }
+    // 把本次最终文字转发给已连接的远程手机：remote_server 的 WS handler 订阅了
+    // "remote:result"，H5 在状态区下方显示（type=result）。此前全仓无任何处 emit 该事件，
+    // 手机用户永远看不到识别结果。无手机连接时该事件无人转发 = 无害空操作。
+    if !polished.trim().is_empty() {
+        if let Some(app) = inner.app.lock().clone() {
+            let _ = app.emit("remote:result", polished.clone());
+        }
+    }
     let done_message = if tsf_required_insert_failed {
         Some("TSF 未上屏，已禁止非 TSF 兜底".to_string())
     } else {
