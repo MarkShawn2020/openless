@@ -16,7 +16,7 @@ import {
     type ReactNode,
 } from "react"
 import { useTranslation } from "react-i18next"
-import { isTauri, setActiveAsrProvider } from "../lib/ipc"
+import { isTauri, setActiveAsrProvider } from "../../lib/ipc"
 import {
     FOUNDRY_LOCAL_ASR_MODELS,
     SHERPA_ONNX_ASR_MODELS,
@@ -77,11 +77,11 @@ import {
     type SherpaOnnxLanguageHint,
     type SherpaOnnxModelAlias,
     type SherpaPrepareProgress,
-} from "../lib/localAsr"
-import { useHotkeySettings } from "../state/HotkeySettingsContext"
-import { detectOS } from "../components/WindowChrome"
-import { SelectLite } from "../components/ui/SelectLite"
-import { Btn, Card, PageHeader, Pill } from "./_atoms"
+} from "../../lib/localAsr"
+import { useHotkeySettings } from "../../state/HotkeySettingsContext"
+import { detectOS } from "../../components/WindowChrome"
+import { SelectLite } from "../../components/ui/SelectLite"
+import { Btn, Card, PageHeader, Pill } from "../_atoms"
 
 // Foundry Local Whisper 后端只在 Windows 编译实体（foundry_local_sdk 仅 Windows），
 // 非 Windows 平台 runtime 是 stub 永远 unavailable。前端这一页对应的卡片、状态拉取、
