@@ -242,6 +242,17 @@ pub(crate) fn build_client() -> Result<reqwest::Client> {
     builder.build().context("build reqwest client failed")
 }
 
+/// 判断目录里已存在的目标文件是否可信为「完整下载」。
+/// `actual_size` 为 `None`（取不到元数据）一律视为不完整。`expected_size == 0` 表示 HF 未
+/// 给出该文件大小（未知）→ 退回旧行为：只要文件存在就信任，避免对未知大小的文件反复重下。
+/// 否则严格要求字节数一致——上次被中断/外部损坏而残留的截断文件不再被当作完整跳过。
+fn existing_file_is_complete(actual_size: Option<u64>, expected_size: u64) -> bool {
+    match actual_size {
+        Some(actual) => expected_size == 0 || actual == expected_size,
+        None => false,
+    }
+}
+
 async fn run_download(
     app: &AppHandle,
     model_id: ModelId,
@@ -322,8 +333,20 @@ async fn run_download(
     for (idx, file) in info.files.iter().enumerate() {
         let dest = dir.join(&file.path);
         if dest.exists() {
-            // 已经下完的（目录里直接存在 dest 文件）跳过；前面 already_done_bytes 已计入
-            continue;
+            let actual = std::fs::metadata(&dest).ok().map(|m| m.len());
+            if existing_file_is_complete(actual, file.size) {
+                // 已完整下载（大小一致，或 HF 未给大小时退回信任存在）→ 跳过；
+                // already_done_bytes 已计入。
+                continue;
+            }
+            // 大小不符：上次被中断 / 外部损坏的截断文件，删除后重新下载，避免被当成完整。
+            log::warn!(
+                "[download] 已存在文件 {} 大小 {:?} != 期望 {}，删除重下",
+                file.path,
+                actual,
+                file.size
+            );
+            let _ = std::fs::remove_file(&dest);
         }
         let url = format!(
             "{}/{}/resolve/main/{}",
@@ -997,4 +1020,26 @@ fn emit_cancelled(
             error: None,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::existing_file_is_complete;
+
+    #[test]
+    fn existing_file_complete_only_when_size_matches_or_unknown() {
+        // 大小一致 → 完整。
+        assert!(existing_file_is_complete(Some(1024), 1024));
+        // 截断（偏小）→ 不完整，触发删除重下。
+        assert!(!existing_file_is_complete(Some(512), 1024));
+        // 比期望大（损坏 / 串写）→ 不完整。
+        assert!(!existing_file_is_complete(Some(2048), 1024));
+        // 取不到元数据 → 不完整。
+        assert!(!existing_file_is_complete(None, 1024));
+        // HF 未给大小（expected == 0）→ 退回「只要存在就信任」。
+        assert!(existing_file_is_complete(Some(0), 0));
+        assert!(existing_file_is_complete(Some(123), 0));
+        // expected == 0 但元数据取不到 → 仍不完整。
+        assert!(!existing_file_is_complete(None, 0));
+    }
 }
