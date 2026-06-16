@@ -168,6 +168,9 @@ pub fn set_combo_hotkey(coord: CoordinatorState<'_>, binding: ComboBinding) -> R
     if let Some(open_app) = prefs.open_app_hotkey.as_ref() {
         reject_dictation_open_app_hotkey_overlap(&shortcut, open_app)?;
     }
+    if let Some(less_computer) = prefs.coding_agent_voice_hotkey.as_ref() {
+        reject_dictation_less_computer_hotkey_overlap(&shortcut, less_computer)?;
+    }
     prefs.custom_combo_hotkey = Some(binding);
     prefs.dictation_hotkey = shortcut;
     sync_dictation_hotkey_legacy_fields(&mut prefs);
