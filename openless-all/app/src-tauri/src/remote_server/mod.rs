@@ -50,6 +50,10 @@ const PIN_MAX_FAILS: u32 = 5;
 const PIN_LOCK_SECS: u64 = 60;
 /// pin_fails 表的容量上限：超过即清理已过期/已解锁的条目，防止伪造海量源 IP 撑爆内存。
 const PIN_FAILS_MAX_ENTRIES: usize = 256;
+/// 全局（跨 IP）PIN 失败上限和重置窗口。防止局域网内多台设备轮换 IP 绕过按 IP 的限速。
+/// 20 次/分钟 ≈ 0.02% 的 PIN 空间，在 60s 锁定前实际可试到的组合数极少。
+const PIN_GLOBAL_MAX_FAILS: u32 = 20;
+const PIN_GLOBAL_WINDOW_SECS: u64 = 60;
 /// 单个 PCM 二进制帧的上限。16kHz/16bit 实时流正常每帧只有几 KB，64KB ≈ 2 秒音频；
 /// 超限帧直接丢弃，防已配对客户端（或驱动它的恶意网页）推超大帧造成内存压力。
 const MAX_PCM_FRAME_BYTES: usize = 64 * 1024;
@@ -283,6 +287,8 @@ struct WsState {
     app: AppHandle,
     /// 按源 IP 的 PIN 失败计数 + 锁定截止时刻（防爆破；TLS+6 位 PIN 已是主防线）。
     pin_fails: Mutex<std::collections::HashMap<IpAddr, (u32, Option<Instant>)>>,
+    /// 全局 PIN 失败计数 + 计数窗口起始时刻（防跨 IP 分布式暴力）。
+    pin_global_fails: Mutex<(u32, Instant)>,
     /// 自签名证书的 DER 原始字节，供 /cert.cer 下载给手机安装信任。
     cert_der: Vec<u8>,
     /// 服务关停广播的接收端，每条 WS 连接 clone 一份并在主循环 select 监听。
@@ -446,6 +452,7 @@ pub async fn start(cfg: RemoteServerConfig) -> Result<RemoteServerHandle, String
         coordinator: cfg.coordinator,
         app: cfg.app,
         pin_fails: Mutex::new(std::collections::HashMap::new()),
+        pin_global_fails: Mutex::new((0, Instant::now())),
         cert_der,
         conn_shutdown_rx,
     });
@@ -738,6 +745,23 @@ fn verify_hello(txt: &str, state: &Arc<WsState>, peer_ip: IpAddr) -> AuthResult 
     // 锁定检查与失败累计放同一临界区：之前分两次拿锁，同一 IP 的并发握手可以
     // 都先通过锁定检查再各自累计失败，让计数越过阈值却不触发锁定。
     let now = Instant::now();
+
+    // 全局限速：防局域网内多台设备轮换 IP 绕过按 IP 的限速（分布式暴力）。
+    {
+        let mut global = state.pin_global_fails.lock();
+        let window_elapsed = now.duration_since(global.1).as_secs();
+        if window_elapsed >= PIN_GLOBAL_WINDOW_SECS {
+            // 滑动窗口到期，重置计数
+            *global = (0, now);
+        }
+        if !pin_ok {
+            global.0 += 1;
+        }
+        if global.0 >= PIN_GLOBAL_MAX_FAILS {
+            return AuthResult::Locked;
+        }
+    }
+
     let mut guard = state.pin_fails.lock();
     if let Some((_, Some(until))) = guard.get(&peer_ip) {
         if now < *until {
@@ -748,6 +772,9 @@ fn verify_hello(txt: &str, state: &Arc<WsState>, peer_ip: IpAddr) -> AuthResult 
     }
     if pin_ok {
         guard.remove(&peer_ip);
+        // 成功认证后重置全局计数，避免暴力后期合法用户被误锁
+        let mut global = state.pin_global_fails.lock();
+        global.0 = 0;
         AuthResult::Ok
     } else {
         // 容量兜底：先丢已解锁/过期的条目，防伪造海量源 IP 撑爆表。
