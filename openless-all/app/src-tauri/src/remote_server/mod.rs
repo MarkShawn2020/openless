@@ -108,11 +108,20 @@ pub struct RemoteInputStatus {
 
 // ───────────────────────── 工具函数 ─────────────────────────
 
-/// 生成 6 位数字配对码。用 uuid v4 的随机字节取模，无需引入 rand。
+/// 生成 6 位数字配对码。使用 rejection sampling 消除取模偏差（u32::MAX 不是
+/// 1_000_000 的倍数，直接取模会给低编号 PIN 带来约 0.03% 的额外概率）。
 pub fn generate_pin() -> String {
-    let b = uuid::Uuid::new_v4().into_bytes();
-    let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) % 1_000_000;
-    format!("{n:06}")
+    // u32::MAX + 1 = 2^32；舍弃使结果偏置的高端余数区间。
+    // 偏置截止点：u32::MAX - (u32::MAX % 1_000_000) + 1（向下取整到 1_000_000 的倍数）
+    const LIMIT: u32 = u32::MAX - (u32::MAX % 1_000_000);
+    loop {
+        let b = uuid::Uuid::new_v4().into_bytes();
+        let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        if n < LIMIT {
+            return format!("{:06}", n % 1_000_000);
+        }
+        // 极罕见（约 2^32 mod 10^6 / 2^32 ≈ 0.007% 概率），重新采样即可。
+    }
 }
 
 fn pin_path(app: &AppHandle) -> Option<std::path::PathBuf> {
