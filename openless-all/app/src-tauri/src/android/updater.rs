@@ -219,6 +219,15 @@ mod android_impl {
             return Err(format!("download status {}", resp.status()));
         }
         let total = resp.content_length();
+        // 安全：防止无限流耗尽内存。200 MB 远超任何实际 APK 大小（当前约 50 MB）。
+        const MAX_APK_BYTES: u64 = 200 * 1024 * 1024;
+        if let Some(len) = total {
+            if len > MAX_APK_BYTES {
+                return Err(format!(
+                    "APK 声明大小 {len} 字节超过上限 {MAX_APK_BYTES}，拒绝下载"
+                ));
+            }
+        }
         let mut downloaded: u64 = 0;
         let mut bytes = Vec::new();
         let mut stream = resp.bytes_stream();
@@ -226,6 +235,11 @@ mod android_impl {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("download chunk: {e}"))?;
             downloaded += chunk.len() as u64;
+            if downloaded > MAX_APK_BYTES {
+                return Err(format!(
+                    "下载字节数 {downloaded} 超过上限 {MAX_APK_BYTES}，已终止"
+                ));
+            }
             bytes.extend_from_slice(&chunk);
             let _ = app.emit(
                 "android-update:progress",
