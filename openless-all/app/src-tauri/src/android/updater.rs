@@ -40,13 +40,12 @@ mod android_impl {
     fn device_arch() -> Result<&'static str, String> {
         crate::android::jni::android::with_android_env(|env, _context| {
             let abis_obj = env
-                .call_static_method(
+                .get_static_field(
                     "android/os/Build",
                     "SUPPORTED_ABIS",
-                    "()[Ljava/lang/String;",
-                    &[],
+                    "[Ljava/lang/String;",
                 )
-                .and_then(|value| value.l())
+                .and_then(|v| v.l())
                 .map_err(|e| format!("read SUPPORTED_ABIS: {e}"))?;
             let abis_array = jni::objects::JObjectArray::from(abis_obj);
             let len = env
