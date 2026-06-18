@@ -62,6 +62,7 @@ export function CheckUpdateButton({ channel }: { channel: UpdateChannel }) {
           progress={updater.progress}
           downloaded={updater.downloaded}
           contentLength={updater.contentLength}
+          errorMessage={updater.errorMessage}
           onInstall={() => void updater.installUpdate()}
           onClose={() => void updater.dismissDialog()}
         />

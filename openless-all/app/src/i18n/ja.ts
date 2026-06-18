@@ -1009,6 +1009,11 @@ export const ja: typeof zhCN = {
         restartNow: '今すぐ再起動',
         progress: '{{progress}}% · {{downloaded}} / {{total}}',
         progressUnknown: 'ダウンロード済み {{downloaded}}',
+        installError: {
+          title: '更新に失敗しました',
+          desc: '自動更新を完了できませんでした：{{error}}。ダウンロードページから手動で最新版を入手できます。',
+        },
+        manualDownload: '手動でダウンロード',
       },
     },
   },

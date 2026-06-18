@@ -1041,6 +1041,11 @@ export const en: typeof zhCN = {
         restartNow: 'Restart now',
         progress: '{{progress}}% · {{downloaded}} / {{total}}',
         progressUnknown: '{{downloaded}} downloaded',
+        installError: {
+          title: 'Update failed',
+          desc: "The automatic update couldn't finish: {{error}}. You can download and install the latest version manually.",
+        },
+        manualDownload: 'Download manually',
       },
     },
   },

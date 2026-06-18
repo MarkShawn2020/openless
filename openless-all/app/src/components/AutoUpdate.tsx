@@ -15,6 +15,8 @@ import {
   appDownloadAndInstallAndroidUpdate,
   isAndroid,
   isTauri,
+  logClientError,
+  openExternal,
   restartApp,
   type AppUpdateMetadata,
   type UpdateChannel,
@@ -22,6 +24,9 @@ import {
 import { Btn } from '../pages/_atoms';
 
 const UPDATE_CHECK_TIMEOUT_MS = 15_000;
+
+// 自动更新失败时的手动下载兜底：直达 GitHub Releases（与「关于」页 RELEASE_NOTES_URL 一致）。
+const RELEASE_DOWNLOAD_URL = 'https://github.com/appergb/openless/releases';
 
 export type UpdateStatus =
   | 'idle'
@@ -31,7 +36,11 @@ export type UpdateStatus =
   | 'downloading'
   | 'installing'
   | 'downloaded'
-  | 'error';
+  | 'error'
+  // installError：下载/安装这一步失败（区别于 'error' 的「检查失败」）。
+  // 检查失败沿用 'error'，在 CheckUpdateButton 里只做按钮内轻提示、不弹框，
+  // 后台自动检查失败也不弹框；只有 installError 才让弹框留在原地显示错误 + 手动下载兜底。
+  | 'installError';
 
 export interface UseAutoUpdate {
   status: UpdateStatus;
@@ -162,6 +171,7 @@ export function useAutoUpdate(): UseAutoUpdate {
     } catch (error) {
       console.error('[updater] failed to check update', error);
       const msg = error instanceof Error ? error.message : String(error);
+      void logClientError(`[updater] check failed: ${msg}`);
       setErrorMessage(msg);
       setStatus('error');
     }
@@ -180,8 +190,9 @@ export function useAutoUpdate(): UseAutoUpdate {
       } catch (error) {
         console.error('[updater] failed to install android update', error);
         const msg = error instanceof Error ? error.message : String(error);
+        void logClientError(`[updater] android install failed (v${payload.version}): ${msg}`);
         setErrorMessage(msg);
-        setStatus('error');
+        setStatus('installError');
       }
       return;
     }
@@ -208,9 +219,10 @@ export function useAutoUpdate(): UseAutoUpdate {
     } catch (error) {
       console.error('[updater] failed to install update', error);
       const msg = error instanceof Error ? error.message : String(error);
+      void logClientError(`[updater] install failed (v${update.version}): ${msg}`);
       setErrorMessage(msg);
       await closeUpdate();
-      setStatus('error');
+      setStatus('installError');
     }
   };
 
@@ -237,8 +249,8 @@ export function useAutoUpdate(): UseAutoUpdate {
   };
 }
 
-export function isDialogStatus(status: UpdateStatus): status is 'available' | 'downloading' | 'installing' | 'downloaded' {
-  return status === 'available' || status === 'downloading' || status === 'installing' || status === 'downloaded';
+export function isDialogStatus(status: UpdateStatus): status is 'available' | 'downloading' | 'installing' | 'downloaded' | 'installError' {
+  return status === 'available' || status === 'downloading' || status === 'installing' || status === 'downloaded' || status === 'installError';
 }
 
 export function UpdateDialog({
@@ -247,29 +259,34 @@ export function UpdateDialog({
   progress,
   downloaded,
   contentLength,
+  errorMessage,
   onInstall,
   onClose,
 }: {
-  status: 'available' | 'downloading' | 'installing' | 'downloaded';
+  status: 'available' | 'downloading' | 'installing' | 'downloaded' | 'installError';
   version: string;
   progress: number | null;
   downloaded: number;
   contentLength: number | null;
+  errorMessage?: string | null;
   onInstall: () => void;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
   const downloading = status === 'downloading';
   const installing = status === 'installing';
+  const installError = status === 'installError';
   const androidInstalled = isAndroid() && status === 'downloaded';
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.18)', display: 'grid', placeItems: 'center', zIndex: 40 }}>
       <div style={{ width: 360, borderRadius: 16, background: 'var(--ol-surface)', border: '0.5px solid var(--ol-line-strong)', boxShadow: '0 18px 42px rgba(0,0,0,0.18)', padding: 18 }}>
         <div style={{ fontSize: 15, fontWeight: 650, marginBottom: 8 }}>{t(`settings.about.updateDialog.${status}.title`)}</div>
-        <div style={{ fontSize: 12, color: 'var(--ol-ink-3)', lineHeight: 1.6, marginBottom: 14 }}>
+        <div style={{ fontSize: 12, color: 'var(--ol-ink-3)', lineHeight: 1.6, marginBottom: 14, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
           {androidInstalled
             ? t('settings.about.updateDialog.androidInstalled.desc', { version, defaultValue: '系统安装器已打开，请按提示完成安装。安装后重新打开 OpenLess 即可使用 {{version}}。' })
-            : t(`settings.about.updateDialog.${status}.desc`, { version })}
+            : installError
+              ? t('settings.about.updateDialog.installError.desc', { error: errorMessage || t('settings.about.updateError') })
+              : t(`settings.about.updateDialog.${status}.desc`, { version })}
         </div>
         {(downloading || installing || status === 'downloaded') && (
           <div style={{ marginBottom: 14 }}>
@@ -291,6 +308,8 @@ export function UpdateDialog({
           {(downloading || installing) && <Btn size="sm" disabled>{installing ? t('settings.about.updateDialog.installingLabel') : t('settings.about.updateDialog.downloadingLabel')}</Btn>}
           {status === 'downloaded' && <Btn size="sm" onClick={onClose}>{t('settings.about.updateDialog.later')}</Btn>}
           {status === 'downloaded' && !androidInstalled && <Btn variant="blue" size="sm" onClick={restartApp}>{t('settings.about.updateDialog.restartNow')}</Btn>}
+          {installError && <Btn size="sm" onClick={onClose}>{t('common.cancel')}</Btn>}
+          {installError && <Btn variant="blue" size="sm" onClick={() => void openExternal(RELEASE_DOWNLOAD_URL)}>{t('settings.about.updateDialog.manualDownload')}</Btn>}
         </div>
       </div>
     </div>

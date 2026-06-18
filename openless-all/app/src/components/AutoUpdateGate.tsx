@@ -60,6 +60,7 @@ export function AutoUpdateGate() {
       progress={u.progress}
       downloaded={u.downloaded}
       contentLength={u.contentLength}
+      errorMessage={u.errorMessage}
       onInstall={u.installUpdate}
       onClose={u.dismissDialog}
     />

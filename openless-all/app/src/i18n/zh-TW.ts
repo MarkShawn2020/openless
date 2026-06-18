@@ -1007,6 +1007,11 @@ export const zhTW: typeof zhCN = {
         restartNow: '現在重啓',
         progress: '{{progress}}% · {{downloaded}} / {{total}}',
         progressUnknown: '已下載 {{downloaded}}',
+        installError: {
+          title: '更新失敗',
+          desc: '自動更新未能完成：{{error}}。你可以前往下載頁手動下載安裝最新版本。',
+        },
+        manualDownload: '手動下載',
       },
     },
   },

@@ -1009,6 +1009,11 @@ export const ko: typeof zhCN = {
         restartNow: '지금 재시작',
         progress: '{{progress}}% · {{downloaded}} / {{total}}',
         progressUnknown: '다운로드됨 {{downloaded}}',
+        installError: {
+          title: '업데이트 실패',
+          desc: '자동 업데이트를 완료하지 못했습니다: {{error}}. 다운로드 페이지에서 최신 버전을 직접 받아 설치할 수 있습니다.',
+        },
+        manualDownload: '수동 다운로드',
       },
     },
   },

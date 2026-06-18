@@ -1039,6 +1039,11 @@ export const zhCN = {
         restartNow: '现在重启',
         progress: '{{progress}}% · {{downloaded}} / {{total}}',
         progressUnknown: '已下载 {{downloaded}}',
+        installError: {
+          title: '更新失败',
+          desc: '自动更新没能完成：{{error}}。你可以前往下载页手动下载安装最新版本。',
+        },
+        manualDownload: '手动下载',
       },
     },
   },
