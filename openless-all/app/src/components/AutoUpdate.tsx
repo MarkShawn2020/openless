@@ -56,7 +56,7 @@ export interface UseAutoUpdate {
   checking: boolean;
   busy: boolean;
   errorMessage: string | null;
-  checkForUpdates: (channel?: UpdateChannel) => Promise<void>;
+  checkForUpdates: (channel?: UpdateChannel, options?: CheckUpdateOptions) => Promise<void>;
   installUpdate: () => Promise<void>;
   dismissDialog: () => Promise<void>;
 }
@@ -137,7 +137,7 @@ export function useAutoUpdate(): UseAutoUpdate {
     androidUpdateRef.current = { url, signature, version: metadata.version };
   };
 
-  const checkForUpdates = async (channel?: UpdateChannel) => {
+  const checkForUpdates = async (channel?: UpdateChannel, options?: CheckUpdateOptions) => {
     setStatus('checking');
     setVersion('');
     setErrorMessage(null);
@@ -159,6 +159,25 @@ export function useAutoUpdate(): UseAutoUpdate {
       if (isAndroid()) {
         storeAndroidMetadata(metadata);
         setVersion(metadata.version);
+        if (options?.autoInstallAndroid) {
+          try {
+            // 复用 storeAndroidMetadata 的 rawJson 解析（提取 url/signature/version）
+            const raw = metadata.rawJson ?? {};
+            const url = typeof raw.url === 'string' ? raw.url : '';
+            const signature = typeof raw.signature === 'string' ? raw.signature : '';
+            if (!url || !signature) {
+              console.warn('[auto-update] android manifest missing url/signature, falling back to manual update');
+              setStatus('available');
+              return;
+            }
+            await appDownloadAndInstallAndroidUpdate({ url, signature, version: metadata.version });
+            setStatus('downloaded');
+          } catch (error) {
+            console.warn('[auto-update] android auto-install failed', error);
+            setStatus('available');
+          }
+          return;
+        }
         setStatus('available');
         return;
       }
