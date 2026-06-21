@@ -67,3 +67,23 @@ export function codingAgentCancelTest(): Promise<void> {
 export function codingAgentCommandRisk(command: string): Promise<string | null> {
     return invokeOrMock("coding_agent_command_risk", { command }, () => null)
 }
+
+/** OpenCode CLI 检测结果（issue #579）。 */
+export interface OpenCodeDetection {
+    installed: boolean
+    version: string | null
+    exe: string
+}
+
+/** 检测 `opencode` 是否安装（语音 Agent 选 OpenCode 后端时设置页据此提示）。 */
+export function codingAgentDetectOpencode(exe?: string): Promise<OpenCodeDetection> {
+    return invokeOrMock(
+        "coding_agent_detect_opencode",
+        { exe },
+        () => ({
+            installed: false,
+            version: null,
+            exe: exe || "opencode",
+        }),
+    )
+}
