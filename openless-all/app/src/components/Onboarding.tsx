@@ -220,12 +220,14 @@ function AndroidMicrophoneStep() {
 
   useEffect(() => {
     void refresh();
-    const id = window.setInterval(refresh, 3000);
+    // issue #470：纯事件驱动，去掉高频轮询。窗口重新聚焦或重新可见时刷新（授权必经系统设置再切回）。
     const onFocus = () => { void refresh(); };
+    const onVisibility = () => { if (document.visibilityState === 'visible') void refresh(); };
     window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
-      window.clearInterval(id);
       window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, []);
 
@@ -291,7 +293,12 @@ function DesktopOnboarding({
     ]);
     setAccessibility(a);
     setMicrophone(m);
-    const aOk = !requiresAccessibility || a === 'granted' || a === 'notApplicable';
+    // Gate on the real permission status — macOS returns granted/denied, other
+    // platforms return notApplicable. This must NOT depend on the hotkey
+    // capability flag: it is null while it loads, so trusting it let mic-only
+    // onboarding finish before we knew macOS needs Accessibility, dropping users
+    // into the app with a dead hotkey. Mirrors the gate in App.tsx.
+    const aOk = a === 'granted' || a === 'notApplicable';
     const mOk = m === 'granted' || m === 'notApplicable';
     if (aOk && mOk) {
       onComplete();
@@ -299,13 +306,15 @@ function DesktopOnboarding({
   };
 
   useEffect(() => {
-    refresh();
-    const id = window.setInterval(refresh, 1000);
-    const onFocus = () => refresh();
+    void refresh();
+    // issue #470：纯事件驱动，去掉每秒轮询。授权必经系统设置 App，切回 OpenLess 必触发 focus/visibilitychange。
+    const onFocus = () => { void refresh(); };
+    const onVisibility = () => { if (document.visibilityState === 'visible') void refresh(); };
     window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
-      window.clearInterval(id);
       window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
       if (refreshTimeoutRef.current) clearTimeout(refreshTimeoutRef.current);
     };
   }, [requiresAccessibility]);
@@ -318,6 +327,10 @@ function DesktopOnboarding({
     } finally {
       setBusy(false);
     }
+    // issue #470：与麦克风路径对称——授权动作返回后立即刷新，并挂一次 800ms 兜底覆盖 app 内按钮发起的授予。
+    void refresh();
+    if (refreshTimeoutRef.current) clearTimeout(refreshTimeoutRef.current);
+    refreshTimeoutRef.current = window.setTimeout(refresh, 800);
   };
 
   const onRequestMicrophone = async () => {
@@ -354,7 +367,7 @@ function DesktopOnboarding({
       >
         <BrandHeader title={t('onboarding.welcome')} desc={t('onboarding.intro')} />
 
-        {requiresAccessibility && (
+        {(requiresAccessibility || accessibility === 'denied') && (
           <PermissionStep
             index={1}
             title={capability?.requiresAccessibilityPermission ? t('onboarding.accessibilityTitle') : t('onboarding.hotkeyTitle')}
@@ -372,13 +385,13 @@ function DesktopOnboarding({
                     : t('onboarding.actionGrant')
             }
             onAction={onGrantAccessibility}
-            disabled={busy || !capability?.requiresAccessibilityPermission || accessibility === 'granted' || accessibility === 'notApplicable'}
+            disabled={busy || accessibility === 'granted' || accessibility === 'notApplicable'}
             hint={capability?.requiresAccessibilityPermission ? t('onboarding.accessibilityHint') : undefined}
           />
         )}
 
         <PermissionStep
-          index={requiresAccessibility ? 2 : 1}
+          index={(requiresAccessibility || accessibility === 'denied') ? 2 : 1}
           title={t('onboarding.micTitle')}
           desc={t('onboarding.micDesc')}
           status={microphone}
@@ -559,8 +572,8 @@ function PermissionStep({ index, title, desc, status, actionLabel, onAction, dis
           fontFamily: 'inherit',
           border: 0,
           borderRadius: 8,
-          background: granted ? 'var(--ol-surface-2)' : 'var(--ol-ink)',
-          color: granted ? 'var(--ol-ink-3)' : '#fff',
+          background: granted ? 'var(--ol-surface-2)' : 'var(--ol-primary-solid-bg)',
+          color: granted ? 'var(--ol-ink-3)' : 'var(--ol-primary-solid-ink)',
           cursor: disabled ? 'not-allowed' : 'default',
           opacity: disabled && !granted ? 0.6 : 1,
           transition: 'background 0.16s var(--ol-motion-quick), color 0.16s var(--ol-motion-quick), opacity 0.18s var(--ol-motion-soft), transform 0.12s var(--ol-motion-quick)',
@@ -581,8 +594,8 @@ const primaryButtonStyle = {
   fontFamily: 'inherit',
   border: 0,
   borderRadius: 10,
-  background: 'var(--ol-ink)',
-  color: '#fff',
+  background: 'var(--ol-primary-solid-bg)',
+  color: 'var(--ol-primary-solid-ink)',
   cursor: 'default',
 } as const;
 

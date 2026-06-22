@@ -253,7 +253,6 @@ pub async fn run_opencode_agent(
         }
     }
 
-    let _ = cancel.load(Ordering::Relaxed); // 静默标记 cancel 已被消费（kill_on_drop 兜底）。
     outcome
 }
 

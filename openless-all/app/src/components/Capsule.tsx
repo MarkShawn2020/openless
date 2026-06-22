@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { detectOS, type OS } from './WindowChrome';
 import {
@@ -8,6 +8,40 @@ import {
 } from '../lib/capsuleLayout';
 import { invokeOrMock, isTauri } from '../lib/ipc';
 import type { CapsulePayload, CapsuleState } from '../lib/types';
+
+// 胶囊 keyframes 注入一次到 document.head，而不是放在组件 JSX 里。否则录音时音量
+// 每帧（~60Hz）setLevel 都会让 React 重新创建/reconcile 这个 <style> 元素 —— 纯属
+// 浪费，因为这些 keyframes 是静态的。与 QaPanel / LessComputerPanel 注入方式一致。
+const CAPSULE_KEYFRAMES = `
+  /* 入场：从中央很窄的一小条（scaleX 0.18）+ 略压扁（scaleY 0.95）+ 透明，
+     长出到 scaleX 1 / scaleY 1 / 不透明。配合 wrapper 的 transformOrigin:center，
+     视觉上是「从中心向左右展开」。 */
+  @keyframes capsule-in {
+    from { opacity: 0; transform: scale(.78) translateY(8px); }
+    to   { opacity: 1; transform: scale(1)   translateY(0); }
+  }
+  /* 离场：scaleX 由 1 收回 0.18 + 整体向下偏移 8px + 淡出。
+     forwards 让最终帧（opacity:0、scaleX:.18）保持到组件被卸载。 */
+  @keyframes capsule-out {
+    from { opacity: 1; transform: scaleX(1)   translateY(0); }
+    to   { opacity: 0; transform: scaleX(.18) translateY(8px); }
+  }
+  @keyframes cap-shine {
+    0%   { background-position: 200% center; }
+    100% { background-position: -200% center; }
+  }
+  @keyframes cap-state-enter {
+    from { opacity: 0; transform: translateY(2px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+`;
+
+if (typeof document !== 'undefined' && !document.getElementById('capsule-keyframes')) {
+  const tag = document.createElement('style');
+  tag.id = 'capsule-keyframes';
+  tag.textContent = CAPSULE_KEYFRAMES;
+  document.head.appendChild(tag);
+}
 
 interface AudioBarsProps {
   level: number;
@@ -63,7 +97,7 @@ interface CenterTextProps {
   color?: string;
 }
 
-function CenterText({ os, kind, text, color = 'var(--ol-ink-3)' }: CenterTextProps) {
+function CenterText({ os, kind, text, color = 'var(--ol-capsule-center-ink)' }: CenterTextProps) {
   const metrics = getCapsulePillMetrics(os);
   const layout = getCapsuleMessageLayout(os, kind);
   return (
@@ -96,11 +130,11 @@ interface CircleButtonProps {
   onClick: () => void;
 }
 
-function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
+// memo:录音时 level 每帧(~60Hz)变化会重渲 Pill;cancel/confirm 两个 SVG 按钮跟
+// level 无关,memo + 稳定的 onClick 让它们在录音期间跳过重渲(只剩音量条真正更新)。
+const CircleButton = memo(function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
   const { t } = useTranslation();
   const isCancel = variant === 'cancel';
-  // confirm 是主操作锚点，纯白；cancel 半透 + 自带 backdrop blur 跟 pill 拉开层级。
-  const useBackdrop = isCancel;
   return (
     <button
       onClick={enabled ? onClick : undefined}
@@ -114,11 +148,9 @@ function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
         width: 28,
         height: 28,
         borderRadius: 999,
-        background: isCancel ? 'rgba(255, 255, 255, 0.55)' : 'rgba(255, 255, 255, 0.92)',
-        backdropFilter: useBackdrop ? 'blur(12px) saturate(160%)' : 'none',
-        WebkitBackdropFilter: useBackdrop ? 'blur(12px) saturate(160%)' : 'none',
-        color: 'var(--ol-ink)',
-        border: '0.8px solid rgba(0, 0, 0, 0.08)',
+        background: isCancel ? 'var(--ol-capsule-btn-bg)' : 'var(--ol-capsule-btn-bg-confirm)',
+        color: 'var(--ol-capsule-btn-ink)',
+        border: '0.8px solid var(--ol-capsule-btn-border)',
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -142,7 +174,7 @@ function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
       )}
     </button>
   );
-}
+});
 
 interface PillProps {
   os: OS;
@@ -157,8 +189,8 @@ interface PillProps {
 
 function Pill({ os, state, level, insertedChars, message, operating, onCancel, onConfirm }: PillProps) {
   const { t } = useTranslation();
-  const metrics = getCapsulePillMetrics(os);
-  const processingLayout = getCapsuleMessageLayout(os, 'processing');
+  const metrics = useMemo(() => getCapsulePillMetrics(os), [os]);
+  const processingLayout = useMemo(() => getCapsuleMessageLayout(os, 'processing'), [os]);
   const cancelEnabled = state === 'recording' || state === 'transcribing' || state === 'polishing';
   const confirmEnabled = state === 'recording';
 
@@ -255,7 +287,7 @@ function Pill({ os, state, level, insertedChars, message, operating, onCancel, o
     // 非 Linux 走假毛玻璃；Linux 禁用透明窗口后由 .ol-frost 平台规则退成不透明面。
     // 不写 backdrop-filter —— webview 模糊不了透明窗口背后的桌面（Tauri 上游限制）。
     <div
-      className="ol-frost"
+      className="ol-frost ol-capsule-pill"
       style={{
         display: 'inline-flex',
         alignItems: 'center',
@@ -266,11 +298,9 @@ function Pill({ os, state, level, insertedChars, message, operating, onCancel, o
         height: metrics.height,
         boxSizing: metrics.boxSizing,
         borderRadius: 999,
-        border: '1px solid rgba(255, 255, 255, 0.55)',
-        boxShadow: os === 'win'
-          ? `0 10px 24px -14px rgba(0, 0, 0, ${(0.24 + ambient * 0.06).toFixed(3)}), 0 0 0 0.5px rgba(0, 0, 0, 0.08), inset 0 1px 0 0 rgba(255, 255, 255, 0.8)`
-          : `0 18px 50px -10px rgba(0, 0, 0, ${shadowAlpha.toFixed(3)}), 0 0 0 0.5px rgba(0, 0, 0, 0.08), inset 0 1px 0 0 rgba(255, 255, 255, 0.8)`,
-        color: 'var(--ol-ink)',
+        border: '1px solid var(--ol-capsule-pill-border)',
+        boxShadow: `${os === 'win' ? `0 10px 24px -14px rgba(0, 0, 0, ${(0.24 + ambient * 0.06).toFixed(3)})` : `0 18px 50px -10px rgba(0, 0, 0, ${shadowAlpha.toFixed(3)})`}, 0 0 0 0.5px rgba(0, 0, 0, 0.24), var(--ol-capsule-pill-inset)`,
+        color: 'var(--ol-capsule-center-ink)',
         fontFamily: 'var(--ol-font-sans)',
         transform: `scale(${scale.toFixed(4)})`,
         transformOrigin: 'center',
@@ -374,13 +404,13 @@ export function Capsule() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
-  const onCancel = () => {
+  const onCancel = useCallback(() => {
     void invokeOrMock<void>('cancel_dictation', undefined, () => undefined);
-  };
+  }, []);
 
-  const onConfirm = () => {
+  const onConfirm = useCallback(() => {
     void invokeOrMock<void>('stop_dictation', undefined, () => undefined);
-  };
+  }, []);
 
   // 真正卸载：state 已是 idle，且不在离场动画中。
   if (state === 'idle' && !leaving) {
@@ -450,10 +480,10 @@ export function Capsule() {
             fontSize: 10.5,
             fontWeight: 600,
             color: 'var(--ol-blue)',
-            background: 'rgba(255, 255, 255, 0.78)',
-            backdropFilter: 'blur(20px) saturate(180%)',
-            WebkitBackdropFilter: 'blur(20px) saturate(180%)',
-            border: '0.5px solid rgba(37, 99, 235, 0.25)',
+            background: 'var(--ol-capsule-badge-bg)',
+            // issue #470：去掉无效的 backdrop-filter —— webview 模糊不了透明窗口背后的桌面
+            // （Tauri 上游限制，同本文件上方 pill 注释），纯空耗合成，删除零视觉变化。
+            border: '0.5px solid var(--ol-capsule-badge-border)',
             boxShadow: '0 4px 12px -4px rgba(37, 99, 235, 0.25), 0 0 0 0.5px rgba(0,0,0,0.04)',
             letterSpacing: '0.02em',
             whiteSpace: 'nowrap',
@@ -479,29 +509,6 @@ export function Capsule() {
         onCancel={onCancel}
         onConfirm={onConfirm}
       />
-      <style>{`
-        /* 入场：从中央很窄的一小条（scaleX 0.18）+ 略压扁（scaleY 0.95）+ 透明，
-           长出到 scaleX 1 / scaleY 1 / 不透明。配合 wrapper 的 transformOrigin:center，
-           视觉上是「从中心向左右展开」。 */
-        @keyframes capsule-in {
-          from { opacity: 0; transform: scale(.78) translateY(8px); }
-          to   { opacity: 1; transform: scale(1)   translateY(0); }
-        }
-        /* 离场：scaleX 由 1 收回 0.18 + 整体向下偏移 8px + 淡出。
-           forwards 让最终帧（opacity:0、scaleX:.18）保持到组件被卸载。 */
-        @keyframes capsule-out {
-          from { opacity: 1; transform: scaleX(1)   translateY(0); }
-          to   { opacity: 0; transform: scaleX(.18) translateY(8px); }
-        }
-        @keyframes cap-shine {
-          0%   { background-position: 200% center; }
-          100% { background-position: -200% center; }
-        }
-        @keyframes cap-state-enter {
-          from { opacity: 0; transform: translateY(2px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-      `}</style>
     </div>
   );
 }

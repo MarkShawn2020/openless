@@ -210,16 +210,12 @@ export function Style() {
   }, []);
 
   const selectedPack = packs.find(pack => pack.id === selectedId) ?? null;
-  const activePack = packs.find(pack => pack.active) ?? null;
   const rawPack = packs.find(pack => pack.id === BUILTIN_RAW_ID) ?? null;
   const otherBuiltinPacks = packs
     .filter(pack => pack.kind === 'builtin' && pack.id !== BUILTIN_RAW_ID)
     .sort((a, b) => BUILTIN_BODY_ORDER.indexOf(a.id) - BUILTIN_BODY_ORDER.indexOf(b.id));
   const importedPacks = packs.filter(pack => pack.kind === 'imported');
   const bodyPacks = [...otherBuiltinPacks, ...importedPacks];
-  const builtinCount = packs.filter(pack => pack.kind === 'builtin').length;
-  const importedCount = packs.filter(pack => pack.kind === 'imported').length;
-  const enabledCount = packs.filter(pack => pack.enabled).length;
 
   useEffect(() => {
     if (!selectedPack) {
@@ -620,12 +616,10 @@ export function Style() {
                     textAlign: 'left',
                     position: 'relative',
                     border: '0.5px solid',
-                    borderColor: pack.active ? 'var(--ol-blue)' : 'var(--ol-line)',
+                    borderColor: pack.active ? 'var(--ol-style-card-border-active)' : 'var(--ol-style-card-border)',
                     background: pack.active
-                      ? 'linear-gradient(180deg, rgba(239,246,255,0.92), rgba(255,255,255,0.98))'
-                      : isBuiltin
-                        ? 'linear-gradient(180deg, rgba(248,250,252,0.92), rgba(241,245,249,0.85))'
-                        : 'linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.92))',
+                      ? 'var(--ol-style-card-bg-active)'
+                      : 'var(--ol-style-card-bg)',
                     borderRadius: 18,
                     padding: 16,
                     boxShadow: pack.active ? '0 0 0 3px var(--ol-blue-ring)' : 'none',
@@ -636,7 +630,7 @@ export function Style() {
                   <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
                     <div style={{ minWidth: 0 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                        <div style={{ fontSize: 14, fontWeight: 600, color: isBuiltin && !pack.active ? 'var(--ol-ink-2)' : 'var(--ol-ink)' }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--ol-style-card-ink)' }}>
                           {pack.name}
                         </div>
                         <Pill tone={isBuiltin ? 'outline' : 'blue'} size="sm">
@@ -997,7 +991,7 @@ export function Style() {
                   <Card
                     padding={16}
                     style={{
-                      background: 'linear-gradient(180deg, rgba(255,255,255,0.98), rgba(246,248,252,0.95))',
+                      background: 'var(--ol-style-subtle-bg)',
                       border: '0.5px solid rgba(148,163,184,0.24)',
                     }}
                   >
@@ -1065,7 +1059,7 @@ export function Style() {
                     style={{
                       padding: 14,
                       borderRadius: 14,
-                      background: 'linear-gradient(180deg, rgba(248,250,252,0.98), rgba(241,245,249,0.95))',
+                      background: 'var(--ol-style-subtle-bg)',
                       border: '0.5px solid var(--ol-line)',
                     }}
                   >
@@ -1102,7 +1096,7 @@ export function Style() {
                         key={`${draft.id}-example-${index}`}
                         padding={16}
                         style={{
-                          background: 'linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.98))',
+                          background: 'var(--ol-style-editor-bg)',
                         }}
                       >
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
@@ -1137,7 +1131,7 @@ export function Style() {
                             style={{
                               borderRadius: 14,
                               border: '0.5px solid rgba(148,163,184,0.22)',
-                              background: 'rgba(248,250,252,0.9)',
+                              background: 'var(--ol-style-subtle-bg)',
                               padding: 14,
                             }}
                           >
@@ -1155,7 +1149,7 @@ export function Style() {
                             style={{
                               borderRadius: 14,
                               border: '0.5px solid rgba(37,99,235,0.16)',
-                              background: 'rgba(239,246,255,0.86)',
+                              background: 'var(--ol-style-subtle-bg)',
                               padding: 14,
                             }}
                           >
@@ -1189,7 +1183,7 @@ function MetaItem({ label, value }: { label: string; value: string }) {
       style={{
         borderRadius: 12,
         border: '0.5px solid rgba(148,163,184,0.2)',
-        background: 'rgba(255,255,255,0.92)',
+        background: 'var(--ol-style-input-bg)',
         padding: '10px 12px',
       }}
     >
@@ -1226,7 +1220,7 @@ function DirectiveRow({
         padding: '10px 12px',
         borderRadius: 12,
         border: '0.5px solid rgba(148,163,184,0.2)',
-        background: 'rgba(255,255,255,0.92)',
+        background: 'var(--ol-style-input-bg)',
       }}
     >
       <div style={{ minWidth: 0 }}>

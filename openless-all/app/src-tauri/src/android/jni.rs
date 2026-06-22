@@ -17,7 +17,13 @@ pub mod android {
         let mut env = vm
             .attach_current_thread()
             .map_err(|error| format!("attach Android thread: {error}"))?;
-        let context = unsafe { JObject::from_raw(android_context.context() as jni::sys::jobject) };
+        let raw_context = android_context.context() as jni::sys::jobject;
+        if raw_context.is_null() {
+            return Err("Android context not yet initialized".to_string());
+        }
+        // SAFETY: raw_context is non-null and points to a valid Android Context object
+        // provided by tao/Tauri; the reference lifetime is valid for the duration of `f`.
+        let context = unsafe { JObject::from_raw(raw_context) };
         f(&mut env, &context)
     }
 
@@ -72,7 +78,7 @@ pub mod android {
         Ok(())
     }
 
-    fn call_static_bool_with_context_class<'local>(
+    pub(crate) fn call_static_bool_with_context_class<'local>(
         env: &mut JNIEnv<'local>,
         context: &JObject<'local>,
         class_name: &str,
@@ -94,7 +100,7 @@ pub mod android {
             .map_err(|error| format!("create jstring: {error}"))
     }
 
-    fn jobject_str<'local>(
+    pub(crate) fn jobject_str<'local>(
         env: &mut JNIEnv<'local>,
         value: &str,
     ) -> Result<JObject<'local>, String> {
@@ -182,13 +188,12 @@ pub mod android {
             &[JValue::Object(&action_obj)],
         )
         .map_err(|error| format!("set service action: {error}"))?;
-        let start_method = if action.ends_with(".HIDE") || action.ends_with(".SHOW") {
-            "startService"
-        } else if android_sdk_int(env)? >= 26 {
-            "startForegroundService"
-        } else {
-            "startService"
-        };
+        let start_method =
+            if action.ends_with(".START_RECORDING") && android_sdk_int(env)? >= 26 {
+                "startForegroundService"
+            } else {
+                "startService"
+            };
         env.call_method(
             context,
             start_method,
@@ -305,6 +310,77 @@ pub mod android {
             .map_err(|error| format!("read SDK_INT: {error}"))
     }
 
+    /// 读取剪贴板当前的第一条纯文本内容，用于在粘贴后还原。
+    /// 失败或剪贴板为空时返回 None（不返回错误，避免阻塞主流程）。
+    pub fn get_primary_clip_text(
+        env: &mut JNIEnv,
+        context: &JObject,
+    ) -> Option<String> {
+        let clipboard_name = jobject_str(env, "clipboard").ok()?;
+        let clipboard = env
+            .call_method(
+                context,
+                "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[JValue::Object(&clipboard_name)],
+            )
+            .and_then(|value| value.l())
+            .ok()?;
+        let clip = env
+            .call_method(
+                &clipboard,
+                "getPrimaryClip",
+                "()Landroid/content/ClipData;",
+                &[],
+            )
+            .and_then(|value| value.l())
+            .ok()?;
+        if clip.is_null() {
+            return None;
+        }
+        let item = env
+            .call_method(
+                &clip,
+                "getItemAt",
+                "(I)Landroid/content/ClipData$Item;",
+                &[JValue::Int(0)],
+            )
+            .and_then(|value| value.l())
+            .ok()?;
+        if item.is_null() {
+            return None;
+        }
+        let text_val = env
+            .call_method(
+                &item,
+                "getText",
+                "()Ljava/lang/CharSequence;",
+                &[],
+            )
+            .and_then(|value| value.l())
+            .ok()?;
+        if text_val.is_null() {
+            return None;
+        }
+        let text_str = env
+            .call_method(&text_val, "toString", "()Ljava/lang/String;", &[])
+            .and_then(|value| value.l())
+            .ok()?;
+        let jstr = JString::from(text_str);
+        env.get_string(&jstr)
+            .map(|s| s.to_string_lossy().into_owned())
+            .ok()
+    }
+
+    /// 将指定文本写回剪贴板，用于 accessibility 粘贴后还原用户原有内容。
+    pub fn set_primary_clip_text(
+        env: &mut JNIEnv,
+        context: &JObject,
+        text: &str,
+    ) -> Result<(), String> {
+        copy_to_clipboard(env, context, text).map(|_| ())
+    }
+
     pub fn copy_to_clipboard(
         env: &mut JNIEnv,
         context: &JObject,
@@ -419,32 +495,146 @@ pub mod android {
         }
     }
 
+    const ACCESSIBILITY_SERVICE_CLASS: &str = "com.openless.app.OpenLessAccessibilityService";
+    const ACCESSIBILITY_PREFS_NAME: &str = "openless_accessibility";
+    const ACCESSIBILITY_HEARTBEAT_KEY: &str = "last_heartbeat";
+    const ACCESSIBILITY_HEARTBEAT_STALE_MS: i64 = 15_000;
+
+    fn content_resolver<'local>(
+        env: &mut JNIEnv<'local>,
+        context: &JObject<'local>,
+    ) -> Result<JObject<'local>, String> {
+        env.call_method(context, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+            .and_then(|value| value.l())
+            .map_err(|error| format!("Context.getContentResolver: {error}"))
+    }
+
+    fn jstring_object_to_option<'local>(
+        env: &mut JNIEnv<'local>,
+        value: JObject<'local>,
+    ) -> Result<Option<String>, String> {
+        if value.is_null() {
+            return Ok(None);
+        }
+        let text = env
+            .get_string(&JString::from(value))
+            .map_err(|error| format!("read jstring: {error}"))?
+            .to_string_lossy()
+            .into_owned();
+        Ok(Some(text))
+    }
+
+    fn settings_secure_get_int<'local>(
+        env: &mut JNIEnv<'local>,
+        context: &JObject<'local>,
+        key: &str,
+        default: i32,
+    ) -> Result<i32, String> {
+        let resolver = content_resolver(env, context)?;
+        let key_obj = jobject_str(env, key)?;
+        env.call_static_method(
+            "android/provider/Settings$Secure",
+            "getInt",
+            "(Landroid/content/ContentResolver;Ljava/lang/String;I)I",
+            &[
+                JValue::Object(&resolver),
+                JValue::Object(&key_obj),
+                JValue::Int(default),
+            ],
+        )
+        .and_then(|value| value.i())
+        .map_err(|error| format!("Settings.Secure.getInt({key}): {error}"))
+    }
+
+    fn settings_secure_get_string<'local>(
+        env: &mut JNIEnv<'local>,
+        context: &JObject<'local>,
+        key: &str,
+    ) -> Result<Option<String>, String> {
+        let resolver = content_resolver(env, context)?;
+        let key_obj = jobject_str(env, key)?;
+        let value = env
+            .call_static_method(
+                "android/provider/Settings$Secure",
+                "getString",
+                "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&resolver), JValue::Object(&key_obj)],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| format!("Settings.Secure.getString({key}): {error}"))?;
+        jstring_object_to_option(env, value)
+    }
+
+    fn accessibility_service_component_id<'local>(
+        env: &mut JNIEnv<'local>,
+        context: &JObject<'local>,
+    ) -> Result<String, String> {
+        let package_name = env
+            .call_method(context, "getPackageName", "()Ljava/lang/String;", &[])
+            .and_then(|value| value.l())
+            .map_err(|error| format!("Context.getPackageName: {error}"))?;
+        let package = env
+            .get_string(&JString::from(package_name))
+            .map_err(|error| format!("read package name: {error}"))?
+            .to_string_lossy()
+            .into_owned();
+        Ok(format!("{package}/{ACCESSIBILITY_SERVICE_CLASS}"))
+    }
+
     pub fn accessibility_enabled<'local>(
         env: &mut JNIEnv<'local>,
         context: &JObject<'local>,
     ) -> Result<bool, String> {
-        call_static_bool_with_context_class(
-            env,
-            context,
-            "com.openless.app.OpenLessAccessibilityService",
-            "isEnabled",
-            "(Landroid/content/Context;)Z",
-            &[JValue::Object(context)],
-        )
+        // Read Settings.Secure directly — avoids Kotlin @JvmStatic drift on older APK dex.
+        if settings_secure_get_int(env, context, "accessibility_enabled", 0)? != 1 {
+            return Ok(false);
+        }
+        let services = settings_secure_get_string(env, context, "enabled_accessibility_services")?
+            .unwrap_or_default();
+        let component_id = accessibility_service_component_id(env, context)?;
+        Ok(services.contains(&component_id))
     }
 
     pub fn accessibility_operational<'local>(
         env: &mut JNIEnv<'local>,
         context: &JObject<'local>,
     ) -> Result<bool, String> {
-        call_static_bool_with_context_class(
-            env,
-            context,
-            "com.openless.app.OpenLessAccessibilityService",
-            "isOperational",
-            "(Landroid/content/Context;)Z",
-            &[JValue::Object(context)],
-        )
+        if !accessibility_enabled(env, context)? {
+            return Ok(false);
+        }
+        let prefs_name = jobject_str(env, ACCESSIBILITY_PREFS_NAME)?;
+        let prefs = env
+            .call_method(
+                context,
+                "getSharedPreferences",
+                "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+                &[JValue::Object(&prefs_name), JValue::Int(0)],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| format!("Context.getSharedPreferences: {error}"))?;
+        let heartbeat_key = jobject_str(env, ACCESSIBILITY_HEARTBEAT_KEY)?;
+        let last_heartbeat = env
+            .call_method(
+                &prefs,
+                "getLong",
+                "(Ljava/lang/String;J)J",
+                &[JValue::Object(&heartbeat_key), JValue::Long(0)],
+            )
+            .and_then(|value| value.j())
+            .map_err(|error| format!("SharedPreferences.getLong: {error}"))?;
+        if last_heartbeat <= 0 {
+            return Ok(false);
+        }
+        let now = env
+            .call_static_method(
+                "java/lang/System",
+                "currentTimeMillis",
+                "()J",
+                &[],
+            )
+            .and_then(|value| value.j())
+            .map_err(|error| format!("System.currentTimeMillis: {error}"))?;
+        Ok(now.saturating_sub(last_heartbeat) <= ACCESSIBILITY_HEARTBEAT_STALE_MS)
     }
 
     pub fn launch_accessibility_settings(
@@ -506,5 +696,20 @@ pub mod android {
         } else {
             0
         }
+    }
+
+    pub(crate) fn install_apk_from_path<'local>(
+        env: &mut JNIEnv<'local>,
+        context: &JObject<'local>,
+        path_obj: &JObject<'local>,
+    ) -> Result<bool, String> {
+        call_static_bool_with_context_class(
+            env,
+            context,
+            "com.openless.app.OpenLessUpdateInstaller",
+            "installApk",
+            "(Landroid/content/Context;Ljava/lang/String;)Z",
+            &[JValue::Object(context), JValue::Object(path_obj)],
+        )
     }
 }

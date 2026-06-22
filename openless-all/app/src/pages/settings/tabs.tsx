@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react';
 import { RecordingInputSection } from './RecordingInputSection';
 import { ShortcutsSection } from './ShortcutsSection';
 import { LanguageSection } from './LanguageSection';
+import { ThemeSection } from './ThemeSection';
 import { ProvidersSection } from './ProvidersSection';
 import { MarketplaceSection } from './MarketplaceSection';
 import { PermissionsSection } from './PermissionsSection';
@@ -15,6 +16,7 @@ import { DebugToolsSection } from './DebugToolsSection';
 import { CodingAgentSection } from './CodingAgentSection';
 import { ClaudeConsoleSection } from './ClaudeConsoleSection';
 import { BetaChannelSection } from './BetaChannelSection';
+import { AutoUpdateSection } from './AutoUpdateSection';
 import { detectOS } from '../../components/WindowChrome';
 import { getPlatformCapabilities } from '../../lib/platform';
 import type { PlatformCapabilities } from '../../lib/types';
@@ -33,6 +35,7 @@ export function GeneralTab() {
     <>
       <RecordingInputSection />
       {showDesktopShortcuts && <ShortcutsSection />}
+      <ThemeSection />
       <LanguageSection />
     </>
   );
@@ -66,7 +69,8 @@ export function PrivacyTab() {
       >
         <span style={{
           fontSize: 11, padding: '3px 8px', borderRadius: 999,
-          background: '#fff', color: 'var(--ol-blue)', fontWeight: 600, flexShrink: 0,
+          background: 'var(--ol-surface)',
+          color: 'var(--ol-blue)', fontWeight: 600, flexShrink: 0,
         }}>
           {t('modal.about.localFirst')}
         </span>
@@ -98,6 +102,7 @@ export function AdvancedTab() {
       {showDesktopAdvanced && os !== 'win' && <CodingAgentSection />}
       {showDesktopAdvanced && os !== 'win' && <ClaudeConsoleSection />}
       {platformCaps?.supportsAutoUpdate === true && <BetaChannelSection />}
+      {platformCaps?.supportsAutoUpdate === true && <AutoUpdateSection />}
     </>
   );
 }

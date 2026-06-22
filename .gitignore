@@ -11,6 +11,7 @@ ChatGPT Image*.jpg
 # Local config / secrets
 *.env
 config.local.json
+.local-secrets/
 # Tauri updater 签名私钥（绝不上传 — 公钥在 tauri.conf.json，私钥放 GitHub Secret）
 *.key
 *.key.pub
@@ -36,6 +37,13 @@ target/
 # 本地从 CI / Actions 下载的 APK 及解压目录（非源码）
 ci-artifacts/
 *.apk
+
+# UI smoke / Playwright 截图与报告（本地校验用，非源码）
+openless-all/ui-check-screenshots/
+test-results/
+playwright-report/
+playwright/.cache/
+blob-report/
 
 # Android 真机调试产物（日志 / 截图 / adb 导出 / 数据备份 / 临时还原目录）
 diagnostics/

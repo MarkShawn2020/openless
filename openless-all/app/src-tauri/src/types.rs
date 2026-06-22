@@ -77,19 +77,25 @@ pub enum PasteShortcut {
     ShiftInsert,
 }
 
-/// Auto-update 渠道。决定 Settings → 关于 里展示哪一类版本信息。
-/// `Stable` 沿用 `tauri-plugin-updater` 的默认 endpoints（即 `tauri.conf.json`
-/// 里的 `latest-{{target}}-{{arch}}.json`），与发版 pipeline 对齐。
-/// `Beta` 不动 plugin endpoints —— 只解锁 Settings 里"手动下载最新 Beta"的入口
-/// （fetch GitHub `prerelease` + 跳浏览器），物理隔离 Beta 包不会通过 auto-update
-/// 推到正式版用户。详见 README 的"Contributing workflow"和 CLAUDE.md 的
-/// `Branch & release-channel workflow` 段落。
+/// Auto-update 渠道。决定后台 AutoUpdateGate 拉哪条 manifest。
+/// `Stable` = `latest-android-{arch}.json`（或桌面 plugin-updater 正式版 endpoints）。
+/// `Beta` = `latest-android-{arch}-beta.json`（或桌面 beta endpoints）。
+/// Settings 里手动「检查正式版 / 检查 Beta」按钮显式传 channel，不受此 pref 影响。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateChannel {
     #[default]
     Stable,
     Beta,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,10 +229,6 @@ impl StyleSystemPrompts {
             PolishMode::Structured => &self.structured,
             PolishMode::Formal => &self.formal,
         }
-    }
-
-    pub fn is_default_for_mode(&self, mode: PolishMode) -> bool {
-        self.for_mode(mode) == StyleSystemPrompts::default().for_mode(mode)
     }
 
     pub fn with_legacy_custom_prompts(mut self, legacy: &CustomStylePrompts) -> Self {
@@ -707,8 +709,8 @@ pub struct UserPreferences {
     /// foundry/qwen3 一致。
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     pub sherpa_onnx_keep_loaded_secs: u32,
-    /// Auto-update 渠道偏好。stable = 跟正式版（默认）；beta = Settings 里多
-    /// 一个手动下载 Beta 的入口。不影响 plugin-updater 的自动检查路径。
+    /// Auto-update 渠道。stable = 后台自动更新查正式版 manifest；beta = 查 Beta manifest。
+    /// 手动检查按钮显式指定 channel，与此 pref 解耦。
     #[serde(default)]
     pub update_channel: UpdateChannel,
     /// 历史记录保留天数。0 = 不按时间清理（仅受 200 条上限）。默认 7 天。
@@ -725,6 +727,9 @@ pub struct UserPreferences {
     /// 用户改用托盘菜单访问主窗口。默认 false 跟历史行为一致。
     #[serde(default)]
     pub start_minimized: bool,
+    /// UI theme: follow OS, force light, or force dark. Frontend applies via data-ol-theme.
+    #[serde(default)]
+    pub theme_mode: ThemeMode,
     /// 流式输入：润色 SSE 一边到达一边逐字模拟键盘事件输出到当前焦点。开启后用户感知到
     /// 的处理时延显著降低（润色 LLM 第一个 token 即开始落字）。
     ///
@@ -754,8 +759,9 @@ pub struct UserPreferences {
     /// 默认 true（更接近用户习惯）。
     #[serde(default = "default_true")]
     pub streaming_insert_save_clipboard: bool,
-    /// 主窗口启动 + 后台每 60 分钟自动检查云端新版本。默认 true。
-    /// 用户在 Settings → 关于 里可关。关闭后仅手动「检查更新」按钮可用。
+    /// 主窗口启动 + 后台每 60 分钟自动检查更新。默认 true。
+    /// Android 开启后自动检查并下载，校验后打开系统安装器；桌面仅自动检查 + 用户确认安装。
+    /// 关闭后仅 Settings 手动「检查更新」按钮可用。
     #[serde(default = "default_true")]
     pub auto_update_check: bool,
     /// 历史记录上限（条数）。`None` = 使用代码内 200 条硬上限；
@@ -948,6 +954,8 @@ struct UserPreferencesWire {
     polish_context_window_minutes: u32,
     #[serde(default)]
     start_minimized: bool,
+    #[serde(default)]
+    theme_mode: ThemeMode,
     #[serde(default = "default_true")]
     streaming_insert: bool,
     #[serde(default)]
@@ -1041,6 +1049,7 @@ impl Default for UserPreferencesWire {
             history_retention_days: prefs.history_retention_days,
             polish_context_window_minutes: prefs.polish_context_window_minutes,
             start_minimized: prefs.start_minimized,
+            theme_mode: prefs.theme_mode,
             streaming_insert: prefs.streaming_insert,
             streaming_insert_default_migrated: prefs.streaming_insert_default_migrated,
             streaming_insert_save_clipboard: prefs.streaming_insert_save_clipboard,
@@ -1148,6 +1157,7 @@ impl<'de> Deserialize<'de> for UserPreferences {
             history_retention_days: wire.history_retention_days,
             polish_context_window_minutes: wire.polish_context_window_minutes,
             start_minimized: wire.start_minimized,
+            theme_mode: wire.theme_mode,
             streaming_insert,
             streaming_insert_default_migrated: true,
             streaming_insert_save_clipboard: wire.streaming_insert_save_clipboard,
@@ -1883,6 +1893,7 @@ impl Default for UserPreferences {
             history_retention_days: default_history_retention_days(),
             polish_context_window_minutes: default_polish_context_window_minutes(),
             start_minimized: false,
+            theme_mode: ThemeMode::default(),
             streaming_insert: true,
             streaming_insert_default_migrated: true,
             streaming_insert_save_clipboard: true,
@@ -2419,7 +2430,7 @@ impl PlatformCapabilities {
                 supports_tray: false,
                 supports_local_asr: false,
                 supports_in_app_dictation: true,
-                supports_auto_update: false,
+                supports_auto_update: true,
             }
         }
 

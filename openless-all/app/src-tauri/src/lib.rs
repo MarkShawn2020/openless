@@ -28,6 +28,10 @@ mod commands;
 mod coordinator;
 mod coordinator_state;
 mod correction;
+// 托盘麦克风设备变更监听：macOS CoreAudio / Windows MMDevice 原生通知（空闲零唤醒），
+// Linux 退化为纯轮询兜底。仅桌面端。详见 issue #470。
+#[cfg(not(mobile))]
+mod device_watch;
 mod external_url;
 #[cfg(not(mobile))]
 mod global_hotkey_runtime;
@@ -105,6 +109,9 @@ use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
     RunEvent, Runtime,
 };
+// 桌面专用：移动端 WebviewWindowBuilder 没有 decorations/shadow 等方法，懒创建只在桌面用。
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 use crate::types::PolishMode;
 
@@ -282,6 +289,7 @@ macro_rules! app_invoke_handler_desktop {
             commands::sherpa_onnx_asr_reveal_model_dir,
             commands::export_error_log,
             restart_app,
+            log_client_error,
             set_windows_caption_theme,
         ]
     };
@@ -366,7 +374,13 @@ macro_rules! app_invoke_handler_mobile {
             $crate::commands::open_system_settings,
             $crate::commands::trigger_microphone_prompt,
             $crate::commands::export_error_log,
+            $crate::commands::get_update_channel,
+            $crate::commands::set_update_channel,
+            $crate::commands::fetch_latest_beta_release,
+            $crate::commands::app_check_update_with_channel,
+            $crate::commands::app_download_and_install_android_update,
             $crate::restart_app,
+            $crate::log_client_error,
         ]
     };
 }
@@ -390,7 +404,13 @@ fn run_desktop() {
     }
     let local_asr_download_manager = Arc::new(asr::local::DownloadManager::new());
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // macOS：胶囊要叠到别的 app 的全屏 Space 之上，必须是「非激活 NSPanel」(普通
+    // NSWindow 即便设 collectionBehavior 也做不到 —— tauri#9556 / #11488)。下面 setup 里
+    // 的 capsule.to_panel() 依赖本插件注册的 panel 注册表；插件仅 macOS。
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+    builder
         // 单实例锁：第二个进程启动时立即退出，激活信号转给已运行实例的主窗口。
         // 否则两份 OpenLess（如 /Applications/ + dev build）会各自抓全局热键，
         // 导致按一次键、两个进程同时跑流水线、文本被插入两遍。见 issue #50。
@@ -449,33 +469,38 @@ fn run_desktop() {
             // Capsule 启动时定位到屏幕底部居中并隐藏；coordinator 按需显示。
             // 与 Swift `CapsuleWindowController.repositionToBottomCenter` 同语义。
             if let Some(capsule) = app.get_webview_window("capsule") {
+                // macOS：转成「非激活 NSPanel」，否则胶囊叠不到别的 app 的全屏之上
+                // （普通 NSWindow 只靠 collectionBehavior 做不到 —— tauri#9556 / #11488）。
+                #[cfg(target_os = "macos")]
+                {
+                    use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
+                    use tauri_nspanel::WebviewWindowExt;
+                    match capsule.to_panel() {
+                        Ok(panel) => {
+                            // 非激活：显示/点击都不激活本 app、不切走当前(含全屏)Space。
+                            const NS_NONACTIVATING_PANEL_MASK: i32 = 1 << 7;
+                            panel.set_style_mask(NS_NONACTIVATING_PANEL_MASK);
+                            // 抬到菜单栏(24)之上。
+                            panel.set_level(25);
+                            // 加入所有 Space + 作为辅助窗口出现在全屏 app 的 Space 上。
+                            panel.set_collection_behaviour(
+                                NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
+                                    | NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces,
+                            );
+                        }
+                        Err(e) => log::warn!("[capsule] to_panel failed: {e:?}"),
+                    }
+                }
                 if let Err(e) = position_capsule_bottom_center(&capsule, false) {
                     log::warn!("[capsule] position failed: {e}");
                 }
                 let _ = capsule.hide();
             }
 
-            // QA 浮窗（issue #118）：紧贴胶囊上方 8pt、屏幕底部居中、380×440。
-            // 启动时 hide()，等 coordinator 在 open_qa_panel 时再 show + 首次定位。
-            // tauri.conf.json 里需要声明 label="qa" 的窗口（前端 agent 负责）；
-            // 这里 get_webview_window 返回 None 时直接跳过，不影响主流程。
-            if let Some(qa) = app.get_webview_window("qa") {
-                if let Err(e) = position_qa_window(&qa) {
-                    log::warn!("[qa] position failed: {e}");
-                }
-                #[cfg(target_os = "macos")]
-                make_qa_window_draggable_macos(&qa);
-                let _ = qa.hide();
-            } else {
-                log::info!("[qa] qa 窗口未在 tauri.conf.json 中声明，前端 agent 会补上");
-            }
-
-            // Less Computer 语音 Agent 浮窗（macOS only）。启动时隐藏；coordinator
-            // 在 Less Computer 会话开始时再 show + 定位。非 macOS 上该窗口虽在
-            // tauri.conf.json 声明，但前端不渲染入口、后端不 emit，保持隐藏惰性。
-            if let Some(lc) = app.get_webview_window("less-computer") {
-                let _ = lc.hide();
-            }
+            // QA / Less Computer / glow 浮窗改为懒创建（不再在 tauri.conf.json eager 声明）：
+            // 用到时才 build（ensure_qa_window / ensure_less_computer_window /
+            // ensure_less_computer_glow_window），idle 时根本没有它们的 WebKit 进程 ——
+            // 省 3 个常驻 webview。定位 + QA 拖拽修复在创建/show 路径里补。
 
             // 主窗口磨砂：macOS 用 NSVisualEffectView，Windows 用 Mica。
             // 没这一层的话 transparent: true 让窗口透明 → 背后只是空，不是磨砂。
@@ -884,15 +909,74 @@ fn microphone_device_signature() -> Option<Vec<(String, bool)>> {
     }
 }
 
+/// 在主线程上刷新托盘麦克风子菜单并通知前端。供 OS 原生设备变更回调与慢速兜底轮询
+/// 共用同一条收尾路径。已在主线程或被 `run_on_main_thread` 派发后调用。
+#[cfg(not(mobile))]
+fn refresh_microphone_on_main(app: &AppHandle) {
+    if let Err(err) = refresh_tray_microphone_menu(app) {
+        log::warn!("[tray] refresh microphone menu after device change failed: {err}");
+    }
+    let _ = app.emit("microphone:devices-changed", serde_json::json!({}));
+}
+
+/// 设备变更去抖闭包：被 OS 原生通知回调（macOS CoreAudio / Windows MMDevice）调用。
+/// 复用 `microphone_device_signature()` 去抖——签名没变就零副作用直接返回；变了才
+/// `run_on_main_thread` 派发刷新+emit。OS 通知可能合并/重复触发，去抖确保只在真正
+/// 变化时刷新。`last_signature` 用 `Mutex` 保护，因为回调可能从不同的 CoreAudio/COM
+/// 线程并发进入。
+#[cfg(not(mobile))]
+fn make_microphone_change_handler(app: AppHandle) -> impl Fn() + Send + Sync + 'static {
+    let last_signature = parking_lot::Mutex::new(microphone_device_signature());
+    move || {
+        let signature = microphone_device_signature();
+        {
+            let mut guard = last_signature.lock();
+            if signature == *guard {
+                return;
+            }
+            *guard = signature;
+        }
+        let refresh_app = app.clone();
+        let _ = app.run_on_main_thread(move || refresh_microphone_on_main(&refresh_app));
+    }
+}
+
 #[cfg(not(mobile))]
 fn start_tray_microphone_watcher(app: AppHandle) {
     TRAY_MICROPHONE_WATCHER_STOPPING.store(false, Ordering::Relaxed);
+
+    // 1) OS 原生设备变更通知（issue #470 的最优方案）：空闲零唤醒。
+    //    macOS → CoreAudio AudioObjectAddPropertyListener；Windows → IMMNotificationClient。
+    //    Linux 无原生路径，返回 false，纯靠下面的慢速兜底。
+    //    注册失败（OSStatus≠0 / RegisterEndpoint Err）只 warn，不 panic——兜底轮询保证
+    //    三平台都「永远能检测到设备」。
+    let native_registered =
+        device_watch::spawn_native_watcher(app.clone(), make_microphone_change_handler(app.clone()));
+    if native_registered {
+        log::info!("[tray] OS native microphone device watcher registered");
+    } else {
+        log::info!(
+            "[tray] no OS native microphone device watcher (unsupported platform or registration failed); relying on slow poll fallback"
+        );
+    }
+
+    // 2) 全平台慢速兜底：60s 无条件轮询，复用 signature 去抖（签名没变就 continue，零
+    //    副作用）。原生通知失败时由它保证设备变更最终被检测到；原生通知正常时它只是
+    //    极低频的安全网，几乎从不真正刷新。
     if let Err(err) = std::thread::Builder::new()
-        .name("openless-tray-mic-watch".into())
+        .name("openless-tray-mic-poll".into())
         .spawn(move || {
             let mut last_signature = microphone_device_signature();
             while !TRAY_MICROPHONE_WATCHER_STOPPING.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(1500));
+                // 60s（而非 10s）：原生通知承担实时检测，这条线程只是兜底，把它拉到 60s
+                // 进一步压低空闲唤醒。1s 一片的睡眠让退出 flag 最多 1s 内生效，避免退出时
+                // 长时间挂起线程。
+                for _ in 0..60 {
+                    if TRAY_MICROPHONE_WATCHER_STOPPING.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
                 if TRAY_MICROPHONE_WATCHER_STOPPING.load(Ordering::Relaxed) {
                     break;
                 }
@@ -901,20 +985,12 @@ fn start_tray_microphone_watcher(app: AppHandle) {
                     continue;
                 }
                 last_signature = signature;
-                let app = app.clone();
                 let refresh_app = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    if let Err(err) = refresh_tray_microphone_menu(&refresh_app) {
-                        log::warn!(
-                            "[tray] refresh microphone menu after device change failed: {err}"
-                        );
-                    }
-                    let _ = refresh_app.emit("microphone:devices-changed", serde_json::json!({}));
-                });
+                let _ = app.run_on_main_thread(move || refresh_microphone_on_main(&refresh_app));
             }
         })
     {
-        log::warn!("[tray] start microphone watcher failed: {err}");
+        log::warn!("[tray] start microphone poll fallback failed: {err}");
     }
 }
 
@@ -1065,6 +1141,26 @@ fn restart_app(app: AppHandle) {
     #[cfg(target_os = "macos")]
     reset_tcc_for_beta_restart();
     app.restart();
+}
+
+/// 把前端的关键错误（如自动更新 install 失败）转发到 Rust 文件日志（openless.log）。
+/// webview 的 console.error 不会进 openless.log，单独留一个 IPC，便于用户「导出日志」
+/// 后我们拿到自动更新失败的真实原因。
+#[tauri::command]
+fn log_client_error(message: String) {
+    // message 由前端 webview 可控，可能很长或含换行（伪造日志行）。先把换行折成空格、
+    // 再按 UTF-8 字符边界截断，避免单条日志过大或污染日志格式。
+    const MAX_LEN: usize = 2048;
+    let mut sanitized = message.replace(['\n', '\r'], " ");
+    if sanitized.len() > MAX_LEN {
+        let mut end = MAX_LEN;
+        while !sanitized.is_char_boundary(end) {
+            end -= 1;
+        }
+        sanitized.truncate(end);
+        sanitized.push_str("…(truncated)");
+    }
+    log::error!("[client] {sanitized}");
 }
 
 #[cfg(target_os = "macos")]
@@ -1479,17 +1575,34 @@ impl CapsuleTargetMonitor {
     }
 }
 
-/// macOS：把「当前 focused input / caret」映射到显示器。
+/// macOS：决定胶囊应该摆到哪块显示器。
 ///
-/// 不能用 capsule window 的 current_monitor：窗口隐藏时它仍停留在上一次出现的屏，
-/// 多屏输入会因此被缓存误判为“不需要移动”。这里先用 AX 取 caret/输入框位置，
-/// 再在 Tauri 的 monitor 坐标系里选包含该点的屏；如果点短暂落在所有屏外，
-/// 退到最近的屏，避免虚拟桌面负坐标/屏幕排列边缘导致完全不显示。
+/// 跟随**鼠标光标所在的屏**——这是用户的操作/视线焦点，也是唯一始终可用、
+/// 无需任何权限的信号，多显示器 + 多 Space 下都能稳定命中。光标取不到时
+/// （理论上不会）才退回 AX focused-input/caret 位置。
+///
+/// 关键：不能用 capsule window 自己的 current_monitor——窗口隐藏时它仍停留在
+/// 上一次出现的屏，多屏会被缓存误判为“不需要移动”，把胶囊锁死在第一块屏。
+/// 选屏时先找包含该点的屏；点短暂落在所有屏外则退到最近的屏，避免虚拟桌面
+/// 负坐标 / 屏幕排列边缘导致完全不显示。定位与 layout 去重缓存共用本函数，
+/// 二者看的必须是同一块屏。
 #[cfg(target_os = "macos")]
-pub(crate) fn focused_input_target_monitor<R: tauri::Runtime>(
+pub(crate) fn capsule_target_monitor<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
 ) -> Option<CapsuleTargetMonitor> {
-    let (x, y) = macos_focused_input_anchor_point()?;
+    let (x, y) = macos_mouse_cursor_point().or_else(macos_focused_input_anchor_point)?;
+    monitor_for_anchor_point(window, x, y)
+}
+
+/// 在 Tauri 的 monitor 坐标系里，选出包含逻辑坐标点 `(x, y)` 的显示器；
+/// 点落在所有屏之外时退到最近的屏。坐标系同 AX / CGEvent 的全局显示空间
+/// （左上原点，points）。
+#[cfg(target_os = "macos")]
+fn monitor_for_anchor_point<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    x: f64,
+    y: f64,
+) -> Option<CapsuleTargetMonitor> {
     let monitors = window.available_monitors().ok()?;
     let mut nearest: Option<(f64, CapsuleTargetMonitor)> = None;
 
@@ -1513,6 +1626,11 @@ pub(crate) fn focused_input_target_monitor<R: tauri::Runtime>(
     }
 
     nearest.map(|(_, target)| target)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mouse_cursor_point() -> Option<(f64, f64)> {
+    macos_capsule_ax::mouse_cursor_point()
 }
 
 #[cfg(target_os = "macos")]
@@ -1597,6 +1715,30 @@ mod macos_capsule_ax {
             let width = rect.size.width.max(1.0);
             let height = rect.size.height.max(1.0);
             Some((rect.origin.x + width / 2.0, rect.origin.y + height / 2.0))
+        }
+    }
+
+    type CGEventRef = *const c_void;
+    type CGEventSourceRef = *const c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+    }
+
+    /// 当前鼠标光标在「全局显示坐标系」(左上原点，points) 的位置。该坐标系与 AX
+    /// caret 完全一致，可直接拿去和 `logical_frame` 比较选屏。`CGEventGetLocation`
+    /// 始终可用、不需要任何权限，所以作为胶囊跟随屏幕的首选信号。
+    pub(super) fn mouse_cursor_point() -> Option<(f64, f64)> {
+        unsafe {
+            let event = CGEventCreate(std::ptr::null());
+            if event.is_null() {
+                return None;
+            }
+            let point = CGEventGetLocation(event);
+            CFRelease(event as CFTypeRef);
+            Some((point.x, point.y))
         }
     }
 
@@ -1821,7 +1963,7 @@ pub(crate) fn show_qa_window<R: tauri::Runtime>(app: &AppHandle<R>, content_kind
         return;
     }
 
-    let Some(window) = app.get_webview_window("qa") else {
+    let Some(window) = ensure_qa_window(app) else {
         log::info!("[qa] show 跳过：qa 窗口不存在 (content_kind={content_kind})");
         return;
     };
@@ -1911,6 +2053,116 @@ fn make_qa_window_draggable_macos<R: tauri::Runtime>(window: &tauri::WebviewWind
     log::info!("[qa] NSWindow movableByWindowBackground=YES");
 }
 
+/// 懒创建 QA 浮窗：原来在 tauri.conf.json eager 创建（常驻一个 WebKit 进程）。改为首次
+/// show 时才 build —— idle 时根本不存在 → 省一个常驻 webview。配置与原 tauri.conf 的 qa
+/// 块逐项一致（"center": false ⇒ **不**调 .center()；"focus": false ⇒ focused(false)）。
+/// 关键：make_qa_window_draggable_macos 原先只在启动时设一次，这里创建时必须补回，否则
+/// 懒创建的 QA 窗口在 macOS 上拖不动。
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn ensure_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<tauri::WebviewWindow<R>> {
+    if let Some(w) = app.get_webview_window("qa") {
+        return Some(w);
+    }
+    let built = WebviewWindowBuilder::new(app, "qa", WebviewUrl::App("index.html?window=qa".into()))
+        .title("OpenLess QA")
+        .inner_size(380.0, 440.0)
+        .decorations(false)
+        .transparent(true)
+        .shadow(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .focused(false)
+        .visible(false)
+        .accept_first_mouse(true)
+        .build();
+    match built {
+        Ok(w) => {
+            #[cfg(target_os = "macos")]
+            make_qa_window_draggable_macos(&w);
+            Some(w)
+        }
+        Err(e) => {
+            log::warn!("[qa] lazy window create failed: {e}");
+            None
+        }
+    }
+}
+
+// 移动端 QA 路由到 main 窗口（show_qa_window 在 Android 早返回）；Android 的
+// WebviewWindowBuilder 没有桌面方法，这里只占位返回已有窗口（编译用，运行时不达）。
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn ensure_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<tauri::WebviewWindow<R>> {
+    app.get_webview_window("qa")
+}
+
+/// 懒创建 Less Computer 浮窗（macOS only）。配置与原 tauri.conf 的 less-computer 块一致。
+#[cfg(target_os = "macos")]
+fn ensure_less_computer_window<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<tauri::WebviewWindow<R>> {
+    if let Some(w) = app.get_webview_window("less-computer") {
+        return Some(w);
+    }
+    match WebviewWindowBuilder::new(
+        app,
+        "less-computer",
+        WebviewUrl::App("index.html?window=less-computer".into()),
+    )
+    .title("OpenLess Less Computer")
+    .inner_size(400.0, 200.0)
+    .decorations(false)
+    .transparent(true)
+    .shadow(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .focused(false)
+    .visible(false)
+    .accept_first_mouse(true)
+    .build()
+    {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("[less-computer] lazy window create failed: {e}");
+            None
+        }
+    }
+}
+
+/// 懒创建 Less Computer glow 描边窗（macOS only）。shadow:false、无 acceptFirstMouse。
+/// 它的 level/collectionBehavior/ignore-mouse 在每次 show_less_computer_glow 里幂等设置，
+/// 所以创建时不需要额外原生配置。
+#[cfg(target_os = "macos")]
+fn ensure_less_computer_glow_window<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Option<tauri::WebviewWindow<R>> {
+    if let Some(w) = app.get_webview_window("less-computer-glow") {
+        return Some(w);
+    }
+    match WebviewWindowBuilder::new(
+        app,
+        "less-computer-glow",
+        WebviewUrl::App("index.html?window=less-computer-glow".into()),
+    )
+    .title("OpenLess Less Computer Glow")
+    .inner_size(800.0, 600.0)
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .focused(false)
+    .visible(false)
+    .build()
+    {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("[less-computer-glow] lazy window create failed: {e}");
+            None
+        }
+    }
+}
+
 /// 隐藏 QA 窗口。供 commands::qa_window_dismiss / coordinator session 收尾共用。
 pub(crate) fn hide_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) {
     #[cfg(target_os = "android")]
@@ -1974,7 +2226,7 @@ fn position_less_computer_window<R: tauri::Runtime>(
 /// 显示 Less Computer 浮窗（不抢前台 app 焦点，与 QA 同手法）。`macos` 专用。
 #[cfg(target_os = "macos")]
 pub(crate) fn show_less_computer_window<R: tauri::Runtime>(app: &AppHandle<R>) {
-    let Some(window) = app.get_webview_window("less-computer") else {
+    let Some(window) = ensure_less_computer_window(app) else {
         log::info!("[less-computer] show 跳过：窗口不存在");
         return;
     };
@@ -2022,7 +2274,7 @@ pub(crate) fn hide_less_computer_window<R: tauri::Runtime>(_app: &AppHandle<R>) 
 /// 显示全屏彩虹描边浮层：盖满当前显示器、点击穿透、置顶。Agent 工作时点亮整屏边缘。
 #[cfg(target_os = "macos")]
 pub(crate) fn show_less_computer_glow<R: tauri::Runtime>(app: &AppHandle<R>) {
-    let Some(window) = app.get_webview_window("less-computer-glow") else {
+    let Some(window) = ensure_less_computer_glow_window(app) else {
         return;
     };
     // 盖满当前（否则主）显示器，含菜单栏/Dock 区域。关键：用「逻辑坐标」(物理/缩放) ——
@@ -2047,6 +2299,8 @@ pub(crate) fn show_less_computer_glow<R: tauri::Runtime>(app: &AppHandle<R>) {
     }
     // 点击穿透：纯视觉浮层，绝不拦截鼠标。
     let _ = window.set_ignore_cursor_events(true);
+    // issue #470：通知 glow 前端「可见」，恢复发光动画（隐藏时会 emit(false) 卸载发光层以释放 GPU）。
+    let _ = window.emit("less-computer-glow:active", true);
     let window_clone = window.clone();
     let _ = app.run_on_main_thread(move || {
         use objc2::msg_send;
@@ -2081,6 +2335,9 @@ pub(crate) fn show_less_computer_glow<R: tauri::Runtime>(_app: &AppHandle<R>) {}
 #[cfg(target_os = "macos")]
 pub(crate) fn hide_less_computer_glow<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("less-computer-glow") {
+        // issue #470：先通知前端「不可见」卸载全屏发光层(4 条无限动画)，webview 隐藏后即零 GPU；
+        // 否则 .hide() 后 webview 仍持续合成发光层（Windows 尤其不释放动画）。
+        let _ = window.emit("less-computer-glow:active", false);
         let _ = window.hide();
     }
 }
@@ -2174,6 +2431,12 @@ pub(crate) struct ForegroundMonitor {
     pub(crate) top: i32,
     pub(crate) right: i32,
     pub(crate) bottom: i32,
+    /// 工作区矩形（physical px，去掉任务栏）。多端一致：胶囊优先夹到工作区内，
+    /// 避免压住任务栏。取不到时回退为整屏矩形。issue #470。
+    pub(crate) work_left: i32,
+    pub(crate) work_top: i32,
+    pub(crate) work_right: i32,
+    pub(crate) work_bottom: i32,
     /// 该显示器的有效 DPI 缩放（1.0 = 96dpi）。
     pub(crate) scale: f64,
 }
@@ -2211,6 +2474,10 @@ pub(crate) fn foreground_window_monitor() -> Option<ForegroundMonitor> {
             top: mi.rcMonitor.top,
             right: mi.rcMonitor.right,
             bottom: mi.rcMonitor.bottom,
+            work_left: mi.rcWork.left,
+            work_top: mi.rcWork.top,
+            work_right: mi.rcWork.right,
+            work_bottom: mi.rcWork.bottom,
             scale: (dpi_x as f64 / 96.0).max(0.1),
         })
     }
@@ -2243,25 +2510,34 @@ pub(crate) fn position_capsule_bottom_center<R: tauri::Runtime>(
             let offset_from_bottom =
                 (capsule_visual_height(translation_active) + 80.0 + bounds.bottom_inset) * scale;
             let y = ((mon.bottom as f64) - offset_from_bottom).round() as i32;
-            let clamped_y = y.max(mon.top);
-            // #470 诊断 v2：当前只夹了上边（.max(mon.top)），未夹下/左/右。多显示器、
-            // 负坐标或异常 DPI 下胶囊可能被算到屏幕外却无任何观测。记录显示器几何与
-            // 最终落点，用于证伪/证实「胶囊定位到屏幕外」(C 子嫌疑)。
+
+            // #470：四边都夹到「工作区」内（去掉任务栏），保证整窗可见。GetMonitorInfoW
+            // 取不到 rcWork 时（理论上不会，rcWork 总随 rcMonitor 一同填）退回整屏矩形。
+            let (work_l, work_t, work_r, work_b) =
+                if mon.work_right > mon.work_left && mon.work_bottom > mon.work_top {
+                    (mon.work_left, mon.work_top, mon.work_right, mon.work_bottom)
+                } else {
+                    (mon.left, mon.top, mon.right, mon.bottom)
+                };
+            let (clamped_x, clamped_y) =
+                clamp_to_monitor(x, y, phys_w, phys_h, work_l, work_t, work_r, work_b);
             log::debug!(
-                "[capsule] win position: mon=({},{})..({},{}) scale={:.2} size=({}x{}) -> x={} y={} clamped_y={}",
-                mon.left, mon.top, mon.right, mon.bottom, scale, phys_w, phys_h, x, y, clamped_y
+                "[capsule] win position: mon=({},{})..({},{}) work=({},{})..({},{}) scale={:.2} size=({}x{}) -> raw=({},{}) clamped=({},{})",
+                mon.left, mon.top, mon.right, mon.bottom,
+                work_l, work_t, work_r, work_b,
+                scale, phys_w, phys_h, x, y, clamped_x, clamped_y
             );
-            window.set_position(PhysicalPosition::new(x, clamped_y))?;
+            window.set_position(PhysicalPosition::new(clamped_x, clamped_y))?;
             return Ok(());
         }
         // 仅当 Win32 取不到前台显示器时，落回下面的 current_monitor 逻辑。
     }
 
-    // macOS：跟随当前 focused input / caret 所在显示器，而不是胶囊窗口
-    // 上一次停留的显示器。这样外接屏上输入时，隐藏态胶囊也能先移动再出现。
+    // macOS：跟随鼠标光标所在显示器，而不是胶囊窗口上一次停留的显示器。
+    // 这样在任意外接屏 / 任意 Space 上触发时，隐藏态胶囊也能先移动再出现。
     #[cfg(target_os = "macos")]
     {
-        if let Some(mon) = focused_input_target_monitor(window) {
+        if let Some(mon) = capsule_target_monitor(window) {
             window.set_size(LogicalSize::new(bounds.width, bounds.height))?;
             let frame = mon.logical_frame();
             let (x, y) = bottom_visual_position(
@@ -2540,6 +2816,54 @@ mod tests {
         let pos = bottom_visual_position(frame, 220.0, 96.0, 80.0, 0.0);
 
         assert_eq!(pos, (610.0, -176.0));
+    }
+
+    // ---- #470: capsule 四边 clamp（纯函数，合成多显示器 / 负原点 / 1.5x DPI 输入）----
+
+    #[test]
+    fn clamp_to_monitor_leaves_on_screen_position_untouched() {
+        // 1080p 主屏正中偏下，整窗本就可见 → 原样返回。
+        let (x, y) = clamp_to_monitor(800, 900, 264, 126, 0, 0, 1920, 1040);
+        assert_eq!((x, y), (800, 900));
+    }
+
+    #[test]
+    fn clamp_to_monitor_pulls_back_off_screen_right_and_bottom() {
+        // x/y 算到了屏幕右下外侧 → 收回到「右下角减去窗口尺寸」，整窗仍可见。
+        let (x, y) = clamp_to_monitor(2000, 1200, 264, 126, 0, 0, 1920, 1040);
+        assert_eq!((x, y), (1920 - 264, 1040 - 126));
+        // 整窗右/下边界都落在 area 内。
+        assert!(x + 264 <= 1920);
+        assert!(y + 126 <= 1040);
+    }
+
+    #[test]
+    fn clamp_to_monitor_pushes_into_negative_origin_left_monitor() {
+        // 副屏在主屏左侧（负 X 原点），落点算到了副屏左外侧 → 夹回 area_left。
+        // 1.5x DPI 下尺寸偏大，但 area 仍宽于窗口，左上角夹到 (-2560, top)。
+        let (x, y) = clamp_to_monitor(-3000, -100, 294, 138, -2560, 0, 0, 1440);
+        assert_eq!(x, -2560);
+        assert_eq!(y, 0);
+        // 右/下仍在 area 内。
+        assert!(x >= -2560 && x + 294 <= 0);
+        assert!(y >= 0 && y + 138 <= 1440);
+    }
+
+    #[test]
+    fn clamp_to_monitor_respects_work_area_above_taskbar() {
+        // 工作区底部 = 1040（任务栏占了 1040..1080）。落点本在任务栏区域（y=1030），
+        // 应被夹到「工作区底 - 窗口高」之上，胶囊整窗不压任务栏。
+        let (_x, y) = clamp_to_monitor(800, 1030, 264, 126, 0, 0, 1920, 1040);
+        assert_eq!(y, 1040 - 126);
+        assert!(y + 126 <= 1040);
+    }
+
+    #[test]
+    fn clamp_to_monitor_degrades_gracefully_when_window_wider_than_area() {
+        // 病态输入：area 比窗口还窄（罕见，但要保证不 panic、不溢出为负超界）。
+        // max_x 钳到 area_left，clamp 把左上角收回 area_left。
+        let (x, y) = clamp_to_monitor(500, 500, 800, 600, 0, 0, 400, 300);
+        assert_eq!((x, y), (0, 0));
     }
 
     #[test]
