@@ -37,6 +37,7 @@ export {
     listHistory,
     deleteHistoryEntry,
     clearHistory,
+    getActivityStats,
     readAudioRecording,
     retranscribeRecording,
 } from "./history"
@@ -132,6 +133,7 @@ export {
     lessComputerWindowDismiss,
     lessComputerApprove,
     lessComputerWindowResize,
+    lessComputerSubmitText,
 } from "./less-computer"
 
 // updater

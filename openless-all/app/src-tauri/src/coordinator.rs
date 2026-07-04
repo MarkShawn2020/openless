@@ -39,8 +39,8 @@ use crate::correction::apply_correction_rules;
 use crate::hotkey::{HotkeyEvent, HotkeyMonitor};
 use crate::insertion::TextInserter;
 use crate::persistence::{
-    sync_style_pack_preferences, CorrectionRuleStore, CredentialAccount, CredentialsVault,
-    DictionaryStore, HistoryStore, PreferencesStore, StylePackStore,
+    sync_style_pack_preferences, ActivityStore, CorrectionRuleStore, CredentialAccount,
+    CredentialsVault, DictionaryStore, HistoryStore, PreferencesStore, StylePackStore,
 };
 
 use crate::llm_gemini::{GeminiConfig, GeminiProvider};
@@ -238,6 +238,8 @@ pub struct Coordinator {
 struct Inner {
     app: Mutex<Option<AppHandle>>,
     history: HistoryStore,
+    /// 每日活动计数（热力图数据源），与 history 的保留策略解耦。
+    activity: ActivityStore,
     prefs: PreferencesStore,
     style_packs: StylePackStore,
     vocab: DictionaryStore,
@@ -383,10 +385,16 @@ impl Coordinator {
                 CorrectionRuleStore::new_fallback()
             });
 
+            let activity = ActivityStore::load().unwrap_or_else(|e| {
+                log::error!("[coord] ActivityStore init failed: {e}; 活动计数降级为内存态");
+                ActivityStore::new_fallback()
+            });
+
             Self {
                 inner: Arc::new(Inner {
                     app: Mutex::new(None),
                     history,
+                    activity,
                     prefs,
                     style_packs,
                     vocab,
@@ -474,10 +482,16 @@ impl Coordinator {
             CorrectionRuleStore::new_fallback()
         });
 
+        let activity = ActivityStore::load().unwrap_or_else(|e| {
+            log::error!("[coord] ActivityStore init failed: {e}; 活动计数降级为内存态");
+            ActivityStore::new_fallback()
+        });
+
         Self {
             inner: Arc::new(Inner {
                 app: Mutex::new(None),
                 history,
+                activity,
                 prefs,
                 style_packs,
                 vocab,
@@ -1088,8 +1102,30 @@ impl Coordinator {
         dictation::resolve_less_computer_approval(token, approved);
     }
 
+    /// 浮窗打字输入：文字指令直接进入 Less Computer 执行链（与语音转写同一条
+    /// 路径——同样的护栏钳制 / 审批循环 / 连续会话语义），跳过录音与 ASR。
+    pub fn less_computer_submit_text(&self, text: String) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            let session_id = crate::coordinator_state::new_session_id();
+            if let Err(e) =
+                dictation::run_voice_agent_transcript(&inner, session_id, text, 0).await
+            {
+                log::warn!("[less-computer] text submit run failed: {e}");
+            }
+        });
+    }
+
     pub fn history(&self) -> &HistoryStore {
         &self.inner.history
+    }
+
+    pub fn activity(&self) -> &ActivityStore {
+        &self.inner.activity
     }
 
     pub fn prefs(&self) -> &PreferencesStore {

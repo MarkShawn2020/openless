@@ -31,6 +31,9 @@ const TARGET_AUDIO_CHUNK_BYTES: usize = 6_400;
 const BYTES_PER_MS: f64 = 32.0;
 const HOTWORD_CAP: usize = 80;
 const FINAL_RESULT_TIMEOUT: Duration = Duration::from_secs(12);
+/// WS 连接建立（DNS+TCP+TLS+握手）的上限。无网时系统级 TCP 超时可达约 1 分钟，
+/// 4s 建立不了基本可断定网络不可用，快速失败让用户立刻看到网络提示。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug)]
 pub struct VolcengineCredentials {
@@ -156,8 +159,17 @@ impl VolcengineStreamingASR {
                 .map_err(|e| VolcengineASRError::ConnectionFailed(e.to_string()))?,
         );
 
-        let (ws, _resp) = connect_async(request)
+        // 无网 fail-fast：connect_async 裸奔时 TCP 挂起可达系统级超时（约 1 分钟），
+        // 用户按了停止也只能干等。4s 内建立不了连接直接判定网络不可用 —— 失败走
+        // transcribeFailed 收尾（历史 + 已录音频照常保存），胶囊立刻给出错误提示。
+        let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request))
             .await
+            .map_err(|_| {
+                VolcengineASRError::ConnectionFailed(format!(
+                    "网络连接超时（{}s），请检查网络后重试",
+                    CONNECT_TIMEOUT.as_secs()
+                ))
+            })?
             .map_err(classify_connect_error)?;
         let (write, read) = ws.split();
 
