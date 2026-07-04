@@ -785,9 +785,9 @@ const userBubbleStyle: CSSProperties = {
   padding: '8px 12px',
   borderRadius: 14,
   borderBottomRightRadius: 4,
-  background: 'linear-gradient(135deg, #3d6bff, #7a55f2)',
-  boxShadow: '0 1px 0 rgba(255,255,255,.22) inset, 0 6px 18px -8px rgba(84,98,255,.55)',
-  color: '#fff',
+  background: 'var(--ol-accent-solid-bg)',
+  boxShadow: '0 2px 10px -6px rgba(37, 99, 235, 0.5)',
+  color: 'var(--ol-accent-solid-ink)',
   fontSize: 13,
   lineHeight: 1.55,
   wordBreak: 'break-word',
@@ -855,9 +855,8 @@ const approveBtnStyle: CSSProperties = {
   fontSize: 12,
   fontWeight: 600,
   cursor: 'default',
-  background: 'linear-gradient(135deg, #3d6bff, #7a55f2)',
-  boxShadow: '0 1px 0 rgba(255,255,255,.22) inset',
-  color: '#fff',
+  background: 'var(--ol-accent-solid-bg)',
+  color: 'var(--ol-accent-solid-ink)',
 };
 
 const denyBtnStyle: CSSProperties = {
@@ -918,9 +917,8 @@ const sendButtonStyle: CSSProperties = {
   justifyContent: 'center',
   cursor: 'default',
   padding: 0,
-  background: 'linear-gradient(135deg, #3d6bff, #7a55f2)',
-  color: '#fff',
-  boxShadow: '0 1px 0 rgba(255,255,255,.22) inset',
+  background: 'var(--ol-accent-solid-bg)',
+  color: 'var(--ol-accent-solid-ink)',
 };
 
 const globalCss = `
