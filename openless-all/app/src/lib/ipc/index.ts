@@ -158,6 +158,7 @@ export type {
     CodingAgentPermissionMode,
     McpHealth,
     CodingAgentEvent,
+    OpenCodeDetection,
 } from "./coding-agent"
 export type {
     McpServerStatus,
@@ -171,6 +172,7 @@ export {
     codingAgentRunTest,
     codingAgentCancelTest,
     codingAgentCommandRisk,
+    codingAgentDetectOpencode,
 } from "./coding-agent"
 
 // marketplace
