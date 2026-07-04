@@ -158,11 +158,9 @@ export type {
     CodingAgentPermissionMode,
     McpHealth,
     CodingAgentEvent,
-} from "./coding-agent"
-export type {
+    OpenCodeDetection,
     McpServerStatus,
     ClaudeDetection,
-    OpenCodeDetection,
     CodingAgentRunTestArgs,
 } from "./coding-agent"
 export {
