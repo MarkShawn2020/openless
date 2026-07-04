@@ -2675,6 +2675,12 @@ pub struct CapsulePayload {
     /// 从 "thinking" 换成 "using"——告诉用户 Agent 正在操作电脑而非单纯思考。
     #[serde(default)]
     pub operating: bool,
+    /// 预备态：胶囊已经"乐观显示"出来（按下热键即弹出并播入场动画），但麦克风还没
+    /// 真正开始 capture 第一帧 PCM。为 true 时前端渲染"待命"光效（柔和呼吸、不接真实
+    /// 电平），并暗示用户先别急着开口；`level_handler` 首次触发（PCM 真的流入）后翻成
+    /// false，光条"点亮"进入正式录音态。只对 Recording 状态有意义。详见胶囊出现时序改造。
+    #[serde(default)]
+    pub warming: bool,
 }
 
 /// Snapshot of credentials read from vault — only what the UI needs to know

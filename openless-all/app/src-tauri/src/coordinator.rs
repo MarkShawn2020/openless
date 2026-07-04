@@ -307,6 +307,11 @@ struct Inner {
     /// 最近一次应用到 capsule 窗口的几何状态。避免录音 level tick 反复触发
     /// resize / reposition。
     capsule_layout: Mutex<Option<CapsuleLayoutState>>,
+    /// 预备态标志：按下热键即"乐观显示"胶囊（带入场动画），此时麦克风还在 cpal
+    /// init 窗口内、没有第一帧 PCM。为 true 时 emit_capsule 把 Recording payload 的
+    /// `warming` 打成 true（前端渲染"待命"光效）；`level_handler` 首次触发（PCM 真的
+    /// 流入）后置 false，光条"点亮"进入正式录音。begin_session 每次入场重置为 true。
+    capsule_warming: AtomicBool,
     /// QA 用的 ASR 句柄。必须跟 active_asr_provider 保持一致，避免浮窗走不同入口。
     qa_asr: Mutex<Option<ActiveAsr>>,
     /// QA 用的 Recorder 句柄。
@@ -423,6 +428,7 @@ impl Coordinator {
                     last_capsule_state: Mutex::new(None),
                     qa_state: Mutex::new(QaSessionState::default()),
                     capsule_layout: Mutex::new(None),
+                    capsule_warming: AtomicBool::new(false),
                     qa_asr: Mutex::new(None),
                     qa_recorder: Mutex::new(None),
                     qa_stream_cancelled: Arc::new(AtomicBool::new(false)),
@@ -522,6 +528,7 @@ impl Coordinator {
                 last_capsule_state: Mutex::new(None),
                 qa_state: Mutex::new(QaSessionState::default()),
                 capsule_layout: Mutex::new(None),
+                capsule_warming: AtomicBool::new(false),
                 qa_asr: Mutex::new(None),
                 qa_recorder: Mutex::new(None),
                 qa_stream_cancelled: Arc::new(AtomicBool::new(false)),

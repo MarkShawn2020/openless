@@ -23,6 +23,13 @@ interface SiriGLProps {
   /** wave 专用：true=波形展开（录音），false=向圆心汇聚成呼吸光点（思考）。 */
   resolved?: boolean;
   /**
+   * wave 专用：预备态。true = 麦克风尚未就绪，光条走柔和「待命」呼吸（忽略真实电平），
+   * 暗示用户稍候；麦克风就绪后置 false，改接真实电平，光条「点亮」进入正式录音。
+   */
+  warming?: boolean;
+  /** wave 专用：预备态预期时长（ms），驱动展开动画的预测节奏。见 Capsule warmupMs。 */
+  warmupMs?: number;
+  /**
    * 动画时间倍率（默认 1）。shader 时间由内部按 dt×speed 累积而非取墙钟，
    * 因此变速是连续的：思考中 >1 加速转动，收尾回落到标准速度。
    */
@@ -35,6 +42,14 @@ interface SiriGLProps {
 
 /** 内部渲染分辨率倍率（乘在 devicePixelRatio 上），demo 同款取值，越低越省 GPU。 */
 const RENDER_SCALE = 0.75;
+
+/**
+ * 预备态光条的「收拢度」：wave 的 uResolved 停在这个低值 —— 光条向中心聚拢、明显未展开
+ * （视觉上就是「加载中，还没好」）。麦克风就绪后 uResolved 升到 1，光条展开点亮成完整
+ * 声波，作为「准备完成、可以开口」的唯一信号。取值偏低才够「未成形」，但不取 0（0 是思
+ * 考态的中心光点，避免撞脸）。
+ */
+const WARMING_RESOLVED = 0.2;
 
 const VERTEX_SRC = 'attribute vec2 aPos; void main(){ gl_Position=vec4(aPos,0.0,1.0); }';
 
@@ -266,7 +281,7 @@ function visualVoice(raw: number): number {
   return Math.pow(eased, 0.42);
 }
 
-export function SiriGL({ mode, level, resolved, speed, merging, className, style }: SiriGLProps) {
+export function SiriGL({ mode, level, resolved, warming, warmupMs, speed, merging, className, style }: SiriGLProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // 60Hz 的 level 更新走 ref 桥接：render 只同步数值，绘制循环在 rAF 里读，
   // 不因 props 变化重建 GL 管线。
@@ -274,10 +289,14 @@ export function SiriGL({ mode, level, resolved, speed, merging, className, style
   const resolvedRef = useRef(1);
   const speedRef = useRef(1);
   const mergingRef = useRef(0);
+  const warmingRef = useRef(0);
+  const warmupMsRef = useRef(150);
   levelRef.current = Math.min(1, Math.max(0, level ?? 0));
   resolvedRef.current = resolved === false ? 0 : 1;
   speedRef.current = speed ?? 1;
   mergingRef.current = merging === true ? 1 : 0;
+  warmingRef.current = warming === true ? 1 : 0;
+  warmupMsRef.current = warmupMs ?? 150;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -336,7 +355,11 @@ export function SiriGL({ mode, level, resolved, speed, merging, className, style
     // 干脆地（k=4）合并回中央一颗圆，随淡出消失。
     const GATHER_HOLD_S = 0.3;
     let smoothLevel = 0;
-    let smoothResolved = resolvedRef.current;
+    // 预备态一挂载就从收拢态起步（未成形=加载中），避免「先展开一下又收拢」的突兀；
+    // 麦克风就绪后再展开到 resolvedRef。
+    let smoothResolved = warmingRef.current > 0.5 ? WARMING_RESOLVED : resolvedRef.current;
+    // 预测式展开进度（0=收拢, 1=展开）：warming 入场从 0 起爬，非 warming 直接 1。
+    let warmProgress = warmingRef.current > 0.5 ? 0 : 1;
     let smoothSpeed = speedRef.current;
     let gather = 1;
     let shaderTime = 0;
@@ -363,10 +386,33 @@ export function SiriGL({ mode, level, resolved, speed, merging, className, style
 
       // 汇聚态（resolved→0）时电平失去含义，切换成含蓄的慢呼吸信号驱动光点搏动。
       const thinking = resolvedRef.current < 0.5;
-      const target = thinking ? 0.14 + 0.07 * Math.sin(t * 2.2) : visualVoice(levelRef.current);
+      const warmingNow = warmingRef.current > 0.5;
+      // 电平：预备态走低幅「加载脉动」（暗、慢，明显未就绪），思考态呼吸，录音态接真实电平。
+      const target = warmingNow
+        ? 0.12 + 0.06 * Math.sin(t * 3.0)
+        : thinking
+          ? 0.14 + 0.07 * Math.sin(t * 2.2)
+          : visualVoice(levelRef.current);
       const attack = target > smoothLevel ? 14 : 5;
       smoothLevel += (target - smoothLevel) * (1 - Math.exp(-dt * attack));
-      smoothResolved += (resolvedRef.current - smoothResolved) * (1 - Math.exp(-dt * 2.2));
+      // 预测式展开（用户方案）：入场展开不再死等就绪信号（那会「亮起→卡一下→突然展开」），
+      // 而是按历史平均加载时长 warmupMs 从按下就平滑推进：
+      //   · 未就绪（warming）：warmProgress 按 warmupMs 匀速慢爬，cap 0.9（留一截给就绪收尾）；
+      //   · 就绪（warming→false）：快速补到 1 —— 就绪早=剩得多，视觉上「迅速展开完成」；
+      //   · 加载超长：停在 0.9 等着（用户说的「没办法」的情况），光条明显未满=还没好。
+      const warmupSec = Math.max(0.06, warmupMsRef.current / 1000);
+      if (warmingNow) {
+        warmProgress = Math.min(0.9, warmProgress + dt / warmupSec);
+      } else {
+        warmProgress += (1 - warmProgress) * (1 - Math.exp(-dt * 9));
+      }
+      // resolved：思考态（resolvedRef→0）走原「从容汇聚」；入场/录音由 warmProgress 从收拢
+      // （WARMING_RESOLVED）展开到满，smoothResolved 紧跟（展开节奏已由 warmProgress 控速）。
+      const targetResolved = thinking
+        ? resolvedRef.current
+        : WARMING_RESOLVED + (1 - WARMING_RESOLVED) * warmProgress;
+      const resolvedK = thinking ? 2.2 : 9.0;
+      smoothResolved += (targetResolved - smoothResolved) * (1 - Math.exp(-dt * resolvedK));
       // 出场 hold 之后才开始散开；合并（目标 1）快、散开（目标 0）缓。
       if (mergingRef.current === 1) {
         gather += (1 - gather) * (1 - Math.exp(-dt * 4.0));

@@ -537,6 +537,12 @@ export interface CapsulePayload {
   translation: boolean;
   /** 当前是否是 Less Computer 会话：处理态文案显示 "using" 而非 "thinking"。 */
   operating?: boolean;
+  /**
+   * 预备态：胶囊已「乐观显示」（按下热键即弹出并播入场动画），但麦克风还没吐第一帧
+   * PCM。为 true 时录音光条渲染成「待命」形态（柔和呼吸、不接真实电平），暗示用户稍候
+   * 再开口；麦克风就绪后翻 false，光条点亮进入正式录音。只对 recording 有意义。
+   */
+  warming?: boolean;
 }
 
 export interface CredentialsStatus {

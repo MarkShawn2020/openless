@@ -1243,6 +1243,14 @@ pub(super) async fn begin_session_as(
         return Ok(());
     }
 
+    // 乐观显示：按下热键即弹出胶囊并播入场动画，不等麦克风/ASR。此刻麦克风还在 cpal
+    // init 窗口内、没有第一帧 PCM，先进「预备态」（warming=true → 前端渲染待命光效，引导
+    // 用户稍候再开口）；level_handler 首次触发（PCM 真的流入）后翻成正式录音态、光条点亮。
+    // 这样把「视觉反馈」与「麦克风就绪」解耦：即时反馈 + 完整入场动画，同时用预备→点亮的
+    // 过渡守住「不漏首字」。若随后凭证/权限校验失败，下面分支会用 Error 覆盖这一帧。
+    inner.capsule_warming.store(true, Ordering::SeqCst);
+    emit_capsule(inner, CapsuleState::Recording, 0.0, 0, None, None);
+
     if let Err(message) = ensure_asr_credentials() {
         log::warn!("[coord] ASR credential gate failed: {message}");
         emit_capsule(
@@ -1409,7 +1417,7 @@ pub(super) async fn begin_session_as(
                 .await?;
             }
             MacosKeylessDictationProvider::AppleSpeech => {
-                let local = build_apple_speech();
+                let local = build_apple_speech(&inner.prefs.get());
                 store_asr_for_session(
                     inner,
                     current_session_id,
@@ -1654,6 +1662,10 @@ pub(super) async fn start_recorder_for_starting(
             .started_at
             .elapsed()
             .as_millis() as u64;
+        // 第一帧 PCM 真的流到 consumer 了（recorder.rs::process_callback 的顺序保证
+        // consume_pcm_chunk 先于 level_handler）——关掉预备态，让这一帧起 payload.warming
+        // 翻 false，前端把「待命」光条点亮成正式录音态。之后每帧都是 false（幂等）。
+        inner_for_level.capsule_warming.store(false, Ordering::SeqCst);
         emit_capsule(
             &inner_for_level,
             CapsuleState::Recording,

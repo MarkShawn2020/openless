@@ -41,6 +41,10 @@ interface VoiceOrbStageProps {
   os: OS;
   state: CapsuleState;
   level: number;
+  /** 预备态：录音光条渲染成「待命」呼吸形态，不接真实电平。见 CapsulePayload.warming。 */
+  warming?: boolean;
+  /** 预备→就绪的平均耗时（ms），驱动展开动画的预测节奏。见 SiriGL warmupMs。 */
+  warmupMs?: number;
   message?: string;
 }
 
@@ -52,7 +56,7 @@ interface VoiceOrbStageProps {
  *   - error：冻结光效 + 浮一行发光红字说明原因（唯一保留的文字信息）。
  * 刻意没有任何垫底/暗晕（用户拍板）：白底界面上宁可对比度弱，也不要黑色遮挡。
  */
-function VoiceOrbStage({ os, state, level, message }: VoiceOrbStageProps) {
+function VoiceOrbStage({ os, state, level, warming, warmupMs, message }: VoiceOrbStageProps) {
   const { t } = useTranslation();
   const metrics = useMemo(() => getCapsulePillMetrics(os), [os]);
 
@@ -93,6 +97,8 @@ function VoiceOrbStage({ os, state, level, message }: VoiceOrbStageProps) {
           mode="wave"
           level={level}
           resolved={!isOrb}
+          warming={warming}
+          warmupMs={warmupMs}
           style={{
             position: 'absolute',
             inset: 0,
@@ -150,6 +156,16 @@ const errorGlowTextStyle: CSSProperties = {
 // 与 @keyframes capsule-out 的 0.52s 时长一致——必须同步，否则定时器先于
 // 动画结束就 unmount → 用户看到半截动画被截断。
 const EXIT_ANIM_MS = 520;
+
+// 胶囊「预备→就绪」的平均耗时（ms），驱动入场展开动画的预测节奏（见 SiriGL warmProgress）：
+// 每次录音就绪后按 EMA 更新并存 localStorage 跨会话学习。默认 150ms，clamp [60,600]。
+const WARMUP_MS_KEY = 'ol-capsule-warmup-ms';
+const WARMUP_MS_DEFAULT = 150;
+function readWarmupMs(): number {
+  if (typeof localStorage === 'undefined') return WARMUP_MS_DEFAULT;
+  const raw = Number(localStorage.getItem(WARMUP_MS_KEY));
+  return Number.isFinite(raw) && raw > 0 ? Math.min(600, Math.max(60, raw)) : WARMUP_MS_DEFAULT;
+}
 // #470 诊断 v2：模块级一次性门，只在 webview 收到第一个 capsule:state 事件时打 log。
 let capsuleStateFirstLogged = false;
 
@@ -170,6 +186,7 @@ function getPreviewCapsulePayload() {
       level: 0,
       message: undefined,
       translation: false,
+      warming: false,
     };
   }
 
@@ -184,6 +201,7 @@ function getPreviewCapsulePayload() {
     level: Number.isFinite(previewLevel) ? Math.min(1, Math.max(0, previewLevel)) : 0.6,
     message: params.get('message') ?? undefined,
     translation: params.get('translation') === '1',
+    warming: params.get('warming') === '1',
   };
 }
 
@@ -200,6 +218,11 @@ export function Capsule({ os: forcedOs }: CapsuleProps = {}) {
   const [level, setLevel] = useState<number>(preview.level);
   const [message, setMessage] = useState<string | undefined>(preview.message);
   const [translation, setTranslation] = useState<boolean>(preview.translation);
+  // 预备态：麦克风尚未吐第一帧 PCM。true 时录音光条走「待命」呼吸形态（见 SiriGL warming）。
+  const [warming, setWarming] = useState<boolean>(preview.warming);
+  // 预备→就绪耗时的移动平均，驱动光条展开动画的预测节奏（见 SiriGL warmProgress）。
+  const [warmupMs, setWarmupMs] = useState<number>(() => readWarmupMs());
+  const warmStartRef = useRef<number | null>(null);
   // `leaving` 与 `lastVisibleState` 协同实现「退出动画」：
   // - 当 state 从非 idle 变成 idle 时，不立即卸载，而是把 leaving 置为 true 并保留
   //   最后一帧的可见 state（lastVisibleState），让语音 orb 用 capsule-out 动画收缩淡出。
@@ -241,6 +264,7 @@ export function Capsule({ os: forcedOs }: CapsuleProps = {}) {
         setLevel(p.level ?? 0);
         setMessage(p.message ?? undefined);
         setTranslation(p.translation === true);
+        setWarming(p.warming === true);
       });
       if (cancelled) handle();
       else unlisten = handle;
@@ -276,6 +300,24 @@ export function Capsule({ os: forcedOs }: CapsuleProps = {}) {
     // 把它们加进依赖会让定时器被反复重建。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
+
+  // 学习「预备态持续多久」= 麦克风就绪耗时，EMA 更新 warmupMs（预测展开的基准时长）。
+  useEffect(() => {
+    if (warming) {
+      warmStartRef.current = performance.now();
+      return;
+    }
+    if (warmStartRef.current == null) return;
+    const loadMs = performance.now() - warmStartRef.current;
+    warmStartRef.current = null;
+    // 过滤异常样本：<20ms 多半不是真入场；>3s 多半首次 TCC / 卡顿，不代表常态。
+    if (loadMs < 20 || loadMs > 3000) return;
+    setWarmupMs(prev => {
+      const next = Math.min(600, Math.max(60, prev * 0.7 + loadMs * 0.3));
+      try { localStorage.setItem(WARMUP_MS_KEY, String(Math.round(next))); } catch { /* ignore */ }
+      return next;
+    });
+  }, [warming]);
 
   // 真正卸载：state 已是 idle，且不在离场动画中。
   if (state === 'idle' && !leaving) {
@@ -360,6 +402,8 @@ export function Capsule({ os: forcedOs }: CapsuleProps = {}) {
         os={os}
         state={renderedState}
         level={leaving ? 0 : level}
+        warming={!leaving && warming}
+        warmupMs={warmupMs}
         message={message}
       />
     </div>
