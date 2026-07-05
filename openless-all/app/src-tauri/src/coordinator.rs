@@ -1828,9 +1828,7 @@ pub(super) fn insert_via_non_tsf_fallback(
     _paste_shortcut: PasteShortcut,
 ) -> InsertStatus {
     let prefs = inner.prefs.get();
-    let sendinput_options = crate::unicode_keystroke::WindowsSendInputOptions {
-        newline_mode: prefs.windows_sendinput_newline_mode,
-    };
+    let sendinput_options = dictation::windows_sendinput_options_from_prefs(&prefs);
     let status = finish_non_tsf_insertion_fallback(
         || inner
             .inserter

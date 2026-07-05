@@ -344,7 +344,7 @@ async fn run_streaming_polish(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_sendinput_options_from_prefs(
+pub(super) fn windows_sendinput_options_from_prefs(
     prefs: &crate::types::UserPreferences,
 ) -> crate::unicode_keystroke::WindowsSendInputOptions {
     crate::unicode_keystroke::WindowsSendInputOptions {
