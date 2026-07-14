@@ -82,6 +82,80 @@ fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
     writer.finish().expect("finish zip");
 }
 
+fn duplicate_central_directory_entry(path: &Path, entry_name: &str, extra_copies: usize) {
+    const CENTRAL_HEADER: &[u8; 4] = b"PK\x01\x02";
+    const EOCD: &[u8; 4] = b"PK\x05\x06";
+    const CENTRAL_HEADER_LEN: usize = 46;
+
+    let mut bytes = fs::read(path).expect("read zip fixture");
+    let eocd_offset = bytes
+        .windows(EOCD.len())
+        .rposition(|window| window == EOCD)
+        .expect("find zip EOCD");
+    let original_count = u16::from_le_bytes(
+        bytes[eocd_offset + 10..eocd_offset + 12]
+            .try_into()
+            .expect("EOCD entry count"),
+    );
+    let original_central_size = u32::from_le_bytes(
+        bytes[eocd_offset + 12..eocd_offset + 16]
+            .try_into()
+            .expect("EOCD central size"),
+    );
+    let mut offset = u32::from_le_bytes(
+        bytes[eocd_offset + 16..eocd_offset + 20]
+            .try_into()
+            .expect("EOCD central offset"),
+    ) as usize;
+
+    let mut selected_record = None;
+    for _ in 0..original_count {
+        assert_eq!(
+            bytes.get(offset..offset + CENTRAL_HEADER.len()),
+            Some(CENTRAL_HEADER.as_slice()),
+            "central directory signature"
+        );
+        let name_len = u16::from_le_bytes(
+            bytes[offset + 28..offset + 30]
+                .try_into()
+                .expect("central name length"),
+        ) as usize;
+        let extra_len = u16::from_le_bytes(
+            bytes[offset + 30..offset + 32]
+                .try_into()
+                .expect("central extra length"),
+        ) as usize;
+        let comment_len = u16::from_le_bytes(
+            bytes[offset + 32..offset + 34]
+                .try_into()
+                .expect("central comment length"),
+        ) as usize;
+        let end = offset + CENTRAL_HEADER_LEN + name_len + extra_len + comment_len;
+        if &bytes[offset + CENTRAL_HEADER_LEN..offset + CENTRAL_HEADER_LEN + name_len]
+            == entry_name.as_bytes()
+        {
+            selected_record = Some(bytes[offset..end].to_vec());
+        }
+        offset = end;
+    }
+
+    let record = selected_record.expect("selected central directory entry");
+    let added = record.repeat(extra_copies);
+    bytes.splice(eocd_offset..eocd_offset, added.iter().copied());
+    let new_eocd_offset = eocd_offset + added.len();
+    let new_count = original_count
+        .checked_add(u16::try_from(extra_copies).expect("fixture copy count fits u16"))
+        .expect("fixture entry count fits u16");
+    bytes[new_eocd_offset + 8..new_eocd_offset + 10].copy_from_slice(&new_count.to_le_bytes());
+    bytes[new_eocd_offset + 10..new_eocd_offset + 12].copy_from_slice(&new_count.to_le_bytes());
+    let new_central_size = original_central_size
+        .checked_add(u32::try_from(added.len()).expect("fixture size fits u32"))
+        .expect("fixture central size fits u32");
+    bytes[new_eocd_offset + 12..new_eocd_offset + 16]
+        .copy_from_slice(&new_central_size.to_le_bytes());
+    fs::write(path, bytes).expect("write duplicate central directory fixture");
+}
+
 fn valid_archive(path: &Path, icon: Option<&[u8]>) {
     let manifest = manifest(
         "prompt.md",
@@ -118,6 +192,50 @@ fn assert_import_error_contains(store: &StylePackStore, zip_path: &Path, expecte
         store.state.lock().is_empty(),
         "rejected import changed state"
     );
+}
+
+#[test]
+fn import_rejects_duplicate_physical_manifest_entry() {
+    let root = TestDir::new("duplicate-manifest");
+    let zip_path = root.path().join("duplicate-manifest.zip");
+    valid_archive(&zip_path, None);
+    duplicate_central_directory_entry(&zip_path, "manifest.json", 1);
+    let store = test_store(root.path(), Vec::new());
+
+    assert_import_error_contains(&store, &zip_path, "duplicate physical");
+}
+
+#[test]
+fn import_rejects_duplicate_physical_manifest_selected_prompt_entry() {
+    let root = TestDir::new("duplicate-prompt");
+    let zip_path = root.path().join("duplicate-prompt.zip");
+    valid_archive(&zip_path, None);
+    duplicate_central_directory_entry(&zip_path, "prompt.md", 1);
+    let store = test_store(root.path(), Vec::new());
+
+    assert_import_error_contains(&store, &zip_path, "duplicate physical");
+}
+
+#[test]
+fn import_rejects_duplicate_physical_manifest_selected_icon_entry() {
+    let root = TestDir::new("duplicate-icon");
+    let zip_path = root.path().join("duplicate-icon.zip");
+    valid_archive(&zip_path, Some(VALID_PNG_1X1));
+    duplicate_central_directory_entry(&zip_path, "assets/icon.png", 1);
+    let store = test_store(root.path(), Vec::new());
+
+    assert_import_error_contains(&store, &zip_path, "duplicate physical");
+}
+
+#[test]
+fn import_rejects_more_than_sixteen_physical_entries_even_when_names_repeat() {
+    let root = TestDir::new("physical-entry-count");
+    let zip_path = root.path().join("physical-entry-count.zip");
+    valid_archive(&zip_path, None);
+    duplicate_central_directory_entry(&zip_path, "prompt.md", 14);
+    let store = test_store(root.path(), Vec::new());
+
+    assert_import_error_contains(&store, &zip_path, "physical entries");
 }
 
 #[test]

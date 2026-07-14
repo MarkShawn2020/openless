@@ -76,8 +76,9 @@ pub(super) struct StreamBudget {
 
 pub(super) fn read_style_pack_archive(zip_path: &Path) -> Result<ParsedStylePackArchive> {
     let compressed = read_compressed_archive_bounded(zip_path)?;
-    let mut archive =
-        zip::ZipArchive::new(Cursor::new(compressed)).context("open style pack zip archive")?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(compressed.as_slice()))
+        .context("open style pack zip archive")?;
+    preflight_physical_central_directory(&compressed, &archive)?;
     let entry_names = preflight_archive_metadata(&mut archive)?;
     let mut stream_budget = StreamBudget::default();
 
@@ -149,6 +150,221 @@ pub(super) fn read_style_pack_archive(zip_path: &Path) -> Result<ParsedStylePack
         examples,
         icon,
     })
+}
+
+const CENTRAL_DIRECTORY_HEADER_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
+const ZIP64_END_SIGNATURE: &[u8; 4] = b"PK\x06\x06";
+const ZIP64_LOCATOR_SIGNATURE: &[u8; 4] = b"PK\x06\x07";
+const END_OF_CENTRAL_DIRECTORY_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
+const CENTRAL_DIRECTORY_HEADER_LEN: usize = 46;
+const END_OF_CENTRAL_DIRECTORY_LEN: usize = 22;
+const ZIP64_END_MIN_LEN: usize = 56;
+const ZIP64_LOCATOR_LEN: usize = 20;
+
+fn preflight_physical_central_directory(
+    bytes: &[u8],
+    archive: &zip::ZipArchive<Cursor<&[u8]>>,
+) -> Result<()> {
+    let comment_len = archive.comment().len();
+    let eocd_len = END_OF_CENTRAL_DIRECTORY_LEN
+        .checked_add(comment_len)
+        .ok_or_else(|| anyhow!("style pack zip EOCD length overflow"))?;
+    let eocd_offset = bytes
+        .len()
+        .checked_sub(eocd_len)
+        .ok_or_else(|| anyhow!("style pack zip EOCD is truncated"))?;
+    if bytes.get(eocd_offset..eocd_offset + 4)
+        != Some(END_OF_CENTRAL_DIRECTORY_SIGNATURE.as_slice())
+    {
+        bail!("style pack zip EOCD is not anchored at the end of the archive");
+    }
+    let declared_comment_len = read_u16(bytes, eocd_offset + 20)? as usize;
+    if declared_comment_len != comment_len {
+        bail!("style pack zip EOCD comment length is inconsistent");
+    }
+
+    let disk_number = read_u16(bytes, eocd_offset + 4)?;
+    let central_disk = read_u16(bytes, eocd_offset + 6)?;
+    if disk_number != 0 || central_disk != 0 {
+        bail!("multi-disk style pack zip archives are not supported");
+    }
+    let entries_on_disk = read_u16(bytes, eocd_offset + 8)?;
+    let total_entries = read_u16(bytes, eocd_offset + 10)?;
+    if entries_on_disk != total_entries {
+        bail!("multi-disk style pack zip archives are not supported");
+    }
+
+    let central_start = usize::try_from(archive.central_directory_start())
+        .map_err(|_| anyhow!("style pack zip central directory offset is unsupported"))?;
+    let archive_offset = usize::try_from(archive.offset())
+        .map_err(|_| anyhow!("style pack zip archive offset is unsupported"))?;
+    if central_start > eocd_offset {
+        bail!("style pack zip central directory starts beyond its EOCD");
+    }
+
+    let is_zip64 = entries_on_disk == u16::MAX
+        || total_entries == u16::MAX
+        || read_u32(bytes, eocd_offset + 12)? == u32::MAX
+        || read_u32(bytes, eocd_offset + 16)? == u32::MAX;
+    let (central_end, declared_entries, declared_size, declared_relative_offset) = if is_zip64 {
+        parse_zip64_footer(bytes, eocd_offset, archive_offset)?
+    } else {
+        (
+            eocd_offset,
+            total_entries as u64,
+            read_u32(bytes, eocd_offset + 12)? as u64,
+            read_u32(bytes, eocd_offset + 16)? as u64,
+        )
+    };
+    let expected_central_start = (archive_offset as u64)
+        .checked_add(declared_relative_offset)
+        .ok_or_else(|| anyhow!("style pack zip central directory offset overflow"))?;
+    if expected_central_start != central_start as u64 {
+        bail!("style pack zip central directory offset is inconsistent");
+    }
+    let actual_central_size = central_end
+        .checked_sub(central_start)
+        .ok_or_else(|| anyhow!("style pack zip central directory bounds are inconsistent"))?;
+    if declared_size != actual_central_size as u64 {
+        bail!("style pack zip central directory size is inconsistent");
+    }
+
+    let mut cursor = central_start;
+    let mut physical_count = 0usize;
+    while cursor < central_end {
+        if bytes.get(cursor..cursor + 4) != Some(CENTRAL_DIRECTORY_HEADER_SIGNATURE.as_slice()) {
+            bail!("style pack zip central directory contains a malformed physical entry");
+        }
+        physical_count = physical_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("style pack zip physical entry count overflow"))?;
+        if physical_count > MAX_ARCHIVE_ENTRIES {
+            bail!("style pack archive contains more than {MAX_ARCHIVE_ENTRIES} physical entries");
+        }
+
+        let name_len = read_u16(bytes, cursor + 28)? as usize;
+        let extra_len = read_u16(bytes, cursor + 30)? as usize;
+        let entry_comment_len = read_u16(bytes, cursor + 32)? as usize;
+        let disk_start = read_u16(bytes, cursor + 34)?;
+        if disk_start != 0 && disk_start != u16::MAX {
+            bail!("multi-disk style pack zip entries are not supported");
+        }
+        let name_start = cursor
+            .checked_add(CENTRAL_DIRECTORY_HEADER_LEN)
+            .ok_or_else(|| anyhow!("style pack zip central entry offset overflow"))?;
+        let record_len = CENTRAL_DIRECTORY_HEADER_LEN
+            .checked_add(name_len)
+            .and_then(|value| value.checked_add(extra_len))
+            .and_then(|value| value.checked_add(entry_comment_len))
+            .ok_or_else(|| anyhow!("style pack zip central entry length overflow"))?;
+        let record_end = cursor
+            .checked_add(record_len)
+            .filter(|end| *end <= central_end)
+            .ok_or_else(|| anyhow!("style pack zip central entry is truncated"))?;
+        let name_end = name_start
+            .checked_add(name_len)
+            .filter(|end| *end <= record_end)
+            .ok_or_else(|| anyhow!("style pack zip central entry name is truncated"))?;
+        bytes
+            .get(name_start..name_end)
+            .ok_or_else(|| anyhow!("style pack zip central entry name is truncated"))?;
+        cursor = record_end;
+    }
+
+    if cursor != central_end || physical_count as u64 != declared_entries {
+        bail!("style pack zip physical entry count is inconsistent");
+    }
+    if physical_count != archive.len() {
+        bail!("duplicate physical style pack zip entries were collapsed while decoding");
+    }
+    Ok(())
+}
+
+fn parse_zip64_footer(
+    bytes: &[u8],
+    eocd_offset: usize,
+    archive_offset: usize,
+) -> Result<(usize, u64, u64, u64)> {
+    let locator_offset = eocd_offset
+        .checked_sub(ZIP64_LOCATOR_LEN)
+        .ok_or_else(|| anyhow!("style pack ZIP64 locator is truncated"))?;
+    if bytes.get(locator_offset..locator_offset + 4) != Some(ZIP64_LOCATOR_SIGNATURE.as_slice()) {
+        bail!("style pack ZIP64 locator is missing");
+    }
+    if read_u32(bytes, locator_offset + 4)? != 0 || read_u32(bytes, locator_offset + 16)? != 1 {
+        bail!("multi-disk style pack ZIP64 archives are not supported");
+    }
+    let zip64_relative_offset = usize::try_from(read_u64(bytes, locator_offset + 8)?)
+        .map_err(|_| anyhow!("style pack ZIP64 EOCD offset is unsupported"))?;
+    let zip64_offset = archive_offset
+        .checked_add(zip64_relative_offset)
+        .ok_or_else(|| anyhow!("style pack ZIP64 EOCD offset overflow"))?;
+    let zip64_signature_end = zip64_offset
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("style pack ZIP64 EOCD offset overflow"))?;
+    if bytes.get(zip64_offset..zip64_signature_end) != Some(ZIP64_END_SIGNATURE.as_slice()) {
+        bail!("style pack ZIP64 EOCD is missing");
+    }
+    let zip64_payload_len = usize::try_from(read_u64(bytes, zip64_offset + 4)?)
+        .map_err(|_| anyhow!("style pack ZIP64 EOCD length is unsupported"))?;
+    let zip64_total_len = 12usize
+        .checked_add(zip64_payload_len)
+        .ok_or_else(|| anyhow!("style pack ZIP64 EOCD length overflow"))?;
+    if zip64_total_len < ZIP64_END_MIN_LEN
+        || zip64_offset.checked_add(zip64_total_len) != Some(locator_offset)
+    {
+        bail!("style pack ZIP64 EOCD bounds are inconsistent");
+    }
+    if read_u32(bytes, zip64_offset + 16)? != 0 || read_u32(bytes, zip64_offset + 20)? != 0 {
+        bail!("multi-disk style pack ZIP64 archives are not supported");
+    }
+    let entries_on_disk = read_u64(bytes, zip64_offset + 24)?;
+    let total_entries = read_u64(bytes, zip64_offset + 32)?;
+    if entries_on_disk != total_entries {
+        bail!("multi-disk style pack ZIP64 archives are not supported");
+    }
+    Ok((
+        zip64_offset,
+        total_entries,
+        read_u64(bytes, zip64_offset + 40)?,
+        read_u64(bytes, zip64_offset + 48)?,
+    ))
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| anyhow!("style pack zip integer offset overflow"))?;
+    let value = bytes
+        .get(offset..end)
+        .ok_or_else(|| anyhow!("style pack zip metadata is truncated"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("style pack zip integer offset overflow"))?;
+    let value = bytes
+        .get(offset..end)
+        .ok_or_else(|| anyhow!("style pack zip metadata is truncated"))?;
+    let value: [u8; 4] = value
+        .try_into()
+        .map_err(|_| anyhow!("style pack zip 32-bit field has an invalid length"))?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| anyhow!("style pack zip integer offset overflow"))?;
+    let value = bytes
+        .get(offset..end)
+        .ok_or_else(|| anyhow!("style pack zip metadata is truncated"))?;
+    let value: [u8; 8] = value
+        .try_into()
+        .map_err(|_| anyhow!("style pack zip 64-bit field has an invalid length"))?;
+    Ok(u64::from_le_bytes(value))
 }
 
 fn read_compressed_archive_bounded(zip_path: &Path) -> Result<Vec<u8>> {
