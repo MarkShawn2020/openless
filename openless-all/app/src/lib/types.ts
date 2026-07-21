@@ -50,6 +50,18 @@ export interface DictationSession {
   /** 该会话是否在录音时归档了原始 wav（取决于当时 prefs.recordAudioForDebug）。
    *  true 时前端在 History 渲染播放按钮，凭 id 通过 read_audio_recording IPC 拿字节流。 */
   hasAudioRecording: boolean | null;
+  /** 本次转写用的 ASR provider id（如 "volcengine" / "local-qwen3"）。旧历史为 null。 */
+  asrProvider: string | null;
+  /** 本次转写用的 ASR 模型 id。provider 无模型概念时为 null。 */
+  asrModel: string | null;
+  /** 本次润色用的 LLM provider id。Raw 直通（未调用 LLM）时为 null。 */
+  llmProvider: string | null;
+  /** 本次润色用的 LLM 模型 id。Raw 直通时为 null。 */
+  llmModel: string | null;
+  /** 松键后等待转写结果的实测耗时（毫秒）。流式 ASR 是收尾延迟，批式是完整转写耗时。 */
+  asrMs: number | null;
+  /** LLM 润色/翻译调用的实测耗时（毫秒）。未调用 LLM 时为 null。 */
+  polishMs: number | null;
 }
 
 export interface DictionaryEntry {
@@ -460,14 +472,20 @@ export type QaStateKind =
 export interface QaChatMessage {
   role: 'user' | 'assistant';
   content: string;
+  /** 未经模型安全信封转义的选区原文，仅用于 UI 文本展示。 */
+  selectionText?: string;
 }
 
 export interface QaStatePayload {
   kind: QaStateKind;
+  /** 后端会话 token；前端用它丢弃关闭/重开后迟到的旧轮事件。 */
+  session_id?: string;
   /** 后端权威：当前已有的多轮对话历史（user → assistant 交替）。answer 事件带完整版。 */
   messages?: QaChatMessage[];
   /** recording 状态时附带的选区预览（前 60 字）。 */
   selection_preview?: string | null;
+  /** Linux 选区工具缺失时的非阻断提醒码。 */
+  selection_warning?: 'linux_selection_tools_missing' | null;
   /** error 状态时附带的提示。 */
   error?: string;
   /** answer_delta 事件时附带的本帧增量字符串。 */

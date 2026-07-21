@@ -248,6 +248,8 @@ async fn run_streaming_polish(
     llm_thinking_enabled: bool,
     front_app: Option<&str>,
     prior_turns: &[(String, String)],
+    llm_call: &mut Option<crate::polish::LlmCallLabel>,
+    llm_elapsed_ms: &mut Option<u64>,
 ) -> (String, Option<String>, bool) {
     log::info!(
         "[coord] streaming_insert path ENTER (raw_chars={})",
@@ -268,6 +270,8 @@ async fn run_streaming_polish(
             llm_thinking_enabled,
             front_app,
             prior_turns,
+            llm_call,
+            llm_elapsed_ms,
         )
         .await;
         return (p, e, false);
@@ -298,6 +302,8 @@ async fn run_streaming_polish(
                 llm_thinking_enabled,
                 front_app,
                 prior_turns,
+                llm_call,
+                llm_elapsed_ms,
             )
             .await;
             return (p, err, false);
@@ -353,6 +359,8 @@ async fn run_streaming_polish(
         llm_thinking_enabled,
         front_app,
         prior_turns,
+        llm_call,
+        llm_elapsed_ms,
         move |delta: &str| {
             let converted = match delta_converter.as_ref() {
                 Some(converter) => converter.convert(delta),
@@ -452,6 +460,8 @@ async fn run_streaming_polish(
                 llm_thinking_enabled,
                 front_app,
                 prior_turns,
+                llm_call,
+                llm_elapsed_ms,
             )
             .await;
             (p, e, false)
@@ -1514,7 +1524,7 @@ pub(super) async fn begin_session_as(
         };
         let local = Arc::new(FoundryLocalWhisperAsr::new(
             Arc::clone(&inner.foundry_local_runtime),
-            model_alias,
+            model_alias.clone(),
             prefs.foundry_local_runtime_source.clone(),
             language_hint,
         ));
@@ -1522,6 +1532,7 @@ pub(super) async fn begin_session_as(
             inner,
             current_session_id,
             ActiveAsr::FoundryLocalWhisper(Arc::clone(&local)),
+            AsrCallLabel::new(foundry::PROVIDER_ID, Some(model_alias)),
         );
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = local;
         start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
@@ -1556,7 +1567,7 @@ pub(super) async fn begin_session_as(
         });
         let local = match SherpaOnnxAsr::new_for_model(
             Arc::clone(&inner.sherpa_onnx_runtime),
-            model_alias,
+            model_alias.clone(),
             language_hint,
             token_handler,
         )
@@ -1583,6 +1594,7 @@ pub(super) async fn begin_session_as(
             inner,
             current_session_id,
             ActiveAsr::SherpaOnnxLocal(Arc::clone(&local)),
+            AsrCallLabel::new(sherpa::PROVIDER_ID, Some(model_alias)),
         );
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = local;
         start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
@@ -1594,7 +1606,7 @@ pub(super) async fn begin_session_as(
     if let Some(provider) = macos_keyless_dictation_provider(&active_asr) {
         match provider {
             MacosKeylessDictationProvider::LocalQwen3 => {
-                let local = match build_local_qwen3(inner).await {
+                let (local, local_model) = match build_local_qwen3(inner).await {
                     Ok(l) => l,
                     Err(e) => {
                         log::error!("[coord] 本地 Qwen3-ASR 初始化失败: {e:#}");
@@ -1616,6 +1628,7 @@ pub(super) async fn begin_session_as(
                     inner,
                     current_session_id,
                     ActiveAsr::Local(Arc::clone(&local)),
+                    AsrCallLabel::new(crate::asr::local::PROVIDER_ID, Some(local_model)),
                 );
                 let consumer: Arc<dyn crate::recorder::AudioConsumer> = local;
                 start_recorder_and_enter_listening(
@@ -1632,6 +1645,8 @@ pub(super) async fn begin_session_as(
                     inner,
                     current_session_id,
                     ActiveAsr::AppleSpeech(Arc::clone(&local)),
+                    // 系统语音识别没有用户可见的模型 id。
+                    AsrCallLabel::new(crate::asr::local::APPLE_SPEECH_PROVIDER_ID, None),
                 );
                 let consumer: Arc<dyn crate::recorder::AudioConsumer> = local;
                 start_recorder_and_enter_listening(
@@ -1656,6 +1671,7 @@ pub(super) async fn begin_session_as(
     match active_asr_provider_kind(&effective_asr) {
         ActiveAsrProviderKind::Bailian
         | ActiveAsrProviderKind::Qwen3Realtime
+        | ActiveAsrProviderKind::StepfunRealtime
         | ActiveAsrProviderKind::Mimo
         | ActiveAsrProviderKind::DashScopeMultimodal
         | ActiveAsrProviderKind::ElevenLabs
@@ -1664,13 +1680,16 @@ pub(super) async fn begin_session_as(
     }
 
     if is_bailian_provider(&effective_asr) {
-        let asr = Arc::new(BailianRealtimeASR::new(read_bailian_credentials()));
+        let creds = read_bailian_credentials();
+        let asr_call_label = AsrCallLabel::new(effective_asr.clone(), Some(creds.model.clone()));
+        let asr = Arc::new(BailianRealtimeASR::new(creds));
         let bridge = Arc::new(DeferredAsrBridge::new());
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = bridge.clone();
         store_asr_for_session(
             inner,
             current_session_id,
             ActiveAsr::Bailian(Arc::clone(&asr)),
+            asr_call_label,
         );
         start_recorder_for_starting(inner, current_session_id, &active_asr, consumer).await?;
 
@@ -1737,13 +1756,16 @@ pub(super) async fn begin_session_as(
         finish_starting_session(inner, current_session_id).await;
     } else if is_qwen3_realtime_provider(&effective_asr) {
         // 与 Bailian 分支同构：流式 WS 会话 + DeferredAsrBridge 缓冲开链前音频。
-        let asr = Arc::new(Qwen3RealtimeASR::new(read_qwen3_realtime_credentials()));
+        let creds = read_qwen3_realtime_credentials();
+        let asr_call_label = AsrCallLabel::new(effective_asr.clone(), Some(creds.model.clone()));
+        let asr = Arc::new(Qwen3RealtimeASR::new(creds));
         let bridge = Arc::new(DeferredAsrBridge::new());
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = bridge.clone();
         store_asr_for_session(
             inner,
             current_session_id,
             ActiveAsr::Qwen3Realtime(Arc::clone(&asr)),
+            asr_call_label,
         );
         start_recorder_for_starting(inner, current_session_id, &active_asr, consumer).await?;
 
@@ -1812,35 +1834,123 @@ pub(super) async fn begin_session_as(
             "[coord] Qwen3 realtime ASR connected; flushed {flushed_bytes} deferred audio bytes"
         );
         finish_starting_session(inner, current_session_id).await;
+    } else if is_stepfun_realtime_provider(&effective_asr) {
+        // 与 Qwen3 realtime 分支同构：流式 WS 会话 + DeferredAsrBridge 缓冲开链前音频。
+        // 实时协议的词汇偏置走 transcription.prompt（批式 stepfun 则相反走 hotwords）。
+        let prompt = crate::asr::whisper::build_prompt_from_phrases(&enabled_phrases(inner));
+        let creds = read_stepfun_realtime_credentials(prompt);
+        let asr_call_label = AsrCallLabel::new(effective_asr.clone(), Some(creds.model.clone()));
+        let asr = Arc::new(crate::asr::StepfunRealtimeASR::new(creds));
+        let bridge = Arc::new(DeferredAsrBridge::new());
+        let consumer: Arc<dyn crate::recorder::AudioConsumer> = bridge.clone();
+        store_asr_for_session(
+            inner,
+            current_session_id,
+            ActiveAsr::StepfunRealtime(Arc::clone(&asr)),
+            asr_call_label,
+        );
+        start_recorder_for_starting(inner, current_session_id, &active_asr, consumer).await?;
+
+        if let Err(e) = asr.open_session().await {
+            log::error!("[coord] open StepFun realtime ASR session failed: {e}");
+            match startup_race_status_for_starting(inner, current_session_id) {
+                StartupRaceStatus::StaleContinuation => {
+                    log::info!(
+                        "[coord] stale StepFun realtime ASR open_session error from session {current_session_id} — ignoring"
+                    );
+                    asr.cancel();
+                    discard_startup_resources_for_session(inner, current_session_id);
+                    restore_prepared_windows_ime_session(inner, current_session_id);
+                    return Ok(());
+                }
+                StartupRaceStatus::CancelRaced => {
+                    asr.cancel();
+                    discard_startup_resources_for_session(inner, current_session_id);
+                    restore_prepared_windows_ime_session(inner, current_session_id);
+                    set_phase_idle_if_session_matches(inner, current_session_id);
+                    return Ok(());
+                }
+                StartupRaceStatus::ActiveStarting => {
+                    asr.cancel();
+                }
+            }
+            discard_startup_resources_for_session(inner, current_session_id);
+            emit_capsule(
+                inner,
+                CapsuleState::Error,
+                0.0,
+                0,
+                Some(format!("ASR 连接失败: {e}")),
+                None,
+            );
+            restore_prepared_windows_ime_session(inner, current_session_id);
+            set_phase_idle_if_session_matches(inner, current_session_id);
+            schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+            return Err(e.to_string());
+        }
+        match startup_race_status_for_starting(inner, current_session_id) {
+            StartupRaceStatus::ActiveStarting => {}
+            StartupRaceStatus::CancelRaced => {
+                log::info!(
+                    "[coord] cancel raced during StepFun realtime ASR open_session — aborting begin"
+                );
+                asr.cancel();
+                discard_startup_resources_for_session(inner, current_session_id);
+                restore_prepared_windows_ime_session(inner, current_session_id);
+                set_phase_idle_if_session_matches(inner, current_session_id);
+                return Ok(());
+            }
+            StartupRaceStatus::StaleContinuation => {
+                log::info!(
+                    "[coord] stale StepFun realtime ASR open_session continuation from session {current_session_id} — ignoring"
+                );
+                asr.cancel();
+                discard_startup_resources_for_session(inner, current_session_id);
+                restore_prepared_windows_ime_session(inner, current_session_id);
+                return Ok(());
+            }
+        }
+        let target: Arc<dyn crate::asr::AudioConsumer> = asr;
+        let flushed_bytes = bridge.attach(target);
+        log::info!(
+            "[coord] StepFun realtime ASR connected; flushed {flushed_bytes} deferred audio bytes"
+        );
+        finish_starting_session(inner, current_session_id).await;
     } else if is_mimo_provider(&effective_asr) {
         let (api_key, base_url, model) = read_mimo_credentials();
+        let asr_call_label = AsrCallLabel::new(effective_asr.clone(), Some(model.clone()));
         let mimo = Arc::new(MimoBatchASR::new(api_key, base_url, model));
         store_asr_for_session(
             inner,
             current_session_id,
             ActiveAsr::Mimo(Arc::clone(&mimo)),
+            asr_call_label,
         );
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = mimo;
         start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
             .await?;
     } else if is_dashscope_multimodal_provider(&effective_asr) {
         let (api_key, base_url, model) = read_dashscope_multimodal_credentials();
+        let asr_call_label = AsrCallLabel::new(effective_asr.clone(), Some(model.clone()));
         let asr = Arc::new(DashScopeMultimodalASR::new(api_key, base_url, model));
         store_asr_for_session(
             inner,
             current_session_id,
             ActiveAsr::DashScopeMultimodal(Arc::clone(&asr)),
+            asr_call_label,
         );
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = asr;
         start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
             .await?;
     } else if is_elevenlabs_provider(&effective_asr) {
         let (api_key, base_url, model) = read_elevenlabs_credentials();
+        let asr_call_label = AsrCallLabel::new(effective_asr.clone(), Some(model.clone()));
         let asr = Arc::new(ElevenLabsBatchASR::new(api_key, base_url, model));
         store_asr_for_session(
             inner,
             current_session_id,
             ActiveAsr::ElevenLabs(Arc::clone(&asr)),
+            asr_call_label,
         );
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = asr;
         start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
@@ -1854,8 +1964,9 @@ pub(super) async fn begin_session_as(
         // hotword を受け取っており、UI 説明文も「ASR ホットワードと後処理
         // モデルのコンテキスト両方に渡される」と明示しているので、Whisper
         // 互換プロバイダにも揃えるのが筋。
-        let whisper_prompt =
-            crate::asr::whisper::build_prompt_from_phrases(&enabled_phrases(inner));
+        let (whisper_prompt, hotwords) =
+            whisper_vocab_for_provider(&active_asr, enabled_phrases(inner));
+        let asr_call_label = AsrCallLabel::new(effective_asr.clone(), Some(model.clone()));
         let whisper = Arc::new(
             WhisperBatchASR::new(
                 api_key,
@@ -1865,12 +1976,14 @@ pub(super) async fn begin_session_as(
                 batch_asr_chunk_limit_ms(&active_asr),
                 whisper_supports_verbose_json(&active_asr),
             )
-            .with_request_format(whisper_request_format(&active_asr)),
+            .with_request_format(whisper_request_format(&active_asr))
+            .with_hotwords(hotwords),
         );
         store_asr_for_session(
             inner,
             current_session_id,
             ActiveAsr::Whisper(Arc::clone(&whisper)),
+            asr_call_label,
         );
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = whisper;
         start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
@@ -1878,6 +1991,12 @@ pub(super) async fn begin_session_as(
     } else {
         let hotwords = enabled_hotwords(inner);
         let creds = read_volc_credentials();
+        // Volcengine 没有模型 id，但 resource id（volc.seedasr.* / volc.bigasr.*）承担同样的
+        // 「用的哪个引擎」角色；经 allowlist 脱敏后当 model 落历史（issue #373 排障场景）。
+        let asr_call_label = AsrCallLabel::new(
+            effective_asr.clone(),
+            volc_resource_history_label(&creds.resource_id),
+        );
         let asr = Arc::new(VolcengineStreamingASR::new(creds, hotwords));
         let bridge = Arc::new(DeferredAsrBridge::new());
         let consumer: Arc<dyn crate::recorder::AudioConsumer> = bridge.clone();
@@ -1885,6 +2004,7 @@ pub(super) async fn begin_session_as(
             inner,
             current_session_id,
             ActiveAsr::Volcengine(Arc::clone(&asr)),
+            asr_call_label,
         );
         start_recorder_for_starting(inner, current_session_id, &active_asr, consumer).await?;
 
@@ -2184,6 +2304,7 @@ pub(super) async fn finish_starting_session(inner: &Arc<Inner>, session_id: Sess
 fn build_transcribe_failed_session(
     session_id: SessionId,
     duration_ms: u64,
+    asr_ms: u64,
     mode: PolishMode,
     has_audio_recording: bool,
 ) -> DictationSession {
@@ -2203,17 +2324,36 @@ fn build_transcribe_failed_session(
         duration_ms: Some(duration_ms),
         dictionary_entry_count: None,
         has_audio_recording: Some(has_audio_recording),
+        asr_provider: None,
+        asr_model: None,
+        llm_provider: None,
+        llm_model: None,
+        asr_ms: Some(asr_ms),
+        polish_ms: None,
     }
 }
 
-fn write_transcribe_failed_history(inner: &Arc<Inner>, session_id: SessionId, duration_ms: u64) {
+fn write_transcribe_failed_history(
+    inner: &Arc<Inner>,
+    session_id: SessionId,
+    duration_ms: u64,
+    asr_ms: u64,
+    asr_call_label: Option<&AsrCallLabel>,
+) {
     let prefs = inner.prefs.get();
-    let session = build_transcribe_failed_session(
+    let mut session = build_transcribe_failed_session(
         session_id,
         duration_ms,
+        asr_ms,
         prefs.default_mode,
         inner.audio_archive_active.load(Ordering::Relaxed),
     );
+    // 失败条目也记下是哪个 ASR 出的错——「哪个模型转不出来」正是模型对比要看的信息。
+    // 用 begin_session 的构建时快照，而不是此刻重读设置（PR #826 review）。
+    if let Some(label) = asr_call_label {
+        session.asr_provider = Some(label.provider.clone());
+        session.asr_model = label.model.clone();
+    }
     if let Err(e) = inner.history.append_with_retention(
         session,
         prefs.history_retention_days,
@@ -2231,11 +2371,20 @@ fn fail_dictation(
     inner: &Arc<Inner>,
     session_id: SessionId,
     elapsed: u64,
+    asr_ms: u64,
     user_msg: String,
     err: String,
+    asr_call_label: Option<&AsrCallLabel>,
 ) -> Result<(), String> {
-    write_transcribe_failed_history(inner, session_id, elapsed);
-    emit_capsule(inner, CapsuleState::Error, 0.0, elapsed, Some(user_msg), None);
+    write_transcribe_failed_history(inner, session_id, elapsed, asr_ms, asr_call_label);
+    emit_capsule(
+        inner,
+        CapsuleState::Error,
+        0.0,
+        elapsed,
+        Some(user_msg),
+        None,
+    );
     restore_prepared_windows_ime_session(inner, session_id);
     inner.state.lock().phase = SessionPhase::Idle;
     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
@@ -2263,9 +2412,21 @@ const SILENT_RETRY_MAX: u32 = 2;
 const SILENT_RETRY_BACKOFF_MS: u64 = 500;
 
 enum SilentRetryOutcome {
-    Transcript(RawTranscript),
-    Exhausted,
+    Transcript {
+        raw: RawTranscript,
+        asr_call_label: AsrCallLabel,
+    },
+    Exhausted(Option<AsrCallLabel>),
     Cancelled,
+}
+
+fn accept_silent_retry_transcript(
+    raw: RawTranscript,
+    retry_label: AsrCallLabel,
+    asr_call_label: &mut Option<AsrCallLabel>,
+) -> RawTranscript {
+    *asr_call_label = Some(retry_label);
+    raw
 }
 
 /// 归档 wav 是 16k/mono/16-bit、固定 44 字节标准头（asr::wav::encode_wav_16k_mono）；取出
@@ -2286,7 +2447,10 @@ fn pcm_duration_ms(pcm_len: usize) -> u64 {
 /// 用「当前」provider 把一段 PCM 重新转录（建一条全新 ASR 会话——原会话失败/断开后不可
 /// 复用）。复用 Coordinator::retranscribe_pcm（历史「重新转录」同款逻辑）；Coordinator 只持有
 /// `inner`，这里用 inner 重建一个轻量句柄，零副作用。
-async fn retranscribe_pcm_via_inner(inner: &Arc<Inner>, pcm: Vec<u8>) -> Result<String, String> {
+async fn retranscribe_pcm_via_inner(
+    inner: &Arc<Inner>,
+    pcm: Vec<u8>,
+) -> (Result<String, String>, Option<AsrCallLabel>) {
     Coordinator {
         inner: Arc::clone(inner),
     }
@@ -2304,24 +2468,25 @@ async fn try_silent_retranscribe(inner: &Arc<Inner>, session_id: SessionId) -> S
         return SilentRetryOutcome::Cancelled;
     }
     if !inner.audio_archive_active.load(Ordering::Relaxed) {
-        return SilentRetryOutcome::Exhausted; // 没归档音频，无从重试
+        return SilentRetryOutcome::Exhausted(None); // 没归档音频，无从重试
     }
     let Some(path) = crate::persistence::recording_path_for_session(&session_id.to_string()).ok()
     else {
-        return SilentRetryOutcome::Exhausted;
+        return SilentRetryOutcome::Exhausted(None);
     };
     let wav = tokio::select! {
         biased;
         _ = wait_for_processing_cancel(inner) => return SilentRetryOutcome::Cancelled,
         result = tokio::fs::read(&path) => match result {
             Ok(wav) => wav,
-            Err(_) => return SilentRetryOutcome::Exhausted,
+            Err(_) => return SilentRetryOutcome::Exhausted(None),
         },
     };
     let Some(pcm) = pcm_from_wav_bytes(&wav) else {
-        return SilentRetryOutcome::Exhausted;
+        return SilentRetryOutcome::Exhausted(None);
     };
     let duration_ms = pcm_duration_ms(pcm.len());
+    let mut last_attempted_label = None;
     for attempt in 1..=SILENT_RETRY_MAX {
         tokio::select! {
             biased;
@@ -2330,30 +2495,37 @@ async fn try_silent_retranscribe(inner: &Arc<Inner>, session_id: SessionId) -> S
                 SILENT_RETRY_BACKOFF_MS * attempt as u64,
             )) => {}
         }
-        let result = tokio::select! {
+        let (result, attempted_label) = tokio::select! {
             biased;
             _ = wait_for_processing_cancel(inner) => return SilentRetryOutcome::Cancelled,
             result = retranscribe_pcm_via_inner(inner, pcm.clone()) => result,
         };
+        if attempted_label.is_some() {
+            last_attempted_label = attempted_label.clone();
+        }
         match result {
             Ok(text) if !text.trim().is_empty() => {
                 log::info!(
                     "[coord] 自动静默重试第 {attempt}/{SILENT_RETRY_MAX} 次成功（{} 字）",
                     text.chars().count()
                 );
-                return SilentRetryOutcome::Transcript(RawTranscript { text, duration_ms });
+                return SilentRetryOutcome::Transcript {
+                    raw: RawTranscript { text, duration_ms },
+                    asr_call_label: attempted_label
+                        .expect("successful retranscription must have a build-time ASR label"),
+                };
             }
             Ok(_) => {
                 // 重试得到空转写——多半真没说话，再重试无意义，省流量直接放弃。
                 log::info!("[coord] 自动静默重试得到空转写，停止重试");
-                return SilentRetryOutcome::Exhausted;
+                return SilentRetryOutcome::Exhausted(last_attempted_label);
             }
             Err(e) => {
                 log::warn!("[coord] 自动静默重试第 {attempt}/{SILENT_RETRY_MAX} 次失败: {e}");
             }
         }
     }
-    SilentRetryOutcome::Exhausted
+    SilentRetryOutcome::Exhausted(last_attempted_label)
 }
 
 fn finish_cancelled_processing(inner: &Arc<Inner>, session_id: SessionId) -> bool {
@@ -2433,6 +2605,8 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     }
 
     let asr_opt = take_asr_for_session(inner, current_session_id);
+    // 构建时快照（begin_session 存入）。会话中途改设置不影响这份归因。
+    let mut asr_call_label = take_asr_label_for_session(inner, current_session_id);
     let asr = match asr_opt {
         Some(a) => a,
         None => {
@@ -2449,6 +2623,9 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     // `asr` move 进去，命中取消时那个 future 会被 drop（连同它持有的 Arc），我们再用这份
     // clone 显式 cancel，促使流式 WebSocket 立刻关闭、不残留后台 worker。
     let asr_for_cancel = asr.clone();
+    // 「等待转写结果」实测起点：流式 ASR 量的是收尾延迟，批式量完整转写。写进
+    // history.asr_ms 供历史详情页展示（含下方的自动静默重试时间——那也是用户等的时间）。
+    let transcribe_started = std::time::Instant::now();
     // 每个引擎分支产出 Ok(RawTranscript) 或 Err(TranscribeFail)；失败/超时不再就地 return，
     // 而是把失败值交给 match 之后统一处理：先自动静默重试（从归档音频重转，应对网络/服务端
     // 瞬时抖动），重试拿回文本就当正常转写继续；彻底失败才 fail_dictation 保留录音 + 报错。
@@ -2649,6 +2826,34 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                         }
                     }
                 }
+                ActiveAsr::StepfunRealtime(asr) => {
+                    debug_assert!(uses_global_timeout);
+                    if let Err(e) = asr.send_last_frame().await {
+                        log::error!("[coord] StepFun realtime send last frame failed: {e}");
+                    }
+                    let timeout_duration =
+                        std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+                    match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
+                        Ok(Ok(r)) => Ok(r),
+                        Ok(Err(e)) => {
+                            log::error!("[coord] StepFun realtime await final failed: {e}");
+                            // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
+                            asr.cancel();
+                            Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
+                        }
+                        Err(_) => {
+                            log::error!(
+                                "[coord] StepFun realtime 全局超时 {} 秒",
+                                COORDINATOR_GLOBAL_TIMEOUT_SECS
+                            );
+                            asr.cancel();
+                            Err(TranscribeFail::new(
+                                "识别超时".to_string(),
+                                "stepfun realtime global timeout".to_string(),
+                            ))
+                        }
+                    }
+                }
                 #[cfg(target_os = "windows")]
                 ActiveAsr::FoundryLocalWhisper(local) => {
                     debug_assert!(!uses_global_timeout);
@@ -2842,14 +3047,20 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let raw = match transcribe_outcome {
         Ok(raw) => raw,
         Err(fail) => match try_silent_retranscribe(inner, current_session_id).await {
-            SilentRetryOutcome::Transcript(raw) => raw,
+            SilentRetryOutcome::Transcript {
+                raw,
+                asr_call_label: retry_label,
+            } => accept_silent_retry_transcript(raw, retry_label, &mut asr_call_label),
             SilentRetryOutcome::Cancelled => {
                 log::info!("[coord] cancel during silent ASR retry — discarding transcript");
                 restore_prepared_windows_ime_session(inner, current_session_id);
                 finish_cancelled_processing(inner, current_session_id);
                 return Ok(());
             }
-            SilentRetryOutcome::Exhausted => {
+            SilentRetryOutcome::Exhausted(retry_label) => {
+                if retry_label.is_some() {
+                    asr_call_label = retry_label;
+                }
                 // 处理最后一次重试结果时也复查一次取消标志，覆盖「重试刚返回
                 // Exhausted 与用户同时按 Esc」的窄竞态，避免误走失败提示。
                 if inner.state.lock().cancelled {
@@ -2860,9 +3071,22 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     finish_cancelled_processing(inner, current_session_id);
                     return Ok(());
                 }
-                return fail_dictation(inner, current_session_id, elapsed, fail.user_msg, fail.err)
+                return fail_dictation(
+                    inner,
+                    current_session_id,
+                    elapsed,
+                    transcribe_started.elapsed().as_millis() as u64,
+                    fail.user_msg,
+                    fail.err,
+                    asr_call_label.as_ref(),
+                );
             }
         },
+    };
+    let asr_ms = transcribe_started.elapsed().as_millis() as u64;
+    let (asr_provider, asr_model) = match &asr_call_label {
+        Some(label) => (Some(label.provider.clone()), label.model.clone()),
+        None => (None, None),
     };
 
     // ASR 返回空转写护栏（来自 PR #66）：写一条 emptyTranscript 失败历史 + 错误胶囊，
@@ -2903,6 +3127,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             // 通过原始录音定位"是不是麦克风太小声 / ASR 模型问题"的场景。修 pr_agent
             // "Missing Audio" 反馈。
             has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
+            // 空转写也记下是哪个 ASR 模型给出的空结果 + 等了多久，供模型对比排查。
+            asr_provider: asr_provider.clone(),
+            asr_model: asr_model.clone(),
+            llm_provider: None,
+            llm_model: None,
+            asr_ms: Some(asr_ms),
+            polish_ms: None,
         };
         let prefs_snapshot = inner.prefs.get();
         if let Err(e) = inner.history.append_with_retention(
@@ -3053,6 +3284,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     // 翻译会话润色后的源语言文本（译文前的中间产物），仅翻译路径解析成功时有值，
     // 写进 history 供后续普通润色轮复用（剔除译文、避免外语污染）。
     let mut polish_source: Option<String> = None;
+    // 一次 LLM 调用的构建时快照：polish 链路在成功构建 provider、即将发起真实调用时
+    // 填充（见 polish_flow.rs）。Raw 直通、凭据缺失等 preflight 失败都保持 None——
+    // 此时不落 llm_* / polish_ms，避免"没调用却记了模型/耗时"的伪数据（PR #826 review）。
+    let mut llm_call: Option<crate::polish::LlmCallLabel> = None;
+    // 只累计 provider 请求本身的耗时。流式路径的输入法切换、逐字上屏和队列排空
+    // 属于插入阶段，不能混入用于模型对比的 polish_ms。
+    let mut llm_elapsed_ms: Option<u64> = None;
     let (polished, polish_error, already_streamed) = if translation_active {
         log::info!(
             "[coord] translation mode → target=\u{300C}{}\u{300D} working={:?} front_app={:?}",
@@ -3071,6 +3309,8 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             llm_thinking_enabled,
             front_app.as_deref(),
             &prior_turns,
+            &mut llm_call,
+            &mut llm_elapsed_ms,
         )
         .await;
         polish_source = src;
@@ -3088,6 +3328,8 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             llm_thinking_enabled,
             front_app.as_deref(),
             &prior_turns,
+            &mut llm_call,
+            &mut llm_elapsed_ms,
         )
         .await
     } else {
@@ -3102,9 +3344,17 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             llm_thinking_enabled,
             front_app.as_deref(),
             &prior_turns,
+            &mut llm_call,
+            &mut llm_elapsed_ms,
         )
         .await;
         (p, e, false)
+    };
+    // 耗时与标签都以「真的发起了 provider 调用」为准；preflight 失败和 Raw 直通均为 None。
+    let polish_ms = llm_elapsed_ms;
+    let (llm_provider, llm_model) = match &llm_call {
+        Some(label) => (Some(label.provider.clone()), Some(label.model.clone())),
+        None => (None, None),
     };
 
     let polished = finalize_polished_text(
@@ -3292,6 +3542,12 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         // 用 begin_session 时 Recorder::start 返回的实际写盘状态，而不是 prefs 开关——
         // 开关打开但路径创建失败时这里是 false，避免前端渲染播放按钮后端 404。
         has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
+        asr_provider,
+        asr_model,
+        llm_provider,
+        llm_model,
+        asr_ms: Some(asr_ms),
+        polish_ms,
     };
     if let Err(e) = inner.history.append_with_retention(
         session,
@@ -3461,10 +3717,10 @@ fn eligible_polish_context_turns(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_typed_prefix, batch_asr_chunk_limit_ms, build_transcribe_failed_session,
-        default_done_message, drain_streaming_insert_deltas_with, eligible_polish_context_turns,
-        finalize_polished_text, flush_streaming_insert_buffer_with, pcm_duration_ms,
-        pcm_from_wav_bytes, streaming_insert_eligible,
+        accept_silent_retry_transcript, append_typed_prefix, batch_asr_chunk_limit_ms,
+        build_transcribe_failed_session, default_done_message, drain_streaming_insert_deltas_with,
+        eligible_polish_context_turns, finalize_polished_text, flush_streaming_insert_buffer_with,
+        pcm_duration_ms, pcm_from_wav_bytes, streaming_insert_eligible,
     };
     #[cfg(target_os = "macos")]
     use super::{macos_keyless_dictation_provider, MacosKeylessDictationProvider};
@@ -3472,6 +3728,27 @@ mod tests {
         ChineseScriptPreference, CorrectionRule, DictationSession, InsertStatus, PolishMode,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn silent_retry_replaces_initial_asr_attribution() {
+        let mut label = Some(super::AsrCallLabel::new(
+            "volcengine",
+            Some("volc.seedasr.sauc.duration".into()),
+        ));
+        let retry_label = super::AsrCallLabel::new(
+            "bailian-qwen3-realtime",
+            Some("qwen3-asr-flash-realtime".into()),
+        );
+        let raw = super::RawTranscript {
+            text: "重试成功".into(),
+            duration_ms: 900,
+        };
+
+        let accepted = accept_silent_retry_transcript(raw, retry_label.clone(), &mut label);
+
+        assert_eq!(accepted.text, "重试成功");
+        assert_eq!(label, Some(retry_label));
+    }
 
     fn correction_rule(pattern: &str, replacement: &str) -> CorrectionRule {
         CorrectionRule {
@@ -3508,6 +3785,12 @@ mod tests {
             style_pack_id: style_pack_id.map(str::to_string),
             translation_active,
             polish_source: polish_source.map(str::to_string),
+            asr_provider: None,
+            asr_model: None,
+            llm_provider: None,
+            llm_model: None,
+            asr_ms: None,
+            polish_ms: None,
         }
     }
 
@@ -3540,17 +3823,20 @@ mod tests {
         // 凭 id 找回。之前 empty 分支用 Uuid::new_v4()，与 wav 文件名对不上 → 前端永远 404、
         // 录音随 prune 丢失（用户报告「识别失败之前的语音也都丢失了」）。
         let sid = Uuid::new_v4();
-        let session = build_transcribe_failed_session(sid, 4200, PolishMode::Structured, true);
+        let session =
+            build_transcribe_failed_session(sid, 4200, 17_250, PolishMode::Structured, true);
         assert_eq!(session.id, sid.to_string());
     }
 
     #[test]
     fn transcribe_failed_history_marks_failed_and_recoverable() {
         let sid = Uuid::new_v4();
-        let session = build_transcribe_failed_session(sid, 1234, PolishMode::Structured, true);
+        let session =
+            build_transcribe_failed_session(sid, 1234, 17_250, PolishMode::Structured, true);
         assert!(matches!(session.insert_status, InsertStatus::Failed));
         assert_eq!(session.error_code.as_deref(), Some("transcribeFailed"));
         assert_eq!(session.duration_ms, Some(1234));
+        assert_eq!(session.asr_ms, Some(17_250));
         // 归档成功 → 标 has_audio_recording=true，前端据此渲染「重新转录」入口。
         assert_eq!(session.has_audio_recording, Some(true));
     }
@@ -3560,7 +3846,7 @@ mod tests {
         // 录音归档失败（has_audio=false）→ 条目仍写（用户看得到这次失败），但不标可重转，
         // 避免前端渲染重转按钮而后端找不到 wav。
         let sid = Uuid::new_v4();
-        let session = build_transcribe_failed_session(sid, 1, PolishMode::Structured, false);
+        let session = build_transcribe_failed_session(sid, 1, 250, PolishMode::Structured, false);
         assert_eq!(session.has_audio_recording, Some(false));
     }
 
