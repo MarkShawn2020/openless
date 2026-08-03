@@ -46,8 +46,9 @@ use crate::persistence::{
 
 use crate::llm_gemini::{GeminiConfig, GeminiProvider};
 use crate::polish::{
-    ActiveLLMProvider, CodexOAuthConfig, CodexOAuthLLMProvider, OpenAICompatibleConfig,
-    OpenAICompatibleLLMProvider, CODEX_DEFAULT_MODEL, CODEX_OAUTH_PROVIDER_ID,
+    openai_compatible_temperature_for_provider, ActiveLLMProvider, CodexOAuthConfig,
+    CodexOAuthLLMProvider, OpenAICompatibleConfig, OpenAICompatibleLLMProvider,
+    CODEX_DEFAULT_MODEL, CODEX_OAUTH_PROVIDER_ID,
 };
 use crate::qa_hotkey::{QaHotkeyError, QaHotkeyEvent, QaHotkeyMonitor};
 use crate::recorder::{Recorder, RecorderError};
@@ -70,6 +71,8 @@ mod polish_flow;
 mod qa;
 mod qa_session;
 mod resources;
+#[cfg(not(mobile))]
+pub(crate) mod selection_polish;
 
 use asr_wiring::*;
 use capsule_focus::*;
@@ -95,7 +98,7 @@ pub(super) fn qa_event_target() -> &'static str {
 use dictation::dictation_error_code;
 use dictation::{
     begin_session, begin_session_as, cancel_session, end_session, handle_pressed_edge,
-    handle_released_edge, request_stop_during_starting,
+    handle_released_edge, handle_trigger_combined, request_stop_during_starting,
 };
 #[cfg(any(debug_assertions, test))]
 use dictation::{handle_pressed, handle_released};
@@ -157,10 +160,11 @@ fn capsule_state_log_name(state: CapsuleState) -> &'static str {
 fn show_capsule_window_for_recording<R: tauri::Runtime>(
     app: &AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
+    reassert_spaces: bool,
 ) {
     let mut needs_fallback = true;
     if capsule_show_strategy_for_platform() == CapsuleShowStrategy::NoActivate {
-        needs_fallback = !show_capsule_window_no_activate(app, window);
+        needs_fallback = !show_capsule_window_no_activate(app, window, reassert_spaces);
         if needs_fallback && !CAPSULE_NO_ACTIVATE_FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
             // 产品取舍：no-activate 是 macOS/AeroSpace 的主路径；但如果 ns_window
             // 暂不可用，仍优先保住录音反馈，不让用户以为听写没启动。fallback 可能
@@ -314,7 +318,8 @@ pub(crate) fn active_asr_provider_kind(id: &str) -> ActiveAsrProviderKind {
 /// 统一「阿里云百炼」入口的模型 → 底层协议 id 路由。
 ///
 /// 三条百炼协议（fun-asr-realtime 经典实时 / qwen3-asr-flash-realtime Realtime /
-/// fun-asr-flash 录音文件）在 UI 上收成一个 provider `bailian`（一把 key），**构建时**
+/// fun-asr-flash 与 qwen-audio-3.0-asr-flash 录音文件）在 UI 上收成一个
+/// provider `bailian`（一把 key），**构建时**
 /// 按所选模型二次路由到具体协议客户端。凭据 / 「已配置」判定仍看真实 active
 /// `bailian`（→ ApiKeyOnly，一把 key），只有这里的 build 分发用得上 effective id。
 ///
@@ -337,30 +342,27 @@ pub(crate) fn resolve_effective_asr_provider(
         return Ok(active_asr.to_string());
     }
 
-    // Android/iOS 继续使用原来的 Bailian WebSocket 配置。统一入口的模型路由
-    // 只在桌面端启用，避免共享设置页意外改变移动端行为。
-    if cfg!(mobile) {
-        return Ok(crate::asr::bailian::PROVIDER_ID.to_string());
-    }
-
     let model = model.trim();
     if model.is_empty() || is_classic_bailian_realtime_model(model) {
         Ok(crate::asr::bailian::PROVIDER_ID.to_string())
     } else if model.starts_with("qwen3-asr-flash-realtime") {
         Ok(crate::asr::qwen_realtime::PROVIDER_ID.to_string())
-    } else if model == crate::asr::dashscope_multimodal::DEFAULT_MODEL {
+    } else if crate::asr::dashscope_multimodal::protocol_for_model(model).is_some() {
         Ok(crate::asr::dashscope_multimodal::PROVIDER_ID.to_string())
     } else {
         Err(format!(
-            "不支持的百炼 ASR 模型：{model}。支持 fun-asr-realtime、paraformer-realtime、sensevoice-realtime、qwen3-asr-flash-realtime 和 fun-asr-flash-2026-06-15"
+            "不支持的百炼 ASR 模型：{model}。支持 Fun-ASR、Paraformer、SenseVoice、qwen-audio-3.0-asr-flash 和 Qwen3-ASR 的实时、同步及录音文件模型"
         ))
     }
 }
 
 fn is_classic_bailian_realtime_model(model: &str) -> bool {
     model.starts_with("fun-asr-realtime")
+        || model.starts_with("fun-asr-flash-8k-realtime")
         || model.starts_with("paraformer-realtime")
+        || model.starts_with("paraformer-8k-realtime")
         || model.starts_with("sensevoice-realtime")
+        || model.starts_with("sensevoice-8k-realtime")
 }
 
 /// StepFun 的流式模型命名恒以 `-stream` 结尾（stepaudio-2.5-asr-stream /
@@ -371,12 +373,10 @@ pub(crate) fn stepfun_model_is_stream(model: &str) -> bool {
 
 pub(crate) fn validate_dashscope_multimodal_model(model: &str) -> Result<(), String> {
     let model = model.trim();
-    if model.is_empty() || model == crate::asr::dashscope_multimodal::DEFAULT_MODEL {
+    if model.is_empty() || crate::asr::dashscope_multimodal::protocol_for_model(model).is_some() {
         return Ok(());
     }
-    Err(format!(
-        "不支持的 DashScope 录音文件 ASR 模型：{model}。该协议仅支持 fun-asr-flash-2026-06-15；fun-asr-flash-8k-realtime 系列属于 8 kHz 实时 WebSocket 模型，当前尚未支持"
-    ))
+    Err(format!("不支持的 DashScope 录音文件 ASR 模型：{model}"))
 }
 
 #[derive(Clone, Copy)]
@@ -384,6 +384,7 @@ pub(crate) enum BailianEndpointProtocol {
     ClassicRealtime,
     QwenRealtime,
     Multimodal,
+    AsyncTranscription,
 }
 
 /// 统一百炼配置只需要表达区域/工作空间主机；具体协议的 scheme 与 path 由模型路由决定。
@@ -396,6 +397,9 @@ pub(crate) fn derive_bailian_endpoint(
         BailianEndpointProtocol::ClassicRealtime => crate::asr::bailian::DEFAULT_ENDPOINT,
         BailianEndpointProtocol::QwenRealtime => crate::asr::qwen_realtime::DEFAULT_ENDPOINT,
         BailianEndpointProtocol::Multimodal => crate::asr::dashscope_multimodal::DEFAULT_ENDPOINT,
+        BailianEndpointProtocol::AsyncTranscription => {
+            crate::asr::dashscope_multimodal::ASYNC_DEFAULT_ENDPOINT
+        }
     };
     let source = if endpoint.trim().is_empty() {
         default_endpoint
@@ -413,6 +417,9 @@ pub(crate) fn derive_bailian_endpoint(
             "https",
             "/api/v1/services/aigc/multimodal-generation/generation",
         ),
+        BailianEndpointProtocol::AsyncTranscription => {
+            ("https", "/api/v1/services/audio/asr/transcription")
+        }
     };
     url.set_scheme(scheme)
         .map_err(|_| "endpointInvalid".to_string())?;
@@ -475,6 +482,14 @@ struct Inner {
     hotkey: Mutex<Option<HotkeyMonitor>>,
     hotkey_status: Mutex<HotkeyStatus>,
     hotkey_trigger_held: AtomicBool,
+    /// 当前主听写热键按下的代次。组合键撤销通道使用同一代次，避免迟到事件
+    /// 误取消下一次按下开启的会话。
+    hotkey_press_generation: AtomicU64,
+    /// 当前代次是否真的开出了会话；0 表示没有可撤销的会话。
+    hotkey_press_began_session: AtomicU64,
+    /// 组合键事件可能先于 Pressed 事件抵达协调器，暂存其代次供仲裁窗口消费。
+    /// 用队列而不是单个槽，避免主 bridge 忙于上一轮仲裁时覆盖连续按下的事件。
+    hotkey_combo_pending_presses: Mutex<std::collections::VecDeque<u64>>,
     /// 防抖时间戳：handle_pressed_edge 入口检查与本字段的距离，< 250ms 的边沿直接
     /// 丢弃（误触双击 / 微动开关回弹 / 用户连点过快造成的空转写报错）。
     /// 与 `hotkey_trigger_held` 互补 —— held 防 press-without-release，本字段防
@@ -489,6 +504,9 @@ struct Inner {
     /// 防止胶囊离场动画期间误激活新听写（issue #545）。
     session_cooldown_until: Mutex<Option<std::time::Instant>>,
     shortcut_recording_active: AtomicBool,
+    /// Less Computer modifier 热键的按下代次与待处理组合键事件。
+    less_computer_press_generation: AtomicU64,
+    less_computer_combo_pending_press: AtomicU64,
     /// 自定义组合键监听器（global-hotkey crate）。当 `prefs.hotkey.trigger == Custom` 时
     /// 代替 modifier-only 的 hotkey monitor。`None` 表示不使用自定义组合键或还没成功安装。
     combo_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
@@ -496,6 +514,13 @@ struct Inner {
     translation_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
     switch_style_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
     open_app_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
+    /// 选区润色快捷键：modifier-only 复用 `HotkeyMonitor`，其它组合键复用
+    /// `ComboHotkeyMonitor`。桌面（非 mobile）专属。
+    #[cfg(not(mobile))]
+    selection_polish_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
+    /// 预览确认模式暂存的结果和原选区目标；仅在用户确认时才允许插入。
+    #[cfg(not(mobile))]
+    selection_polish_preview: Mutex<Option<selection_polish::PendingSelectionPolishPreview>>,
     /// 翻译模式触发标志。每次 begin_session 重置为 false；hotkey 监听器在
     /// Listening / Starting 阶段看到 Shift down 边沿时 set true。
     /// end_session 在调 polish/translate 前读这个 flag + translation_target_language
@@ -510,6 +535,15 @@ struct Inner {
     /// 因此无 GUI 的测试环境也能断言「按下热键 → 弹了哪种胶囊」）。写入是单次廉价
     /// 加锁，对 ~30Hz 录音回调可忽略。
     last_capsule_state: Mutex<Option<CapsuleState>>,
+    /// 每次 capsule payload 递增。选区润色的终态自动隐藏会带上该代数，防止旧 timer
+    /// 覆盖新的选区润色/语音/QA 可见状态。
+    capsule_event_epoch: AtomicU64,
+    /// 将 capsule 事件与自动隐藏线性化。这样一个旧 timer 要么在新的 payload 之前收起
+    /// 旧提示，要么发现代数已改变直接放弃，绝不会在新会话之后补发 Idle。
+    capsule_event_lock: Mutex<()>,
+    /// 选区润色的轻量提示仍在显示或处理中。已有语音/QA 的旧 auto-hide timer 必须在
+    /// 此期间让路，避免把选区润色浮窗提前收掉。
+    selection_polish_capsule_active: AtomicBool,
     /// QA 单独的 session 状态，与 dictation 的 SessionPhase 不冲突。
     qa_state: Mutex<QaSessionState>,
     /// 最近一次应用到 capsule 窗口的几何状态。避免录音 level tick 反复触发
@@ -626,24 +660,39 @@ impl Coordinator {
 
         #[cfg(not(target_os = "windows"))]
         {
+            #[cfg(target_os = "android")]
+            const PERSIST_DEGRADE_SUFFIX: &str = " (Android 禁止 /data/local/tmp)";
+            #[cfg(not(target_os = "android"))]
+            const PERSIST_DEGRADE_SUFFIX: &str = "";
+
             let history = HistoryStore::new().unwrap_or_else(|e| {
-                log::error!("[coord] HistoryStore init failed: {e}; 降级为空历史记录");
+                log::error!(
+                    "[coord] HistoryStore init failed: {e}; 降级为空历史记录{PERSIST_DEGRADE_SUFFIX}"
+                );
                 HistoryStore::new_fallback()
             });
             let prefs = PreferencesStore::new().unwrap_or_else(|e| {
-                log::error!("[coord] PreferencesStore init failed: {e}; 降级为默认偏好设置");
+                log::error!(
+                    "[coord] PreferencesStore init failed: {e}; 降级为默认偏好设置{PERSIST_DEGRADE_SUFFIX}"
+                );
                 PreferencesStore::new_fallback()
             });
             let style_packs = StylePackStore::new(&prefs).unwrap_or_else(|e| {
-                log::error!("[coord] StylePackStore init failed: {e}; 降级为空样式包列表");
+                log::error!(
+                    "[coord] StylePackStore init failed: {e}; 降级为空样式包列表{PERSIST_DEGRADE_SUFFIX}"
+                );
                 StylePackStore::new_fallback()
             });
             let vocab = DictionaryStore::new().unwrap_or_else(|e| {
-                log::error!("[coord] DictionaryStore init failed: {e}; 降级为空词库");
+                log::error!(
+                    "[coord] DictionaryStore init failed: {e}; 降级为空词库{PERSIST_DEGRADE_SUFFIX}"
+                );
                 DictionaryStore::new_fallback()
             });
             let correction_rules = CorrectionRuleStore::new().unwrap_or_else(|e| {
-                log::error!("[coord] CorrectionRuleStore init failed: {e}; 降级为空纠错规则");
+                log::error!(
+                    "[coord] CorrectionRuleStore init failed: {e}; 降级为空纠错规则{PERSIST_DEGRADE_SUFFIX}"
+                );
                 CorrectionRuleStore::new_fallback()
             });
 
@@ -671,20 +720,32 @@ impl Coordinator {
                     hotkey: Mutex::new(None),
                     hotkey_status: Mutex::new(HotkeyStatus::default()),
                     hotkey_trigger_held: AtomicBool::new(false),
+                    hotkey_press_generation: AtomicU64::new(0),
+                    hotkey_press_began_session: AtomicU64::new(0),
+                    hotkey_combo_pending_presses: Mutex::new(std::collections::VecDeque::new()),
                     last_hotkey_dispatch_at: Mutex::new(None),
                     hotkey_press_at: Mutex::new(None),
                     session_cooldown_until: Mutex::new(None),
                     shortcut_recording_active: AtomicBool::new(false),
+                    less_computer_press_generation: AtomicU64::new(0),
+                    less_computer_combo_pending_press: AtomicU64::new(0),
                     combo_hotkey: Mutex::new(None),
                     side_aware_combo: Mutex::new(None),
                     translation_hotkey: Mutex::new(None),
                     switch_style_hotkey: Mutex::new(None),
                     open_app_hotkey: Mutex::new(None),
+                    #[cfg(not(mobile))]
+                    selection_polish_hotkey: Mutex::new(None),
+                    #[cfg(not(mobile))]
+                    selection_polish_preview: Mutex::new(None),
                     translation_modifier_seen: AtomicBool::new(false),
                     qa_hotkey: Mutex::new(None),
                     coding_agent_modifier_hotkey: Mutex::new(None),
                     coding_agent_combo_hotkey: Mutex::new(None),
                     last_capsule_state: Mutex::new(None),
+                    capsule_event_epoch: AtomicU64::new(0),
+                    capsule_event_lock: Mutex::new(()),
+                    selection_polish_capsule_active: AtomicBool::new(false),
                     qa_state: Mutex::new(QaSessionState::default()),
                     capsule_layout: Mutex::new(None),
                     capsule_warming: AtomicBool::new(false),
@@ -773,20 +834,32 @@ impl Coordinator {
                 hotkey: Mutex::new(None),
                 hotkey_status: Mutex::new(HotkeyStatus::default()),
                 hotkey_trigger_held: AtomicBool::new(false),
+                hotkey_press_generation: AtomicU64::new(0),
+                hotkey_press_began_session: AtomicU64::new(0),
+                hotkey_combo_pending_presses: Mutex::new(std::collections::VecDeque::new()),
                 last_hotkey_dispatch_at: Mutex::new(None),
                 hotkey_press_at: Mutex::new(None),
                 session_cooldown_until: Mutex::new(None),
                 shortcut_recording_active: AtomicBool::new(false),
+                less_computer_press_generation: AtomicU64::new(0),
+                less_computer_combo_pending_press: AtomicU64::new(0),
                 combo_hotkey: Mutex::new(None),
                 side_aware_combo: Mutex::new(None),
                 translation_hotkey: Mutex::new(None),
                 switch_style_hotkey: Mutex::new(None),
                 open_app_hotkey: Mutex::new(None),
+                #[cfg(not(mobile))]
+                selection_polish_hotkey: Mutex::new(None),
+                #[cfg(not(mobile))]
+                selection_polish_preview: Mutex::new(None),
                 translation_modifier_seen: AtomicBool::new(false),
                 qa_hotkey: Mutex::new(None),
                 coding_agent_modifier_hotkey: Mutex::new(None),
                 coding_agent_combo_hotkey: Mutex::new(None),
                 last_capsule_state: Mutex::new(None),
+                capsule_event_epoch: AtomicU64::new(0),
+                capsule_event_lock: Mutex::new(()),
+                selection_polish_capsule_active: AtomicBool::new(false),
                 qa_state: Mutex::new(QaSessionState::default()),
                 capsule_layout: Mutex::new(None),
                 capsule_warming: AtomicBool::new(false),
@@ -1039,6 +1112,32 @@ impl Coordinator {
             });
         } else {
             self.inner.qa_hotkey.lock().take();
+        }
+    }
+
+    #[cfg(not(mobile))]
+    pub fn start_selection_polish_hotkey_listener(&self) {
+        let inner = Arc::clone(&self.inner);
+        std::thread::Builder::new()
+            .name("openless-selection-polish-hotkey-supervisor".into())
+            .spawn(move || selection_polish_hotkey_supervisor_loop(inner))
+            .ok();
+    }
+
+    #[cfg(not(mobile))]
+    pub fn stop_selection_polish_hotkey_listener(&self) {
+        take_selection_polish_hotkey_on_main_thread(&self.inner);
+    }
+
+    #[cfg(not(mobile))]
+    pub fn try_update_selection_polish_hotkey_binding(&self) -> Result<(), String> {
+        try_update_selection_polish_hotkey_binding(&self.inner)
+    }
+
+    #[cfg(not(mobile))]
+    pub fn update_selection_polish_hotkey_binding(&self) {
+        if let Err(error) = self.try_update_selection_polish_hotkey_binding() {
+            log::warn!("[coord] update selection polish hotkey binding failed: {error}");
         }
     }
 
@@ -1454,7 +1553,11 @@ impl Coordinator {
         let (tx, rx) = mpsc::channel::<HotkeyEvent>();
         #[cfg(target_os = "linux")]
         let (fcitx_tx, fcitx_binding) = (tx.clone(), binding.clone());
-        match HotkeyMonitor::start(binding, tx) {
+        let cancel_tx = spawn_esc_cancel_bridge(&self.inner);
+        let combo_tx = spawn_combo_abort_bridge(&self.inner, handle_trigger_combined);
+        #[cfg(target_os = "linux")]
+        let combo_tx_for_fcitx = combo_tx.clone();
+        match HotkeyMonitor::start(binding, tx, cancel_tx, combo_tx) {
             Ok(monitor) => {
                 let adapter = monitor.kind();
                 *self.inner.hotkey.lock() = Some(monitor);
@@ -1472,10 +1575,12 @@ impl Coordinator {
                 // Linux: 启动 fcitx5 插件信号监听作为热键源。
                 #[cfg(target_os = "linux")]
                 {
-                    let (qa_trigger, translation_trigger) = modifier_shortcut_triggers(&self.inner);
+                    let (qa_trigger, _selection_polish_trigger, translation_trigger) =
+                        modifier_shortcut_triggers(&self.inner);
                     let custom_key = custom_dictation_key_string(&self.inner);
                     crate::linux_fcitx::start_dictation_signal_listener(
                         fcitx_tx,
+                        combo_tx_for_fcitx,
                         fcitx_binding.clone(),
                         qa_trigger,
                         translation_trigger,
@@ -1501,8 +1606,13 @@ impl Coordinator {
 
     pub fn update_modifier_shortcut_bindings(&self) {
         if let Some(monitor) = self.inner.hotkey.lock().as_ref() {
-            let (qa_trigger, translation_trigger) = modifier_shortcut_triggers(&self.inner);
-            monitor.update_modifier_shortcuts(qa_trigger, translation_trigger);
+            let (qa_trigger, selection_polish_trigger, translation_trigger) =
+                modifier_shortcut_triggers(&self.inner);
+            monitor.update_modifier_shortcuts(
+                qa_trigger,
+                selection_polish_trigger,
+                translation_trigger,
+            );
         }
     }
 
@@ -1776,8 +1886,8 @@ impl Coordinator {
     #[cfg(any(debug_assertions, test))]
     pub async fn inject_hotkey_click_for_dev(&self) -> Result<(), String> {
         log::info!("[coord] dev hotkey injection started");
-            handle_pressed(&self.inner, std::time::Instant::now()).await;
-            handle_released(&self.inner, std::time::Instant::now()).await;
+        handle_pressed(&self.inner, std::time::Instant::now(), 0).await;
+        handle_released(&self.inner, std::time::Instant::now()).await;
         cancel_session(&self.inner);
         Ok(())
     }
@@ -1790,7 +1900,10 @@ impl Coordinator {
             .style_packs
             .get_or_default_active(&prefs.active_style_pack_id)
             .map_err(|e| e.to_string())?;
-        let style_system_prompt = pack.prompt.clone();
+        let style_system_prompt = crate::types::style_pack_prompt(
+            &pack,
+            crate::types::StylePromptKind::DictationAsr,
+        );
         let working_languages = prefs.working_languages;
         let chinese_script_preference = prefs.chinese_script_preference;
         let output_language_preference = prefs.output_language_preference;
@@ -1887,9 +2000,7 @@ impl Coordinator {
         let consumer = start.recorder_consumer();
         consumer.consume_pcm_chunk(&pcm);
         let timeout = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-        let dashscope_timeout = whisper_transcribe_timeout(
-            crate::asr::pcm::pcm_duration_ms(&pcm) as f64 / 1000.0,
-        );
+        let audio_secs = crate::asr::pcm::pcm_duration_ms(&pcm) as f64 / 1000.0;
         let elevenlabs_timeout = crate::asr::elevenlabs::transcribe_timeout(
             crate::asr::pcm::pcm_duration_ms(&pcm) as f64 / 1000.0,
         );
@@ -1931,10 +2042,16 @@ impl Coordinator {
                 .map_err(|_| "重新转录超时".to_string())?
                 .map_err(|e| e.to_string())?,
             ActiveAsr::DashScopeMultimodal(m) => {
-                tokio::time::timeout(dashscope_timeout, m.transcribe())
+                tokio::time::timeout(m.transcribe_timeout(audio_secs), m.transcribe())
                 .await
                 .map_err(|_| "重新转录超时".to_string())?
                 .map_err(|e| e.to_string())?
+            }
+            ActiveAsr::ElevenLabs(e) => {
+                tokio::time::timeout(elevenlabs_timeout, e.transcribe())
+                    .await
+                    .map_err(|_| "重新转录超时".to_string())?
+                    .map_err(|e| e.to_string())?
             }
             ActiveAsr::ElevenLabs(e) => {
                 tokio::time::timeout(elevenlabs_timeout, e.transcribe())
@@ -2310,7 +2427,6 @@ mod non_tsf_fallback_tests {
 // ─────────────────────────── helpers ───────────────────────────
 
 
-
 fn read_whisper_credentials() -> (String, String, String) {
     let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
         .ok()
@@ -2369,9 +2485,20 @@ fn read_dashscope_multimodal_credentials() -> (String, String, String) {
         .ok()
         .flatten()
         .unwrap_or_default();
+    let model = CredentialsVault::get(CredentialAccount::AsrModel)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::asr::dashscope_multimodal::DEFAULT_MODEL.to_string());
     let base_url = if unified_bailian_is_active() {
         let endpoint = read_asr_endpoint(crate::asr::bailian::DEFAULT_ENDPOINT);
-        derive_bailian_endpoint(&endpoint, BailianEndpointProtocol::Multimodal).unwrap_or(endpoint)
+        let protocol = match crate::asr::dashscope_multimodal::protocol_for_model(&model) {
+            Some(crate::asr::dashscope_multimodal::DashScopeBatchProtocol::AsyncTranscription) => {
+                BailianEndpointProtocol::AsyncTranscription
+            }
+            _ => BailianEndpointProtocol::Multimodal,
+        };
+        derive_bailian_endpoint(&endpoint, protocol).unwrap_or(endpoint)
     } else {
         CredentialsVault::get(CredentialAccount::AsrEndpoint)
             .ok()
@@ -2379,11 +2506,6 @@ fn read_dashscope_multimodal_credentials() -> (String, String, String) {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| crate::asr::dashscope_multimodal::DEFAULT_ENDPOINT.to_string())
     };
-    let model = CredentialsVault::get(CredentialAccount::AsrModel)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| crate::asr::dashscope_multimodal::DEFAULT_MODEL.to_string());
     (api_key, base_url, model)
 }
 
@@ -2492,22 +2614,37 @@ fn read_stepfun_realtime_credentials(
 }
 
 fn read_volc_credentials() -> VolcengineCredentials {
+    use crate::asr::volcengine::VolcengineAuthMode;
     let app_id = CredentialsVault::get(CredentialAccount::VolcengineAppKey)
         .ok()
         .flatten()
         .unwrap_or_default();
-    let access_token = CredentialsVault::get(CredentialAccount::VolcengineAccessKey)
+    let auth_mode = CredentialsVault::get(CredentialAccount::VolcengineAuthMode)
         .ok()
         .flatten()
-        .unwrap_or_default();
+        .map(|s| VolcengineAuthMode::from_str(&s))
+        .unwrap_or(VolcengineAuthMode::AppIdToken);
+    // 密钥槽位随鉴权模式：AppIdToken 读旧版 Access Token，ApiKey 读独立的方舟 API Key，
+    // 两者互不污染，切换模式不会把旧模式的凭据带进新模式的握手。
+    let secret = match auth_mode {
+        VolcengineAuthMode::AppIdToken => CredentialsVault::get(CredentialAccount::VolcengineAccessKey)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        VolcengineAuthMode::ApiKey => CredentialsVault::get(CredentialAccount::VolcengineApiKey)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    };
     let resource_id = CredentialsVault::get(CredentialAccount::VolcengineResourceId)
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| VolcengineCredentials::default_resource_id().to_string());
     VolcengineCredentials {
+        auth_mode,
         app_id,
-        access_token,
+        access_token: secret,
         resource_id,
     }
 }
@@ -2601,8 +2738,13 @@ fn build_active_llm_provider(llm_thinking_enabled: bool) -> anyhow::Result<Activ
         .trim_end_matches("/chat/completions")
         .trim_end_matches('/')
         .to_string();
+    let temperature = openai_compatible_temperature_for_provider(
+        &active,
+        CredentialsVault::get_active_llm_temperature(),
+    );
     let config = OpenAICompatibleConfig::new(active, "OpenLess LLM", base_url, api_key, model)
         .with_thinking_enabled(llm_thinking_enabled)
+        .with_temperature(temperature)
         .with_extra_headers(CredentialsVault::get_active_llm_extra_headers());
     Ok(ActiveLLMProvider::OpenAI(OpenAICompatibleLLMProvider::new(
         config,
@@ -3053,8 +3195,40 @@ mod tests {
             resolve_effective_asr_provider(bailian, "fun-asr-flash-2026-06-15").unwrap(),
             crate::asr::dashscope_multimodal::PROVIDER_ID
         );
+        for model in [
+            "fun-asr-flash-2026-09-01",
+            "qwen3-asr-flash",
+            "qwen3-asr-flash-2026-02-10",
+            "fun-asr",
+            "fun-asr-mtl-2025-08-25",
+            "paraformer-v2",
+        ] {
+            assert_eq!(
+                resolve_effective_asr_provider(bailian, model).unwrap(),
+                crate::asr::dashscope_multimodal::PROVIDER_ID,
+                "unexpected route for {model}"
+            );
+        }
+        assert_eq!(
+            resolve_effective_asr_provider(bailian, "fun-asr-flash-8k-realtime").unwrap(),
+            crate::asr::bailian::PROVIDER_ID
+        );
+        assert_eq!(
+            resolve_effective_asr_provider(bailian, "qwen-audio-3.0-asr-flash").unwrap(),
+            crate::asr::dashscope_multimodal::PROVIDER_ID
+        );
         assert_eq!(
             resolve_effective_asr_provider(bailian, "paraformer-realtime-v2").unwrap(),
+            crate::asr::bailian::PROVIDER_ID
+        );
+        // 8k 实时变体同样走经典 WebSocket（降采样 + sample_rate=8000），
+        // 与 bailian.rs::model_is_8k 的命名空间保持一致。
+        assert_eq!(
+            resolve_effective_asr_provider(bailian, "paraformer-8k-realtime-v2").unwrap(),
+            crate::asr::bailian::PROVIDER_ID
+        );
+        assert_eq!(
+            resolve_effective_asr_provider(bailian, "sensevoice-8k-realtime-v1").unwrap(),
             crate::asr::bailian::PROVIDER_ID
         );
         // 空模型 → 经典实时（百炼默认）；未知模型应被拒绝。
@@ -3076,16 +3250,26 @@ mod tests {
 
     #[test]
     fn resolve_effective_asr_provider_rejects_unsupported_bailian_model() {
-        let error = resolve_effective_asr_provider(crate::asr::bailian::PROVIDER_ID, "paraformer-v2")
+        let error = resolve_effective_asr_provider(crate::asr::bailian::PROVIDER_ID, "unknown-asr")
             .unwrap_err();
         assert!(error.contains("不支持的百炼 ASR 模型"));
-
-        let error = resolve_effective_asr_provider(
-            crate::asr::bailian::PROVIDER_ID,
-            "fun-asr-flash-8k-realtime",
-        )
-        .unwrap_err();
+        // qwen3-asr-flash-filetrans 仅接受公网 URL，与本地录音链路不兼容，同样拒绝。
+        let error =
+            resolve_effective_asr_provider(crate::asr::bailian::PROVIDER_ID, "qwen3-asr-flash-filetrans")
+                .unwrap_err();
         assert!(error.contains("不支持的百炼 ASR 模型"));
+    }
+
+    #[test]
+    fn validates_only_supported_dashscope_multimodal_models() {
+        assert!(validate_dashscope_multimodal_model("").is_ok());
+        assert!(
+            validate_dashscope_multimodal_model("fun-asr-flash-2026-06-15").is_ok()
+        );
+        assert!(validate_dashscope_multimodal_model("qwen-audio-3.0-asr-flash").is_ok());
+        assert!(
+            validate_dashscope_multimodal_model("qwen-audio-3.0-asr-flash-streaming").is_err()
+        );
     }
 
     #[test]
@@ -3102,6 +3286,11 @@ mod tests {
         assert_eq!(
             derive_bailian_endpoint(endpoint, BailianEndpointProtocol::Multimodal).unwrap(),
             "https://workspace.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+        );
+        assert_eq!(
+            derive_bailian_endpoint(endpoint, BailianEndpointProtocol::AsyncTranscription)
+                .unwrap(),
+            "https://workspace.ap-southeast-1.maas.aliyuncs.com/api/v1/services/audio/asr/transcription"
         );
     }
 
@@ -3361,6 +3550,34 @@ mod tests {
         assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
     }
 
+    #[tokio::test]
+    async fn stale_capsule_idle_schedule_does_not_hide_newer_state() {
+        let coordinator = Coordinator::new();
+        // 旧 schedule 触发时若期间有更新的 emit，应跳过隐藏（voice agent 取消双 emit 竞争）。
+        emit_capsule(&coordinator.inner, CapsuleState::Done, 0.0, 0, None, None);
+        schedule_capsule_idle(&coordinator.inner, 30);
+        emit_capsule(&coordinator.inner, CapsuleState::Cancelled, 0.0, 0, None, None);
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            coordinator.inner.last_capsule_state.lock().as_ref().copied(),
+            Some(CapsuleState::Cancelled),
+            "旧 schedule 不应把更新的 Cancelled 状态提前隐藏"
+        );
+    }
+
+    #[tokio::test]
+    async fn capsule_idle_schedule_hides_when_no_newer_state() {
+        let coordinator = Coordinator::new();
+        emit_capsule(&coordinator.inner, CapsuleState::Done, 0.0, 0, None, None);
+        schedule_capsule_idle(&coordinator.inner, 30);
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            coordinator.inner.last_capsule_state.lock().as_ref().copied(),
+            Some(CapsuleState::Idle),
+            "无新 emit 时 schedule 应隐藏胶囊"
+        );
+    }
+
     #[test]
     fn cancel_session_state_machine_is_table_driven() {
         let cases = [
@@ -3436,7 +3653,7 @@ mod tests {
             state.session_id = session_id(41);
         }
 
-        handle_pressed_edge(&coordinator.inner, std::time::Instant::now()).await;
+        handle_pressed_edge(&coordinator.inner, std::time::Instant::now(), 1).await;
 
         let state = coordinator.inner.state.lock();
         assert_eq!(state.phase, SessionPhase::Inserting);
@@ -3464,7 +3681,7 @@ mod tests {
             .hotkey_trigger_held
             .store(true, Ordering::SeqCst);
 
-        handle_pressed_edge(&coordinator.inner, std::time::Instant::now()).await;
+        handle_pressed_edge(&coordinator.inner, std::time::Instant::now(), 1).await;
 
         assert_eq!(
             coordinator.inner.state.lock().phase,
@@ -3554,6 +3771,141 @@ mod tests {
         // 无 recorder / ASR 的测试会话下，end_session 直接收尾到 Idle。
         assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
         assert!(coordinator.inner.hotkey_press_at.lock().is_none());
+    }
+
+    // Option+任意字母/数字键：这次按下开出来的会话必须被撤销，且随后的松手边沿不能再被当成
+    // Auto 短按锁存（否则录音一直开着，正是用户报的「按 Option+其他键唤起听写」）。
+    #[tokio::test]
+    async fn trigger_combined_cancels_session_started_by_this_press() {
+        let coordinator = Coordinator::new();
+        set_auto_mode(&coordinator);
+        coordinator.inner.state.lock().phase = SessionPhase::Listening;
+        let pressed_at = std::time::Instant::now();
+        *coordinator.inner.hotkey_press_at.lock() = Some(pressed_at);
+        coordinator
+            .inner
+            .hotkey_trigger_held
+            .store(true, Ordering::SeqCst);
+        coordinator
+            .inner
+            .hotkey_press_generation
+            .store(1, Ordering::SeqCst);
+        coordinator
+            .inner
+            .hotkey_press_began_session
+            .store(1, Ordering::SeqCst);
+
+        handle_trigger_combined(&coordinator.inner, 1);
+
+        assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
+        assert!(!coordinator.inner.hotkey_trigger_held.load(Ordering::SeqCst));
+        assert!(coordinator.inner.hotkey_press_at.lock().is_none());
+        // 组合键误触不算「刚用完一次听写」：不留冷却，否则紧接着真想说话的按下被吞。
+        assert!(coordinator.inner.session_cooldown_until.lock().is_none());
+
+        handle_released_edge(
+            &coordinator.inner,
+            pressed_at + std::time::Duration::from_millis(80),
+        )
+        .await;
+
+        assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
+    }
+
+    // 这次按下是 toggle 停止（没开出会话）时，组合键撤销不能顺手取消正在跑的会话 ——
+    // 那条录音是上一次按下锁存的，取消 = 用户白说一段。
+    #[tokio::test]
+    async fn trigger_combined_leaves_session_it_did_not_start() {
+        let coordinator = Coordinator::new();
+        set_auto_mode(&coordinator);
+        coordinator.inner.state.lock().phase = SessionPhase::Listening;
+        coordinator
+            .inner
+            .hotkey_trigger_held
+            .store(true, Ordering::SeqCst);
+        coordinator
+            .inner
+            .hotkey_press_generation
+            .store(1, Ordering::SeqCst);
+        coordinator
+            .inner
+            .hotkey_press_began_session
+            .store(0, Ordering::SeqCst);
+
+        handle_trigger_combined(&coordinator.inner, 1);
+
+        assert_eq!(
+            coordinator.inner.state.lock().phase,
+            SessionPhase::Listening
+        );
+        assert!(!coordinator.inner.hotkey_trigger_held.load(Ordering::SeqCst));
+    }
+
+    // 组合键撤销通道独立于 Released；若正常松手已经把会话收尾到 Idle，迟到的撤销
+    // 不能清掉正常会话的冷却/防抖，否则下一次三连按会绕过 #545 的保护。
+    #[tokio::test]
+    async fn late_trigger_combined_does_not_clear_completed_session_guards() {
+        let coordinator = Coordinator::new();
+        set_auto_mode(&coordinator);
+        let now = std::time::Instant::now();
+        *coordinator.inner.session_cooldown_until.lock() =
+            Some(now + std::time::Duration::from_secs(1));
+        *coordinator.inner.last_hotkey_dispatch_at.lock() = Some(now);
+        coordinator
+            .inner
+            .hotkey_press_generation
+            .store(1, Ordering::SeqCst);
+        coordinator
+            .inner
+            .hotkey_press_began_session
+            .store(1, Ordering::SeqCst);
+
+        handle_trigger_combined(&coordinator.inner, 1);
+
+        assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
+        assert!(coordinator.inner.session_cooldown_until.lock().is_some());
+        assert!(coordinator.inner.last_hotkey_dispatch_at.lock().is_some());
+    }
+
+    // 撤销走独立线程后，它与 Pressed/Released 那条串行 bridge 之间没有先后保证。
+    // 万一 Released 抢先跑完（把按住态清了、Auto 还锁存成了切换态），撤销仍然必须认出
+    // 这条会话是自己那次按下开的并取消掉 —— 否则组合键会留下一条停不下来的录音，
+    // 正是本 PR 要修的老毛病换个形式复发。
+    #[tokio::test]
+    async fn trigger_combined_still_cancels_when_released_edge_wins_the_race() {
+        let coordinator = Coordinator::new();
+        set_auto_mode(&coordinator);
+        coordinator.inner.state.lock().phase = SessionPhase::Listening;
+        let pressed_at = std::time::Instant::now();
+        *coordinator.inner.hotkey_press_at.lock() = Some(pressed_at);
+        coordinator
+            .inner
+            .hotkey_trigger_held
+            .store(true, Ordering::SeqCst);
+        coordinator
+            .inner
+            .hotkey_press_generation
+            .store(1, Ordering::SeqCst);
+        coordinator
+            .inner
+            .hotkey_press_began_session
+            .store(1, Ordering::SeqCst);
+
+        // 先跑 Released（短按 → Auto 锁存成切换态，录音继续），撤销后到。
+        handle_released_edge(
+            &coordinator.inner,
+            pressed_at + std::time::Duration::from_millis(80),
+        )
+        .await;
+        assert_eq!(
+            coordinator.inner.state.lock().phase,
+            SessionPhase::Listening
+        );
+
+        handle_trigger_combined(&coordinator.inner, 1);
+
+        assert_eq!(coordinator.inner.state.lock().phase, SessionPhase::Idle);
+        assert!(coordinator.inner.session_cooldown_until.lock().is_none());
     }
 
     #[test]
@@ -3856,6 +4208,45 @@ mod tests {
 
         assert!(coordinator.inner.asr.lock().is_none());
     }
+
+    #[test]
+    fn selection_polish_capsule_epoch_rejects_stale_auto_hide() {
+        let coordinator = Coordinator::new();
+        let terminal_epoch =
+            emit_selection_polish_capsule(&coordinator.inner, CapsuleState::Done, "已替换");
+        assert!(selection_polish_capsule_epoch_is_current(
+            &coordinator.inner,
+            terminal_epoch
+        ));
+
+        let next_epoch = emit_selection_polish_capsule(
+            &coordinator.inner,
+            CapsuleState::Polishing,
+            "正在润色...",
+        );
+        assert_ne!(terminal_epoch, next_epoch);
+        assert!(
+            !selection_polish_capsule_epoch_is_current(&coordinator.inner, terminal_epoch),
+            "上一轮的终态 timer 不能收起下一轮处理中提示"
+        );
+        assert!(selection_polish_capsule_epoch_is_current(
+            &coordinator.inner,
+            next_epoch
+        ));
+
+        emit_capsule(
+            &coordinator.inner,
+            CapsuleState::Recording,
+            0.0,
+            0,
+            None,
+            None,
+        );
+        assert!(
+            !selection_polish_capsule_epoch_is_current(&coordinator.inner, next_epoch),
+            "选区终态 timer 不能在新的语音状态上调用 Idle"
+        );
+    }
 }
 
 fn enabled_phrases(inner: &Arc<Inner>) -> Vec<String> {
@@ -3938,19 +4329,33 @@ fn set_phase_idle_if_session_matches(inner: &Arc<Inner>, session_id: SessionId) 
 }
 
 fn schedule_capsule_idle(inner: &Arc<Inner>, delay_ms: u64) {
+    // 记录触发时胶囊显示的状态；到点时若期间有更新的 emit（last_capsule_state 已变），
+    // 说明本次状态已被后续 emit 取代，隐藏交给那次 emit 自己的 schedule——避免旧
+    // schedule 把新状态提前隐藏（如 voice agent 取消路径 cancel_session 与收尾双 emit）。
+    let expect = inner.last_capsule_state.lock().as_ref().copied();
     let inner_clone = Arc::clone(inner);
     async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if inner_clone.last_capsule_state.lock().as_ref().copied() != expect {
+            return;
+        }
         // 必须 dictation **和** QA 同时空闲才能隐藏胶囊。否则旧 dictation Done timer
         // 的尾巴会在新 QA 录音/思考中把胶囊意外收掉（issue #118 v2 复现）。
-        let dictation_idle = inner_clone.state.lock().phase == SessionPhase::Idle;
-        let qa_idle = inner_clone.qa_state.lock().phase == QaPhase::Idle;
-        if dictation_idle && qa_idle {
-            emit_capsule(&inner_clone, CapsuleState::Idle, 0.0, 0, None, None);
-        }
+        // 选区润色进行中或出现新 payload 时，函数内部依据 capsule epoch 放弃隐藏。
+        hide_capsule_if_all_sessions_idle(&inner_clone);
     });
 }
 
+/// 选区润色终态的短暂展示。旧的 timer 只能收起自己那一代的 payload；若用户已经
+/// 触发了下一轮 selection，或在此期间开始语音/QA，会直接放弃，不碰当前 capsule。
+#[cfg(not(mobile))]
+fn schedule_selection_polish_capsule_idle(inner: &Arc<Inner>, event_epoch: u64, delay_ms: u64) {
+    let inner_clone = Arc::clone(inner);
+    async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        hide_selection_polish_capsule_if_current(&inner_clone, event_epoch);
+    });
+}
 
 // ─────────────────────────── audio bridge ───────────────────────────
 

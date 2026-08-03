@@ -16,7 +16,7 @@ import {
 import { emitSaved } from '../../lib/savedEvent';
 import { useMobileLayout } from '../../lib/useMobileLayout';
 import { useHotkeySettings } from '../../state/HotkeySettingsContext';
-import { SelectLite } from '../../components/ui/SelectLite';
+import { SelectLite, type SelectOption } from '../../components/ui/SelectLite';
 import { Card } from '../_atoms';
 import { SettingRow, SectionTitle, Toggle, inputStyle, ASR_PRESETS, type AsrPresetId } from './shared';
 
@@ -47,7 +47,7 @@ function LlmThinkingToggle({ enabled, onToggle }: { enabled: boolean; onToggle: 
   );
 }
 
-const LLM_PRESETS = [
+export const LLM_PRESETS = [
   {
     id: 'ark',
     nameKey: 'ark',
@@ -65,6 +65,12 @@ const LLM_PRESETS = [
     nameKey: 'siliconflow',
     baseUrl: 'https://api.siliconflow.cn/v1',
     modelPlaceholder: 'Qwen/Qwen2.5-7B-Instruct',
+  },
+  {
+    id: 'atlascloud',
+    nameKey: 'atlascloud',
+    baseUrl: 'https://api.atlascloud.ai/v1',
+    modelPlaceholder: 'qwen/qwen3.5-flash',
   },
   {
     id: 'openai',
@@ -162,6 +168,39 @@ const ASR_DEFAULT_RESOURCE_ID = 'volc.seedasr.sauc.duration';
 // ASR_PRESETS 已上移到 settings/shared.tsx 作为单一来源（AsrPresetId 由其派生，
 // Overview 的显示名映射也从那里取）。新增厂商的步骤见 shared.tsx 的注释。
 
+// 云端 ASR 模型预设（下拉可选）——千问新发布的 ASR 优先：qwen3-asr-flash 是
+// Qwen-ASR 的 OpenAI 兼容 HTTP 形态，另有实时变体（flash-realtime）；fun-asr
+// 系列是百炼原生推荐，paraformer 为老一代兜底。
+// 注意：qwen3-asr-flash-filetrans 官方只接受公网音频 URL，与本地录音链路不兼容，
+// 后端会显式拒绝（coordinator.rs::resolve_effective_asr_provider），不放预设。
+const BAILIAN_ASR_MODELS: string[] = [
+  'qwen3-asr-flash-realtime',
+  'qwen3-asr-flash',
+  'fun-asr-realtime',
+  'fun-asr',
+  'fun-asr-flash-2026-06-15',
+  'fun-asr-mtl',
+  'paraformer-realtime-v2',
+  'paraformer-v2',
+];
+
+// OpenAI 兼容（/audio/transcriptions）厂商共用的模型预设。
+const OPENAI_COMPAT_ASR_MODELS: string[] = [
+  'whisper-large-v3-turbo',
+  'whisper-large-v3',
+  'whisper-1',
+  'FunAudioLLM/SenseVoiceSmall',
+  'qwen3-asr-flash',
+];
+
+// 走 Whisper 兼容 /audio/transcriptions 协议的厂商（与后端
+// coordinator.rs::is_whisper_compatible_provider 保持一致）。其余非百炼厂商
+// （zhipu / stepfun / mimo / elevenlabs 等）协议不同，不给预设下拉，保持输入框。
+const WHISPER_COMPAT_ASR_PROVIDERS: AsrPresetId[] = ['whisper', 'groq', 'siliconflow', 'openrouter'];
+
+/** 模型预设下拉里的「自定义模型…」哨兵值：选中即切回输入框手输。 */
+const CUSTOM_MODEL_OPTION_VALUE = '__custom_model__';
+
 type ProvidersSectionKind = 'all' | 'llm' | 'asr';
 
 interface ProvidersSectionProps {
@@ -188,8 +227,20 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
   const [llmModelRevision, setLlmModelRevision] = useState(0);
   const [asrModelRevision, setAsrModelRevision] = useState(0);
   const os = detectOS();
-  const unifiedBailian = committedAsrProvider === 'bailian' && os !== 'android';
+  const unifiedBailian = committedAsrProvider === 'bailian';
   const [bailianModel, setBailianModel] = useState('');
+  const [volcengineAuthMode, setVolcengineAuthMode] = useState<'app_id_token' | 'api_key'>('app_id_token');
+
+  useEffect(() => {
+    if (committedAsrProvider === 'volcengine') {
+      readCredential('volcengine.auth_mode', 'volcengine')
+        .then(v => {
+          if (v === 'api_key') setVolcengineAuthMode('api_key');
+          else setVolcengineAuthMode('app_id_token');
+        })
+        .catch(() => setVolcengineAuthMode('app_id_token'));
+    }
+  }, [committedAsrProvider]);
 
   useEffect(() => {
     if (committedAsrProvider !== 'bailian') setBailianModel('');
@@ -378,14 +429,23 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
             <CredentialField key={`${committedLlmProvider}:endpoint`} label={t('settings.providers.baseUrlLabel')} account="ark.endpoint"
               placeholder={preset.baseUrl || 'https://your-endpoint/v1'} />
             {committedLlmProvider === 'custom' && (
-              <CredentialField
-                key={`${committedLlmProvider}:extra_headers`}
-                label={t('settings.providers.extraHeadersLabel')}
-                account="ark.extra_headers"
-                placeholder={t('settings.providers.extraHeadersPlaceholder')}
-                mono
-                mask
-              />
+              <>
+                <CredentialField
+                  key={`${committedLlmProvider}:temperature`}
+                  label={t('settings.providers.temperatureLabel')}
+                  account="ark.temperature"
+                  placeholder={t('settings.providers.temperaturePlaceholder')}
+                  mono
+                />
+                <CredentialField
+                  key={`${committedLlmProvider}:extra_headers`}
+                  label={t('settings.providers.extraHeadersLabel')}
+                  account="ark.extra_headers"
+                  placeholder={t('settings.providers.extraHeadersPlaceholder')}
+                  mono
+                  mask
+                />
+              </>
             )}
           </>
         )}
@@ -459,22 +519,62 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
         </SettingRow>
         {committedAsrProvider === 'volcengine' ? (
           <>
-            <CredentialField
-              key={`${committedAsrProvider}:app_key`}
-              label={t('settings.providers.volcengineAppKeyLabel')}
-              account="volcengine.app_key"
-              provider={committedAsrProvider}
-              mono
-              mask
-            />
-            <CredentialField
-              key={`${committedAsrProvider}:access_key`}
-              label={t('settings.providers.volcengineAccessKeyLabel')}
-              account="volcengine.access_key"
-              provider={committedAsrProvider}
-              mono
-              mask
-            />
+            <SettingRow label={t('settings.providers.volcengineAuthModeLabel')}>
+              <SelectLite
+                value={volcengineAuthMode}
+                onChange={async (v) => {
+                  const mode = v as 'app_id_token' | 'api_key';
+                  const prev = volcengineAuthMode;
+                  setVolcengineAuthMode(mode);
+                  try {
+                    await setCredential('volcengine.auth_mode', mode, committedAsrProvider);
+                  } catch (error) {
+                    // 写入失败必须回滚 UI 并提示：否则模式看着已切换、重启后却静默回退，
+                    // 配合独立 API Key 槽会造成「Key 存在但模式不对」的混乱。
+                    console.error('[settings] failed to save volcengine auth mode', error);
+                    setVolcengineAuthMode(prev);
+                    emitSaved('failed', t('common.operationFailed'));
+                  }
+                }}
+                options={[
+                  { value: 'app_id_token', label: t('settings.providers.volcengineAuthModeAppIdToken') },
+                  { value: 'api_key', label: t('settings.providers.volcengineAuthModeApiKey') },
+                ]}
+                ariaLabel={t('settings.providers.volcengineAuthModeLabel')}
+                style={{ ...inputStyle, width: '100%', maxWidth: mobile ? '100%' : 260 }}
+              />
+            </SettingRow>
+            {/* 两种模式使用各自独立的凭据槽位：旧版 Access Token（volcengine.access_key）
+                与方舟 API Key（volcengine.api_key）互不预填，切换模式不会残留混淆。 */}
+            {volcengineAuthMode === 'app_id_token' ? (
+              <>
+                <CredentialField
+                  key={`${committedAsrProvider}:app_key`}
+                  label={t('settings.providers.volcengineAppKeyLabel')}
+                  account="volcengine.app_key"
+                  provider={committedAsrProvider}
+                  mono
+                  mask
+                />
+                <CredentialField
+                  key={`${committedAsrProvider}:access_key`}
+                  label={t('settings.providers.volcengineAccessKeyLabel')}
+                  account="volcengine.access_key"
+                  provider={committedAsrProvider}
+                  mono
+                  mask
+                />
+              </>
+            ) : (
+              <CredentialField
+                key={`${committedAsrProvider}:api_key`}
+                label={t('settings.providers.volcengineApiKeyLabel')}
+                account="volcengine.api_key"
+                provider={committedAsrProvider}
+                mono
+                mask
+              />
+            )}
             <CredentialField
               key={`${committedAsrProvider}:resource_id`}
               label={t('settings.providers.volcengineResourceIdLabel')}
@@ -483,7 +583,9 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
               mono
               placeholder={ASR_DEFAULT_RESOURCE_ID} defaultValue={ASR_DEFAULT_RESOURCE_ID} />
             <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ol-ink-4)', lineHeight: 1.6 }}>
-              {t('settings.providers.volcengineMappingNote')}
+              {volcengineAuthMode === 'api_key'
+                ? t('settings.providers.volcengineApiKeyNote')
+                : t('settings.providers.volcengineMappingNote')}
             </div>
           </>
         ) : committedAsrProvider === 'local-qwen3' || committedAsrProvider === 'foundry-local-whisper' || committedAsrProvider === 'sherpa-onnx-local' || committedAsrProvider === 'apple-speech' ? (
@@ -502,7 +604,12 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
             <CredentialField key={`${committedAsrProvider}:model:${asrModelRevision}`} label={t('settings.providers.modelLabel')} account="asr.model"
               provider={committedAsrProvider}
               placeholder={unifiedBailian ? 'fun-asr-realtime' : (asrPreset?.model || 'whisper-1')}
-              onValueChange={unifiedBailian ? setBailianModel : undefined} />
+              onValueChange={unifiedBailian ? setBailianModel : undefined}
+              options={unifiedBailian
+                ? BAILIAN_ASR_MODELS.map(m => ({ value: m, label: m }))
+                : WHISPER_COMPAT_ASR_PROVIDERS.includes(committedAsrProvider)
+                  ? OPENAI_COMPAT_ASR_MODELS.map(m => ({ value: m, label: m }))
+                  : undefined} />
             {unifiedBailian && (
               <BailianProtocolHint key={`${committedAsrProvider}:proto:${asrModelRevision}`} currentModel={bailianModel} />
             )}
@@ -538,13 +645,22 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
 
 // 统一「阿里云百炼」下,按模型名判断走哪种协议(与后端
 // coordinator::resolve_effective_asr_provider 保持一致):qwen3-asr-flash-realtime* 与
-// fun-asr-realtime* 与 fun-asr-flash-8k-realtime* 都是实时模型；当前支持的
-// fun-asr-flash-2026-06-15 是「录音文件·说完转写」。
-function bailianModelIsRecordedFile(model: string): boolean {
+// fun-asr-realtime* 与 fun-asr-flash-8k-realtime* 都是实时模型；fun-asr-flash-2026-06-15
+// 与 qwen-audio-3.0-asr-flash 是「录音文件·说完转写」（同步）。
+function bailianModelProtocol(model: string): 'realtime' | 'sync' | 'async' {
   const m = model.trim();
-  return m === 'fun-asr-flash-2026-06-15';
+  if (!m || m.includes('realtime')) return 'realtime';
+  // qwen3-asr-flash-filetrans 仅接受公网 URL，暂不支持（后端 protocol_for_model
+  // 显式拒绝），前端不再归为 async 提示。
+  if (m === 'fun-asr'
+    || m.startsWith('fun-asr-') && !m.startsWith('fun-asr-flash')
+    || m.startsWith('paraformer')) return 'async';
+  // 其余（fun-asr-flash-*、qwen3-asr-flash、qwen-audio-3.0-asr-flash）为同步录音模型。
+  return 'sync';
 }
 
+// qwen-audio-3.0-asr-flash 官方支持热词，但批量协议尚未把该设置写入请求体；
+// 在后端接入前不展示一个实际不生效的热词输入框。
 function bailianModelSupportsVocabulary(model: string): boolean {
   const m = model.trim();
   return !m
@@ -571,9 +687,12 @@ function BailianProtocolHint({ currentModel }: { currentModel: string }) {
     setModel(currentModel || 'fun-asr-realtime');
   }, [currentModel]);
 
-  const hint = bailianModelIsRecordedFile(model)
-    ? t('settings.providers.bailianModelRecordedFileHint')
-    : t('settings.providers.bailianModelRealtimeHint');
+  const protocol = bailianModelProtocol(model);
+  const hint = protocol === 'realtime'
+    ? t('settings.providers.bailianModelRealtimeHint')
+    : protocol === 'async'
+      ? t('settings.providers.bailianModelAsyncFileHint')
+      : t('settings.providers.bailianModelSyncFileHint');
 
   return (
     <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ol-ink-4)', lineHeight: 1.6 }}>
@@ -698,6 +817,9 @@ function providerErrorMessage(error: unknown, t: ReturnType<typeof useTranslatio
   if (message.includes('API Key')) return t('settings.providers.apiKeyMissing');
   if (message.includes('Endpoint')) return t('settings.providers.endpointMissing');
   if (message.includes('timeout') || message.includes('超时')) return t('settings.providers.requestTimeout');
+  if (message.startsWith('task failed:') || message.startsWith('connection failed:') || message.startsWith('send failed:')) {
+    return message;
+  }
   return t('common.operationFailed');
 }
 
@@ -713,9 +835,11 @@ interface CredentialFieldProps {
   defaultValue?: string;
   trailing?: ReactNode;
   onValueChange?: (value: string) => void;
+  /** 提供则渲染为下拉（预设选择）代替输入框；当前值不在预设里时附加为自定义项。 */
+  options?: SelectOption[];
 }
 
-function CredentialField({ label, account, provider, placeholder, mono, mask, defaultValue, trailing, onValueChange }: CredentialFieldProps) {
+function CredentialField({ label, account, provider, placeholder, mono, mask, defaultValue, trailing, onValueChange, options }: CredentialFieldProps) {
   const { t } = useTranslation();
   const mobile = useMobileLayout();
   const [value, setValue] = useState('');
@@ -723,6 +847,8 @@ function CredentialField({ label, account, provider, placeholder, mono, mask, de
   const [loaded, setLoaded] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [status, setStatus] = useState<CredentialFieldStatus>('idle');
+  // 预设下拉的「自定义模型…」逃生口：选中后切回输入框，保证后端支持的任意模型名都能手输。
+  const [customModelMode, setCustomModelMode] = useState(false);
   const debounceRef = useRef<number | null>(null);
   const statusRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
@@ -853,15 +979,52 @@ function CredentialField({ label, account, provider, placeholder, mono, mask, de
     <SettingRow label={label}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5, width: '100%', maxWidth: mobile ? '100%' : 420 }}>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%', flexWrap: mobile ? 'wrap' : 'nowrap' }}>
-          <input
-            type={inputType}
-            value={value}
-            placeholder={loaded ? placeholder : t('common.loading')}
-            onChange={handleChange}
-            onBlur={onBlur}
-            disabled={disabled}
-            style={{ ...inputStyle, flex: mobile ? '1 1 180px' : 1, minWidth: 0, maxWidth: '100%', fontFamily: mono ? 'var(--ol-font-mono)' : 'inherit' }}
-          />
+          {options && !customModelMode ? (
+            <SelectLite
+              value={value}
+              onChange={(v) => {
+                // 「自定义模型…」逃生口：切回输入框手输任意模型名。
+                if (v === CUSTOM_MODEL_OPTION_VALUE) {
+                  setCustomModelMode(true);
+                  return;
+                }
+                setValue(v);
+                onValueChange?.(v);
+                if (!loaded) return;
+                setDirty(true);
+                void save(v, true);
+              }}
+              options={[
+                ...(value && !options.some(o => o.value === value) ? [{ value, label: value }] : []),
+                ...options,
+                { value: CUSTOM_MODEL_OPTION_VALUE, label: t('settings.providers.customModelLabel', 'Custom model…') },
+              ]}
+              placeholder={loaded ? placeholder : t('common.loading')}
+              disabled={disabled}
+              ariaLabel={label}
+              style={{ ...inputStyle, flex: mobile ? '1 1 180px' : 1, minWidth: 0, maxWidth: '100%', fontFamily: mono ? 'var(--ol-font-mono)' : 'inherit' }}
+            />
+          ) : (
+            <input
+              type={inputType}
+              value={value}
+              placeholder={loaded ? placeholder : t('common.loading')}
+              onChange={handleChange}
+              onBlur={onBlur}
+              disabled={disabled}
+              style={{ ...inputStyle, flex: mobile ? '1 1 180px' : 1, minWidth: 0, maxWidth: '100%', fontFamily: mono ? 'var(--ol-font-mono)' : 'inherit' }}
+            />
+          )}
+          {options && customModelMode && (
+            <button
+              onClick={() => setCustomModelMode(false)}
+              title={t('settings.providers.presetListLabel', 'Back to presets')}
+              style={iconBtnStyle}
+              disabled={disabled}
+            >
+              <Icon name="chevDown" size={13} />
+            </button>
+          )}
           {defaultValue && !value && loaded && (
             <button onClick={fillDefault} title={t('settings.providers.fillDefault')} style={iconBtnStyle} disabled={!loaded}>
               <Icon name="check" size={13} />

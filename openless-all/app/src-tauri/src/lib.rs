@@ -216,6 +216,14 @@ macro_rules! app_invoke_handler_desktop {
             commands::handle_window_hotkey_event,
             #[cfg(debug_assertions)]
             commands::inject_hotkey_click_for_dev,
+            #[cfg(debug_assertions)]
+            commands::run_selection_polish_for_dev,
+            #[cfg(not(mobile))]
+            commands::get_selection_polish_preview,
+            #[cfg(not(mobile))]
+            commands::confirm_selection_polish_preview,
+            #[cfg(not(mobile))]
+            commands::cancel_selection_polish_preview,
             commands::repolish,
             commands::list_style_packs,
             commands::create_style_pack_from_template,
@@ -240,6 +248,7 @@ macro_rules! app_invoke_handler_desktop {
             commands::set_active_llm_provider,
             commands::get_qa_hotkey_label,
             commands::set_qa_hotkey,
+            commands::set_selection_polish_hotkey,
             commands::validate_shortcut_binding,
             commands::set_dictation_hotkey,
             commands::set_translation_hotkey,
@@ -750,6 +759,7 @@ fn run_desktop() {
                 let coordinator = app.state::<Arc<coordinator::Coordinator>>();
                 // 同步启动 QA hotkey listener。和 dictation hotkey 平行，互不抢状态。
                 coordinator.start_qa_hotkey_listener();
+                coordinator.start_selection_polish_hotkey_listener();
                 // 启动「快速 Agent」双热键监听（功能默认关闭，启用后才注册）。
                 coordinator.start_coding_agent_hotkey_listener();
                 // 启动自定义组合键监听器。当 trigger == Custom 时替代 modifier-only 监听器。
@@ -773,6 +783,7 @@ fn run_desktop() {
                 let coordinator = app.state::<Arc<coordinator::Coordinator>>();
                 coordinator.stop_hotkey_listener();
                 coordinator.stop_qa_hotkey_listener();
+                coordinator.stop_selection_polish_hotkey_listener();
                 coordinator.stop_coding_agent_hotkey_listener();
                 coordinator.stop_combo_hotkey_listener();
                 coordinator.stop_translation_hotkey_listener();
@@ -1312,13 +1323,18 @@ fn reset_tcc_service_for_restart(service: &str, reason: &str) {
 }
 
 /// 把日志同时写到 stderr + ~/Library/Logs/OpenLess/openless.log（match Swift `Log.swift`）。
-fn init_file_logger() {
+pub(crate) fn init_file_logger() {
     use simplelog::{
         ColorChoice, CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode,
         WriteLogger,
     };
     let log_dir = log_dir_path();
-    let _ = std::fs::create_dir_all(&log_dir);
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "[logger] WARN create log dir failed path={}: {e}",
+            log_dir.display()
+        );
+    }
     let log_file = log_dir.join("openless.log");
     if let Err(e) = rotate_log_if_too_large(&log_file) {
         eprintln!("[logger] WARN 日志轮转失败: {e}");
@@ -1330,12 +1346,21 @@ fn init_file_logger() {
         TerminalMode::Mixed,
         ColorChoice::Auto,
     )];
-    if let Ok(file) = std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_file)
     {
-        loggers.push(WriteLogger::new(LevelFilter::Info, config, file));
+        Ok(file) => {
+            loggers.push(WriteLogger::new(LevelFilter::Info, config, file));
+            eprintln!("[logger] file logger ready path={}", log_file.display());
+        }
+        Err(e) => {
+            eprintln!(
+                "[logger] ERROR open log file failed path={}: {e}",
+                log_file.display()
+            );
+        }
     }
     let _ = CombinedLogger::init(loggers);
 }
@@ -1387,11 +1412,17 @@ pub fn log_dir_path() -> std::path::PathBuf {
     }
     #[cfg(target_os = "android")]
     {
-        if let Ok(dir) = std::env::var("TAURI_ANDROID_APP_DATA_DIR") {
-            return std::path::PathBuf::from(dir).join("logs");
+        // Prefer cached JNI filesDir/logs; never use /data/local/tmp.
+        if let Ok(dir) = crate::persistence::android_log_dir() {
+            return dir;
         }
+        eprintln!("[logger] ERROR android_log_dir unavailable; file logging disabled");
+        return std::path::PathBuf::from("/__openless_android_log_uninitialized__");
     }
-    std::env::temp_dir().join("OpenLess")
+    #[cfg(not(target_os = "android"))]
+    {
+        std::env::temp_dir().join("OpenLess")
+    }
 }
 
 pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
@@ -2220,17 +2251,17 @@ fn ensure_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<tauri::Webv
     }
     let built = WebviewWindowBuilder::new(app, "qa", WebviewUrl::App("index.html?window=qa".into()))
         .title("OpenLess QA")
-        .inner_size(QA_WINDOW_WIDTH, QA_WINDOW_HEIGHT)
-        .decorations(false)
-        .transparent(true)
-        .shadow(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .focused(false)
-        .visible(false)
-        .accept_first_mouse(true)
-        .build();
+            .inner_size(QA_WINDOW_WIDTH, QA_WINDOW_HEIGHT)
+            .decorations(false)
+            .transparent(true)
+            .shadow(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .focused(false)
+            .visible(false)
+            .accept_first_mouse(true)
+            .build();
     match built {
         Ok(w) => {
             // ⚠️ NSWindow 操作必须在主线程（macOS 26 硬约束）。ensure_qa_window 常从
@@ -2375,6 +2406,57 @@ pub(crate) fn hide_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) {
     hide_chat_window_animated(app, "qa", &QA_PANEL_EPOCH);
 }
 
+/// 选区润色预览是独立、可编辑的小窗：模型结果不会直接覆盖，用户确认后才回到原选区粘贴。
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn ensure_selection_polish_preview_window<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Option<tauri::WebviewWindow<R>> {
+    if let Some(window) = app.get_webview_window("selection-polish-preview") {
+        return Some(window);
+    }
+    WebviewWindowBuilder::new(
+        app,
+        "selection-polish-preview",
+        WebviewUrl::App("index.html?window=selection-polish-preview".into()),
+    )
+    .title("OpenLess 选区润色预览")
+    .inner_size(640.0, 440.0)
+    .min_inner_size(480.0, 320.0)
+    .resizable(true)
+    .always_on_top(true)
+    .visible(false)
+    .build()
+    .map(Some)
+    .unwrap_or_else(|error| {
+        log::warn!("[selection-polish] create preview window failed: {error}");
+        None
+    })
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn show_selection_polish_preview<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let Some(window) = ensure_selection_polish_preview_window(app) else {
+        return;
+    };
+    if let Err(error) = window.show() {
+        log::warn!("[selection-polish] show preview failed: {error}");
+        return;
+    }
+    if let Err(error) = window.set_focus() {
+        log::warn!("[selection-polish] focus preview failed: {error}");
+    }
+    let _ = app.emit_to("selection-polish-preview", "selection-polish-preview:shown", ());
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) fn show_selection_polish_preview<R: tauri::Runtime>(_app: &AppHandle<R>) {}
+
+pub(crate) fn hide_selection_polish_preview<R: tauri::Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("selection-polish-preview") {
+        let _ = window.hide();
+    }
+}
+
 // ───────────────────────── Less Computer 浮窗 ─────────────────────────
 //
 // Less Computer 语音 Agent 的聊天浮窗（窗口 label = "less-computer"）。
@@ -2507,6 +2589,7 @@ pub(crate) fn show_less_computer_glow<R: tauri::Runtime>(app: &AppHandle<R>) {
     // issue #470：通知 glow 前端「可见」，恢复发光动画（隐藏时会 emit(false) 卸载发光层以释放 GPU）。
     let _ = window.emit("less-computer-glow:active", true);
     let window_clone = window.clone();
+    let app_for_reassert = app.clone();
     let _ = app.run_on_main_thread(move || {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
@@ -2519,11 +2602,32 @@ pub(crate) fn show_less_computer_glow<R: tauri::Runtime>(app: &AppHandle<R>) {
                     unsafe {
                         // 抬到菜单栏(24)/Dock 之上，让描边能真正贴到屏幕最外缘（含顶部菜单栏区域）。
                         let _: () = msg_send![ns, setLevel: 25i64];
-                        // 所有 Space 都显示、不参与窗口循环、全屏 app 上也叠加。
-                        let _: () = msg_send![ns, setCollectionBehavior: 273u64];
+                        // 所有 Space 都显示、不参与窗口循环、全屏 app 上也叠加（273 =
+                        // CanJoinAllSpaces|Stationary|FullScreenAuxiliary）。macOS 26 会在
+                        // 运行中把窗口从「全 Space 贴附」剥离且同值写入救不回（详见
+                        // show_capsule_window_no_activate 的重注册注释）；glow show 频率低，
+                        // 每次都走重注册序列：先以去掉 CanJoinAllSpaces 位的 272 上屏，
+                        // 下一个 tick 再写 273 —— 可见状态下的位翻转才触发重新注册。
+                        let _: () = msg_send![ns, setCollectionBehavior: 272u64];
                         let _: () = msg_send![ns, setIgnoresMouseEvents: true];
                         let _: () = msg_send![ns, orderFrontRegardless];
                     }
+                    let window_for_reassert = window_clone.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        let _ = app_for_reassert.run_on_main_thread(move || {
+                            let Ok(handle) = window_for_reassert.ns_window() else {
+                                return;
+                            };
+                            let ns = handle as *mut AnyObject;
+                            if ns.is_null() {
+                                return;
+                            }
+                            unsafe {
+                                let _: () = msg_send![ns, setCollectionBehavior: 273u64];
+                            }
+                        });
+                    });
                 }
             }
             Err(_) => {

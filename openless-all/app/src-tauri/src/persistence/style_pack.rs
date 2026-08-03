@@ -55,6 +55,12 @@ impl StylePackStore {
 
         let mut prefs_snapshot = prefs.get();
         let mut changed = migrate_style_packs_from_preferences(&mut packs, &prefs_snapshot);
+        // 内置包版本对账：代码内置包 version 高于本地副本时用官方覆盖——内置提示词
+        // 升级（如「清晰结构」v3.0 Beta）随 app 更新推向所有已安装用户。保留用户对
+        // enabled 的设置；本地缺失的内置包直接补入。
+        if reconcile_builtin_packs(&mut packs) {
+            changed = true;
+        }
         if ensure_at_least_one_style_pack_enabled(&mut packs) {
             changed = true;
         }
@@ -82,12 +88,12 @@ impl StylePackStore {
         })
     }
 
-    /// 降级实例：data_dir 不可用时使用临时路径和空列表，写操作会安静地失败。
+    /// 降级实例：data_dir 不可用时使用空列表。
+    /// Android 使用空 path（内存态），禁止落 `/data/local/tmp`。
     pub(crate) fn new_fallback() -> Self {
-        let tmp = std::env::temp_dir();
         Self {
-            path: tmp.join("openless_style_packs_fallback.json"),
-            asset_root: tmp.join("openless_style_pack_assets_fallback"),
+            path: super::fallback_store_path("openless_style_packs_fallback.json"),
+            asset_root: super::fallback_store_path("openless_style_pack_assets_fallback"),
             state: Mutex::new(Vec::new()),
         }
     }
@@ -122,9 +128,11 @@ impl StylePackStore {
         {
             return Ok(pack);
         }
+        // 产品默认包是「清晰结构」（default_active_style_pack_id）；用户激活的包
+        // 被禁用时优先落回它，与默认保持一致，最后才用任意 enabled 包兜底。
         if let Some(pack) = packs
             .iter()
-            .find(|pack| pack.id == BUILTIN_STYLE_PACK_LIGHT_ID && pack.enabled)
+            .find(|pack| pack.id == default_active_style_pack_id() && pack.enabled)
             .cloned()
         {
             return Ok(pack);
@@ -306,6 +314,7 @@ impl StylePackStore {
             version: normalize_version(&manifest.version),
             kind: StylePackKind::Imported,
             base_mode: manifest.base_mode,
+            selection_prompt: manifest.selection_prompt.unwrap_or_default(),
             prompt: parsed.prompt,
             examples: parsed.examples,
             tags: normalize_tags(&manifest.tags),
@@ -372,6 +381,7 @@ impl StylePackStore {
             author: pack.author.clone(),
             version: pack.version.clone(),
             base_mode: pack.base_mode,
+            selection_prompt: (!pack.selection_prompt.trim().is_empty()).then(|| pack.selection_prompt.clone()),
             tags: pack.tags.clone(),
             prompt_file: "prompt.md".into(),
             examples_file: "examples.json".into(),
@@ -462,6 +472,12 @@ fn migrate_style_packs_from_preferences(
                 pack.prompt = builtin.prompt.clone();
                 changed = true;
             }
+            // v1 风格包没有选区书面文本 Prompt 字段；为空时填充内置默认值，
+            // 非空内容（含用户自定义）一律保留。
+            if pack.selection_prompt.trim().is_empty() {
+                pack.selection_prompt = builtin.selection_prompt.clone();
+                changed = true;
+            }
             if pack.examples.is_empty() {
                 pack.examples = builtin.examples.clone();
                 changed = true;
@@ -542,10 +558,61 @@ fn ensure_at_least_one_style_pack_enabled(packs: &mut [StylePack]) -> bool {
     false
 }
 
+/// 内置包版本对账：官方版本更高 → 仅推进 prompt 与 version（描述/示例/tags 等
+/// 用户自定义和 enabled 状态全部保留）。缺失的内置包直接补入。
+/// 返回是否有任何包被推进 / 补入。
+fn reconcile_builtin_packs(packs: &mut Vec<StylePack>) -> bool {
+    let mut changed = false;
+    for builtin in crate::types::builtin_style_packs() {
+        if let Some(local) = packs.iter_mut().find(|pack| pack.id == builtin.id) {
+            if pack_version_newer(&builtin.version, &local.version) {
+                log::info!(
+                    "[style-pack] builtin {} prompt upgraded {} -> {} (prompt-only)",
+                    local.id,
+                    local.version,
+                    builtin.version
+                );
+                local.version = builtin.version.clone();
+                local.prompt = builtin.prompt.clone();
+                local.updated_at = Some(Utc::now().to_rfc3339());
+                changed = true;
+            }
+        } else {
+            packs.push(builtin);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// "X.Y.Z" 数值分段比较。pre-release 后缀（-beta 等）先切掉：pre-release 视为
+/// 与正式版同级，不判为更新（与 semver 直觉一致）。
+fn pack_version_newer(a: &str, b: &str) -> bool {
+    fn numeric_parts(v: &str) -> Vec<u64> {
+        v.split('-')
+            .next()
+            .unwrap_or(v)
+            .split('.')
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect()
+    }
+    let (pa, pb) = (numeric_parts(a), numeric_parts(b));
+    for i in 0..pa.len().max(pb.len()) {
+        let x = pa.get(i).copied().unwrap_or(0);
+        let y = pb.get(i).copied().unwrap_or(0);
+        if x == y {
+            continue;
+        }
+        return x > y;
+    }
+    false
+}
+
 pub fn sync_style_pack_preferences(prefs: &mut UserPreferences, packs: &[StylePack]) -> bool {
     let previous_active_style_pack_id = prefs.active_style_pack_id.clone();
     let previous_default_mode = prefs.default_mode;
     let previous_enabled_modes = prefs.enabled_modes.clone();
+    let previous_selection_style_pack_id = prefs.selection_polish_style_pack_id.clone();
     let enabled: Vec<&StylePack> = packs.iter().filter(|pack| pack.enabled).collect();
     let active = packs
         .iter()
@@ -570,6 +637,10 @@ pub fn sync_style_pack_preferences(prefs: &mut UserPreferences, packs: &[StylePa
         prefs.default_mode = active_pack.base_mode;
         changed = true;
     }
+    if !packs.iter().any(|pack| pack.id == prefs.selection_polish_style_pack_id && pack.enabled) {
+        prefs.selection_polish_style_pack_id = active_pack.id.clone();
+        changed = true;
+    }
 
     let next_enabled_modes = enabled_modes_from_style_packs(packs);
     if prefs.enabled_modes != next_enabled_modes {
@@ -583,9 +654,11 @@ pub fn sync_style_pack_preferences(prefs: &mut UserPreferences, packs: &[StylePa
 
     if changed {
         log::info!(
-            "[style-pack] sync_prefs active:{}->{} default_mode:{:?}->{:?} enabled_modes:{:?}->{:?}",
+            "[style-pack] sync_prefs active:{}->{} selection:{}->{} default_mode:{:?}->{:?} enabled_modes:{:?}->{:?}",
             previous_active_style_pack_id,
             prefs.active_style_pack_id,
+            previous_selection_style_pack_id,
+            prefs.selection_polish_style_pack_id,
             previous_default_mode,
             prefs.default_mode,
             previous_enabled_modes,
@@ -675,6 +748,7 @@ fn merge_style_pack_update(existing: StylePack, incoming: StylePack) -> Result<S
     updated.description = incoming.description.trim().to_string();
     updated.author = normalize_optional_text(incoming.author);
     updated.version = normalize_version(&incoming.version);
+    updated.selection_prompt = incoming.selection_prompt;
     updated.prompt = incoming.prompt;
     updated.examples = normalize_examples(incoming.examples);
     updated.tags = normalize_tags(&incoming.tags);
@@ -781,6 +855,9 @@ fn sanitize_style_pack_id(requested_id: &str) -> String {
 }
 
 fn remove_style_pack_assets(asset_root: &Path, pack: &StylePack) {
+    if asset_root.as_os_str().is_empty() {
+        return;
+    }
     if let Some(icon_path) = pack.icon_path.as_deref() {
         let path = Path::new(icon_path);
         let _ = fs::remove_file(path);

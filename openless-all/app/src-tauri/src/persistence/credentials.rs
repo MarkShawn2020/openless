@@ -213,6 +213,12 @@ struct CredsAsrEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     resourceId: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    authMode: Option<String>,
+    /// 方舟（Ark）API Key —— 仅 `api_key` 鉴权模式使用，与旧版 Access Token 槽位
+    /// (`accessKey`) 隔离，避免两模式切换时残留凭据互相污染。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volcengineApiKey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     vocabularyId: Option<String>,
 }
 
@@ -224,6 +230,8 @@ impl CredsAsrEntry {
             && self.appKey.as_deref().unwrap_or("").is_empty()
             && self.accessKey.as_deref().unwrap_or("").is_empty()
             && self.resourceId.as_deref().unwrap_or("").is_empty()
+            && self.authMode.as_deref().unwrap_or("").is_empty()
+            && self.volcengineApiKey.as_deref().unwrap_or("").is_empty()
             && self.vocabularyId.as_deref().unwrap_or("").is_empty()
     }
 }
@@ -268,6 +276,26 @@ fn active_llm_extra_headers(root: &CredsRoot) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+fn is_valid_llm_temperature(temperature: f64) -> bool {
+    temperature.is_finite() && (0.0..=2.0).contains(&temperature)
+}
+
+fn active_llm_temperature_value(root: &CredsRoot) -> Option<f64> {
+    root.providers
+        .llm
+        .get(&root.active.llm)
+        .and_then(|entry| entry.temperature)
+        .filter(|temperature| is_valid_llm_temperature(*temperature))
+}
+
+fn active_llm_temperature(root: &CredsRoot) -> Option<f32> {
+    active_llm_temperature_value(root).map(|temperature| temperature as f32)
+}
+
+fn active_llm_temperature_string(root: &CredsRoot) -> Option<String> {
+    active_llm_temperature_value(root).map(|temperature| temperature.to_string())
+}
+
 fn active_llm_extra_headers_json(root: &CredsRoot) -> Result<Option<String>> {
     let headers = active_llm_extra_headers(root);
     if headers.is_empty() {
@@ -308,6 +336,21 @@ fn parse_extra_headers_json(value: &str) -> Result<HashMap<String, String>> {
         headers.insert(key.to_string(), value.to_string());
     }
     Ok(headers)
+}
+
+fn parse_llm_temperature(value: &str) -> Result<Option<f64>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let temperature: f64 = trimmed.parse().context("temperature must be a number")?;
+    if !is_valid_llm_temperature(temperature) {
+        if !temperature.is_finite() {
+            anyhow::bail!("temperature must be finite");
+        }
+        anyhow::bail!("temperature must be between 0 and 2");
+    }
+    Ok(Some(temperature))
 }
 
 fn is_valid_header_name(name: &str) -> bool {
@@ -1074,6 +1117,8 @@ fn lookup_account(root: &CredsRoot, account: CredentialAccount) -> Option<String
         }
         CredentialAccount::VolcengineAccessKey => asr.and_then(|e| pick(&e.accessKey)),
         CredentialAccount::VolcengineResourceId => asr.and_then(|e| pick(&e.resourceId)),
+        CredentialAccount::VolcengineAuthMode => asr.and_then(|e| pick(&e.authMode)),
+        CredentialAccount::VolcengineApiKey => asr.and_then(|e| pick(&e.volcengineApiKey)),
         CredentialAccount::ArkApiKey => llm.and_then(|e| pick(&e.apiKey)),
         CredentialAccount::ArkModelId => llm.and_then(|e| pick(&e.model)),
         CredentialAccount::ArkEndpoint => llm.and_then(|e| pick(&e.baseURL)),
@@ -1100,6 +1145,14 @@ fn write_account(root: &mut CredsRoot, account: CredentialAccount, value: Option
         CredentialAccount::VolcengineResourceId => {
             let entry = root.providers.asr.entry(asr_id).or_default();
             entry.resourceId = normalized;
+        }
+        CredentialAccount::VolcengineAuthMode => {
+            let entry = root.providers.asr.entry(asr_id).or_default();
+            entry.authMode = normalized;
+        }
+        CredentialAccount::VolcengineApiKey => {
+            let entry = root.providers.asr.entry(asr_id).or_default();
+            entry.volcengineApiKey = normalized;
         }
         CredentialAccount::ArkApiKey => {
             let entry = root.providers.llm.entry(llm_id).or_default();
@@ -1137,6 +1190,9 @@ pub enum CredentialAccount {
     VolcengineAppKey,
     VolcengineAccessKey,
     VolcengineResourceId,
+    VolcengineAuthMode,
+    /// 方舟（Ark）语音模型 API Key（`api_key` 鉴权模式使用，独立于旧版 Access Token 槽位）。
+    VolcengineApiKey,
     ArkApiKey,
     ArkModelId,
     ArkEndpoint,
@@ -1159,6 +1215,8 @@ impl CredentialAccount {
             CredentialAccount::VolcengineAppKey => "volcengine.app_key",
             CredentialAccount::VolcengineAccessKey => "volcengine.access_key",
             CredentialAccount::VolcengineResourceId => "volcengine.resource_id",
+            CredentialAccount::VolcengineAuthMode => "volcengine.auth_mode",
+            CredentialAccount::VolcengineApiKey => "volcengine.api_key",
             CredentialAccount::ArkApiKey => "ark.api_key",
             CredentialAccount::ArkModelId => "ark.model_id",
             CredentialAccount::ArkEndpoint => "ark.endpoint",
@@ -1174,6 +1232,8 @@ impl CredentialAccount {
             CredentialAccount::VolcengineAppKey,
             CredentialAccount::VolcengineAccessKey,
             CredentialAccount::VolcengineResourceId,
+            CredentialAccount::VolcengineAuthMode,
+            CredentialAccount::VolcengineApiKey,
             CredentialAccount::ArkApiKey,
             CredentialAccount::ArkModelId,
             CredentialAccount::ArkEndpoint,
@@ -1191,6 +1251,8 @@ pub struct CredentialsSnapshot {
     pub volcengine_app_key: Option<String>,
     pub volcengine_access_key: Option<String>,
     pub volcengine_resource_id: Option<String>,
+    pub volcengine_auth_mode: Option<String>,
+    pub volcengine_api_key: Option<String>,
     pub asr_api_key: Option<String>,
     pub asr_endpoint: Option<String>,
     pub asr_model: Option<String>,
@@ -1370,6 +1432,25 @@ impl CredentialsVault {
         active_llm_extra_headers_json(&load_credentials())
     }
 
+    pub fn get_active_llm_temperature() -> Option<f32> {
+        let _guard = credentials_lock().lock();
+        active_llm_temperature(&load_credentials())
+    }
+
+    pub fn get_active_llm_temperature_string() -> Option<String> {
+        let _guard = credentials_lock().lock();
+        active_llm_temperature_string(&load_credentials())
+    }
+
+    pub fn set_active_llm_temperature(value: &str) -> Result<()> {
+        let _guard = credentials_lock().lock();
+        let temperature = parse_llm_temperature(value)?;
+        let mut root = load_credentials_for_update()?;
+        let entry = root.providers.llm.entry(root.active.llm.clone()).or_default();
+        entry.temperature = temperature;
+        save_credentials(&root)
+    }
+
     pub fn set_active_llm_extra_headers_json(value: &str) -> Result<()> {
         let _guard = credentials_lock().lock();
         let headers = parse_extra_headers_json(value)?;
@@ -1390,6 +1471,8 @@ impl CredentialsVault {
             volcengine_app_key: lookup_account(&root, CredentialAccount::VolcengineAppKey),
             volcengine_access_key: lookup_account(&root, CredentialAccount::VolcengineAccessKey),
             volcengine_resource_id: lookup_account(&root, CredentialAccount::VolcengineResourceId),
+            volcengine_auth_mode: lookup_account(&root, CredentialAccount::VolcengineAuthMode),
+            volcengine_api_key: lookup_account(&root, CredentialAccount::VolcengineApiKey),
             asr_api_key: lookup_account(&root, CredentialAccount::AsrApiKey),
             asr_endpoint: lookup_account(&root, CredentialAccount::AsrEndpoint),
             asr_model: lookup_account(&root, CredentialAccount::AsrModel),
@@ -1406,7 +1489,7 @@ mod tests {
         android_persistable_credentials, chunk_json_payload, credentials_cache,
         get_android_marketplace_token_at, load_android_credentials_from_path,
         load_android_credentials_from_path_with_crypto, load_android_credentials_into_cache_with,
-        lookup_marketplace_github_token, parse_extra_headers_json,
+        lookup_marketplace_github_token, parse_extra_headers_json, parse_llm_temperature,
         reset_credentials_cache_for_tests, write_marketplace_github_token, CredsRoot,
         MarketplaceGithubToken, KEYRING_CHUNK_MAX_UTF16_UNITS,
     };
@@ -1715,5 +1798,53 @@ mod tests {
         assert_android_secret_unrecoverable(&path, "gho_legacy_startup_secret");
         *credentials_cache().lock() = Some(CredsRoot::default());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parse_llm_temperature_accepts_empty_and_valid_range() {
+        assert_eq!(parse_llm_temperature("").unwrap(), None);
+        assert_eq!(parse_llm_temperature(" 0.3 ").unwrap(), Some(0.3));
+        assert_eq!(parse_llm_temperature("2").unwrap(), Some(2.0));
+    }
+
+    #[test]
+    fn parse_llm_temperature_rejects_invalid_values() {
+        for value in ["abc", "-0.1", "2.1", "NaN", "inf"] {
+            assert!(
+                parse_llm_temperature(value).is_err(),
+                "{value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn active_llm_temperature_ignores_invalid_persisted_values() {
+        for temperature in [-0.1, 2.5] {
+            let mut root = CredsRoot::default();
+            root.providers.llm.insert(
+                root.active.llm.clone(),
+                super::CredsLlmEntry {
+                    temperature: Some(temperature),
+                    ..Default::default()
+                },
+            );
+
+            assert_eq!(super::active_llm_temperature(&root), None);
+            assert_eq!(super::active_llm_temperature_string(&root), None);
+        }
+
+        let mut root = CredsRoot::default();
+        root.providers.llm.insert(
+            root.active.llm.clone(),
+            super::CredsLlmEntry {
+                temperature: Some(0.7),
+                ..Default::default()
+            },
+        );
+        assert_eq!(super::active_llm_temperature(&root), Some(0.7));
+        assert_eq!(
+            super::active_llm_temperature_string(&root).as_deref(),
+            Some("0.7")
+        );
     }
 }

@@ -160,6 +160,35 @@ pub mod android {
         })
     }
 
+    /// Returns the app-private cache directory supplied by Android's Context.
+    pub(crate) fn app_cache_dir() -> Result<String, String> {
+        with_android_env(|env, context| {
+            let directory = env
+                .call_method(context, "getCacheDir", "()Ljava/io/File;", &[])
+                .and_then(|value| value.l())
+                .map_err(|error| format!("Context.getCacheDir: {error}"))?;
+            if directory.is_null() {
+                return Err("Context.getCacheDir returned null".to_string());
+            }
+            let path = env
+                .call_method(&directory, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                .and_then(|value| value.l())
+                .map_err(|error| format!("File.getAbsolutePath: {error}"))?;
+            if path.is_null() {
+                return Err("Context cache directory has no path".to_string());
+            }
+            let path = env
+                .get_string(&JString::from(path))
+                .map_err(|error| format!("read Context cache directory: {error}"))?
+                .to_string_lossy()
+                .into_owned();
+            if path.is_empty() {
+                return Err("Context cache directory is empty".to_string());
+            }
+            Ok(path)
+        })
+    }
+
     const CREDENTIAL_VAULT_CLASS: &str = "com.openless.app.OpenLessCredentialVault";
     const KEYSTORE_KEY_MISSING: &str = "openless-keystore-key-missing";
     const KEYSTORE_AUTHENTICATION_FAILED: &str = "openless-keystore-authentication-failed";
@@ -924,5 +953,37 @@ pub mod android {
             "(Landroid/content/Context;Ljava/lang/String;)Z",
             &[JValue::Object(context), JValue::Object(path_obj)],
         )
+    }
+
+    /// Write `bytes` to a SAF `content://` URI via Kotlin ContentResolver.
+    pub fn write_content_uri(uri: &str, bytes: &[u8]) -> Result<(), String> {
+        with_android_env(|env, context| {
+            let class = load_context_class(env, context, "com.openless.app.OpenLessContentWriter")?;
+            let uri_obj = jobject_str(env, uri)?;
+            let bytes_array = env
+                .byte_array_from_slice(bytes)
+                .map_err(|error| format!("create byte array for content URI write: {error}"))?;
+            let bytes_obj = JObject::from(bytes_array);
+            let ok = env
+                .call_static_method(
+                    class,
+                    "writeBytes",
+                    "(Landroid/content/Context;Ljava/lang/String;[B)Z",
+                    &[
+                        JValue::Object(context),
+                        JValue::Object(&uri_obj),
+                        JValue::Object(&bytes_obj),
+                    ],
+                )
+                .and_then(|value| value.z())
+                .map_err(|error| {
+                    format!("call OpenLessContentWriter.writeBytes: {error}")
+                })?;
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("写入 content URI 失败：{uri}"))
+            }
+        })
     }
 }

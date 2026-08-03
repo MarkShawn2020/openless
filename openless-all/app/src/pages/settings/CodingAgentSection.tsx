@@ -13,6 +13,7 @@ import {
 } from '../../lib/ipc'
 import type { CodingAgentPermissionMode, CodingAgentProviderId } from '../../lib/types'
 import { useHotkeySettings } from '../../state/HotkeySettingsContext'
+import { SelectLite } from '../../components/ui/SelectLite'
 import { Card } from '../_atoms'
 import { SectionDesc, SectionTitle, SettingRow, Toggle, inputStyle } from './shared'
 
@@ -116,20 +117,22 @@ export function CodingAgentSection() {
         <>
           {/* 「按住说话键」配置已挪到 通用 → 快捷键，避免和这里重复。本区只留后端/模型等高级项。 */}
           <SettingRow label={t('settings.codingAgent.provider')}>
-            <select
+            <SelectLite
               value={prefs.codingAgentProvider}
-              onChange={e =>
+              onChange={v =>
                 void savePrefs({
                   ...prefs,
-                  codingAgentProvider: e.target.value as CodingAgentProviderId,
+                  codingAgentProvider: v as CodingAgentProviderId,
                   codingAgentModel: null,
                 })
               }
-              style={{ ...inputStyle, maxWidth: 240, cursor: 'pointer' }}
-            >
-              <option value="claude-code-cli">Claude Code</option>
-              <option value="opencode-cli">OpenCode</option>
-            </select>
+              options={[
+                { value: 'claude-code-cli', label: 'Claude Code' },
+                { value: 'opencode-cli', label: 'OpenCode' },
+              ]}
+              ariaLabel={t('settings.codingAgent.provider')}
+              style={{ ...inputStyle, maxWidth: 240 }}
+            />
           </SettingRow>
 
           {/* OpenCode 后端：提示安装/登录状态。issue #579。 */}
@@ -149,22 +152,16 @@ export function CodingAgentSection() {
           )}
 
           <SettingRow label={t('settings.codingConsole.permissionMode')}>
-            <select
+            <SelectLite
               value={prefs.codingAgentPermissionMode}
-              onChange={e =>
-                void savePrefs({
-                  ...prefs,
-                  codingAgentPermissionMode: e.target.value as CodingAgentPermissionMode,
-                })
-              }
-              style={{ ...inputStyle, maxWidth: 240, cursor: 'pointer' }}
-            >
-              {PERMISSION_MODES.map(m => (
-                <option key={m} value={m}>
-                  {t(`settings.codingConsole.mode.${m}`)}
-                </option>
-              ))}
-            </select>
+              onChange={v => void savePrefs({ ...prefs, codingAgentPermissionMode: v as CodingAgentPermissionMode })}
+              options={PERMISSION_MODES.map(m => ({
+                value: m,
+                label: t(`settings.codingConsole.mode.${m}`),
+              }))}
+              ariaLabel={t('settings.codingConsole.permissionMode')}
+              style={{ ...inputStyle, maxWidth: 240 }}
+            />
           </SettingRow>
 
           <SettingRow
@@ -176,7 +173,7 @@ export function CodingAgentSection() {
             )}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <select
+              <SelectLite
                 value={
                   useOpencode
                     ? prefs.codingAgentModel?.includes('/')
@@ -184,34 +181,30 @@ export function CodingAgentSection() {
                       : ''
                     : (prefs.codingAgentModel ?? '')
                 }
-                onChange={e => {
-                  const v = e.target.value
-                  void savePrefs({ ...prefs, codingAgentModel: v === '' ? null : v })
-                }}
-                style={{ ...inputStyle, maxWidth: 300, cursor: 'pointer' }}
-              >
-                {useOpencode ? (
-                  <>
-                    <option value="">{t('settings.codingAgent.opencodeModelDefault')}</option>
-                    {prefs.codingAgentModel?.includes('/') &&
-                      !opencodeModels.includes(prefs.codingAgentModel) && (
-                        <option value={prefs.codingAgentModel}>{prefs.codingAgentModel}</option>
-                      )}
-                    {opencodeModels.map(model => (
-                      <option key={model} value={model}>
-                        {model}
-                      </option>
-                    ))}
-                  </>
-                ) : (
-                  <>
-                    <option value="">{t('settings.codingAgent.modelDefault')}</option>
-                    <option value="haiku">Haiku</option>
-                    <option value="sonnet">Sonnet</option>
-                    <option value="opus">Opus</option>
-                  </>
-                )}
-              </select>
+                onChange={v => void savePrefs({ ...prefs, codingAgentModel: v === '' ? null : v })}
+                options={
+                  useOpencode
+                    ? [
+                        // 空值 = 使用 OpenCode CLI 默认模型。
+                        { value: '', label: t('settings.codingAgent.opencodeModelDefault') },
+                        // 已选但不在拉取结果里的模型仍保留，避免选中项凭空消失。
+                        ...(prefs.codingAgentModel?.includes('/') &&
+                        !opencodeModels.includes(prefs.codingAgentModel)
+                          ? [{ value: prefs.codingAgentModel, label: prefs.codingAgentModel }]
+                          : []),
+                        ...opencodeModels.map(model => ({ value: model, label: model })),
+                      ]
+                    : [
+                        // 空值 = 使用 CLI 默认模型；放回选项里，避免选了具体模型后回不去默认。
+                        { value: '', label: t('settings.codingAgent.modelDefault') },
+                        { value: 'haiku', label: 'Haiku' },
+                        { value: 'sonnet', label: 'Sonnet' },
+                        { value: 'opus', label: 'Opus' },
+                      ]
+                }
+                ariaLabel={t('settings.codingAgent.model')}
+                style={{ ...inputStyle, maxWidth: 300 }}
+              />
               {useOpencode && opencode?.installed && (
                 <button
                   type="button"
