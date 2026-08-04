@@ -199,9 +199,19 @@ export function RecordingInputSection() {
   const [modeThumb, setModeThumb] = useState<{ left: number; width: number } | null>(null);
   const activeMode = prefs?.hotkey.mode;
   useLayoutEffect(() => {
-    const active = activeMode ? modeButtonsRef.current.get(activeMode) : undefined;
-    if (!active) return;
-    setModeThumb({ left: active.offsetLeft, width: active.offsetWidth });
+    const track = modeTrackRef.current;
+    if (!track) return;
+    const measure = () => {
+      const active = activeMode ? modeButtonsRef.current.get(activeMode) : undefined;
+      if (!active) return;
+      setModeThumb({ left: active.offsetLeft, width: active.offsetWidth });
+    };
+    measure();
+    // 语言切换（按钮文案重排）/ 窗口缩放都会改变按钮宽高，ResizeObserver 兜底
+    // 重测，避免 thumb 停在旧位置（pr_agent #912 反馈）。
+    const observer = new ResizeObserver(measure);
+    observer.observe(track);
+    return () => observer.disconnect();
   }, [activeMode, showDesktopHotkey]);
 
   const choices: Array<[HotkeyMode, string]> = [
@@ -309,7 +319,8 @@ export function RecordingInputSection() {
         // 「静音后自动停止」只在切换式（toggle）模式下可用。外层容器恒渲染，
         // 录音方式从按住/自动切到切换式时整组从下方拉出、切走时收回——与开关
         // 控制秒数行的动画同款（grid 0fr→1fr），不再「突然跳出」。收起时内容
-        // 仍在 DOM 里（overflow hidden），动画结束高度归 0、不占布局。
+        // 仍在 DOM 里（overflow hidden），动画结束高度归 0、不占布局；inert
+        // 把折叠态控件移出 tab 顺序与 a11y 树（与 Collapsible 同款，pr_agent 反馈）。
         <div
           style={{
             display: 'grid',
@@ -318,6 +329,8 @@ export function RecordingInputSection() {
               'grid-template-rows 0.22s var(--ol-motion-soft), opacity 0.18s var(--ol-motion-quick)',
             opacity: prefs.hotkey.mode === 'toggle' ? 1 : 0,
           }}
+          {...(prefs.hotkey.mode !== 'toggle' ? { inert: '' } : {})}
+          aria-hidden={prefs.hotkey.mode !== 'toggle'}
         >
           <div style={{ overflow: 'hidden', minHeight: 0 }}>
             <SettingRow
@@ -341,6 +354,8 @@ export function RecordingInputSection() {
                   'grid-template-rows 0.22s var(--ol-motion-soft), opacity 0.18s var(--ol-motion-quick)',
                 opacity: prefs.silenceAutoStopEnabled ? 1 : 0,
               }}
+              {...(!prefs.silenceAutoStopEnabled ? { inert: '' } : {})}
+              aria-hidden={!prefs.silenceAutoStopEnabled}
             >
               <div style={{ overflow: 'hidden', minHeight: 0 }}>
                 <SettingRow label={t('settings.recording.silenceAutoStopSecondsLabel')}>
