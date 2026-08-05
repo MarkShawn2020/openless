@@ -593,16 +593,17 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
               localModelOptions.some(m => m.id === activeModelId && m.isDownloaded)
                 ? `${committedAsrProvider}:${activeModelId}`
                 : asrProvider;
-            // 本地引擎激活但 active 模型不在已下载列表（模型被删）时，value 无匹配
-            // 选项——补引擎兜底项让下拉有显示、可切走。
-            const unmatchedLocalPreset = isLocalAsrPreset(asrValue)
-              ? ASR_PRESETS.find(p => p.id === asrValue)
-              : undefined;
             // 平台不匹配的旧配置（如 Windows 上仍激活 local-qwen3）：补一个选项兜底。
             const hiddenLocalActive: AsrPresetId | null =
               !visibleAsrPresets.some(p => p.id === committedAsrProvider)
                 ? committedAsrProvider
                 : null;
+            // 本地引擎激活但 active 模型不在已下载列表（模型被删）时，value 无匹配
+            // 选项——补引擎兜底项让下拉有显示、可切走。hiddenLocalActive 已兜底时不重复加。
+            const unmatchedLocalPreset =
+              isLocalAsrPreset(asrValue) && !hiddenLocalActive
+                ? ASR_PRESETS.find(p => p.id === asrValue)
+                : undefined;
             const hiddenLocalNameKey = hiddenLocalActive === 'local-qwen3'
               ? 'asrLocalQwen3'
               : hiddenLocalActive === 'foundry-local-whisper'
