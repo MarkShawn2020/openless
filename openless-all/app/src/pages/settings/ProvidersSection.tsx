@@ -24,6 +24,14 @@ import {
   serializeAdvancedAsrConfig,
   type AdvancedAsrConfig,
 } from '../../lib/advancedAsrConfig';
+import {
+  getFoundryLocalAsrCatalog,
+  getSherpaOnnxAsrCatalog,
+  listLocalAsrModels,
+  setFoundryLocalAsrModel,
+  setLocalAsrActiveModel,
+  setSherpaOnnxAsrModel,
+} from '../../lib/localAsr';
 
 function LlmThinkingToggle({ enabled, onToggle }: { enabled: boolean; onToggle: (next: boolean) => void }) {
   const { t } = useTranslation();
@@ -250,6 +258,28 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
   useEffect(() => {
     if (committedAsrProvider !== 'bailian') setBailianModel('');
   }, [committedAsrProvider]);
+  // 本地引擎激活时，ASR 区块展示本地已下载模型（标注「本地下载」），可直接选用。
+  const [localAsrModels, setLocalAsrModels] = useState<{ id: string; isDownloaded: boolean }[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    if (committedAsrProvider === 'local-qwen3') {
+      void listLocalAsrModels().then(models => {
+        if (!cancelled) setLocalAsrModels(models.map(m => ({ id: m.id, isDownloaded: m.isDownloaded })));
+      }).catch(() => { if (!cancelled) setLocalAsrModels([]); });
+    } else if (committedAsrProvider === 'sherpa-onnx-local') {
+      void getSherpaOnnxAsrCatalog().then(catalog => {
+        if (!cancelled) setLocalAsrModels(catalog.map(c => ({ id: c.alias, isDownloaded: c.cached })));
+      }).catch(() => { if (!cancelled) setLocalAsrModels([]); });
+    } else if (committedAsrProvider === 'foundry-local-whisper') {
+      void getFoundryLocalAsrCatalog().then(catalog => {
+        if (!cancelled) setLocalAsrModels(catalog.map(c => ({ id: c.alias, isDownloaded: c.cached })));
+      }).catch(() => { if (!cancelled) setLocalAsrModels([]); });
+    } else {
+      setLocalAsrModels([]);
+    }
+    return () => { cancelled = true; };
+  }, [committedAsrProvider]);
+
   // 本地重引擎（qwen3 / sherpa / foundry）仍只在「高级 → 本地模型」里启用，
   // 防止新手在主下拉误开 CPU 推理。Apple 语音是系统自带、零凭据、轻量，
   // 在 macOS 上直接作为常规选项放进主下拉，方便随时选用 / 切走。
@@ -421,7 +451,7 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
               label: t(`settings.providers.presets.${p.nameKey}`),
             }))}
             ariaLabel={t('settings.providers.providerLabel')}
-            style={{ ...inputStyle, width: '100%', maxWidth: mobile ? '100%' : 200 }}
+            style={{ width: mobile ? '100%' : 200, maxWidth: '100%', minWidth: 0 }}
           />
         </SettingRow>
         {codexOAuthSelected ? (
@@ -511,7 +541,7 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
                       : []),
                   ]}
                   ariaLabel={t('settings.providers.providerLabel')}
-                  style={{ ...inputStyle, width: '100%', maxWidth: mobile ? '100%' : 200 }}
+                  style={{ width: mobile ? '100%' : 200, maxWidth: '100%', minWidth: 0 }}
                 />
                 {hiddenLocalActive && (
                   <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', lineHeight: 1.5 }}>
@@ -546,7 +576,7 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
                   { value: 'api_key', label: t('settings.providers.volcengineAuthModeApiKey') },
                 ]}
                 ariaLabel={t('settings.providers.volcengineAuthModeLabel')}
-                style={{ ...inputStyle, width: '100%', maxWidth: mobile ? '100%' : 260 }}
+                style={{ width: mobile ? '100%' : 260, maxWidth: '100%', minWidth: 0 }}
               />
             </SettingRow>
             {/* 两种模式使用各自独立的凭据槽位：旧版 Access Token（volcengine.access_key）
@@ -615,10 +645,35 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
             </div>
           </>
         ) : committedAsrProvider === 'local-qwen3' || committedAsrProvider === 'foundry-local-whisper' || committedAsrProvider === 'sherpa-onnx-local' || committedAsrProvider === 'apple-speech' ? (
-          // 用户已经在用本地 ASR——dropdown 行的 asrProviderTakenOver 已经把
-          // "在高级中切换或禁用"讲清楚了，body 不再重复。
-          // 模型管理 UI 唯一入口在「高级 → 本地模型」里的 <LocalAsr embedded />。
-          null
+          // 本地引擎激活：直接展示本地已下载模型（标注「本地下载」），可在此选用，
+          // 与「高级 → 本地模型」看板共用同一批模型数据。Apple 语音零模型选择。
+          committedAsrProvider === 'apple-speech' ? (
+            <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ol-ink-4)', lineHeight: 1.6 }}>
+              {t('settings.providers.appleSpeechLocalNote')}
+            </div>
+          ) : (
+            <SettingRow label={t('settings.providers.localModelLabel')}>
+              <SelectLite
+                value={localAsrModels.find(m => m.isDownloaded)?.id ?? ''}
+                onChange={(next) => {
+                  if (committedAsrProvider === 'local-qwen3') {
+                    void setLocalAsrActiveModel(next);
+                  } else if (committedAsrProvider === 'sherpa-onnx-local') {
+                    void setSherpaOnnxAsrModel(next);
+                  } else if (committedAsrProvider === 'foundry-local-whisper') {
+                    void setFoundryLocalAsrModel(next);
+                  }
+                }}
+                options={localAsrModels.map(m => ({
+                  value: m.id,
+                  label: `${m.id} 本地下载（本地下载）`,
+                }))}
+                placeholder={t('settings.providers.localModelEmpty')}
+                ariaLabel={t('settings.providers.localModelLabel')}
+                style={{ width: '100%', maxWidth: 320, minWidth: 0 }}
+              />
+            </SettingRow>
+          )
         ) : (
           <>
             <CredentialField key={`${committedAsrProvider}:api_key`} label={t('settings.providers.apiKeyLabel')} account="asr.api_key" provider={committedAsrProvider} mono mask />
@@ -945,7 +1000,7 @@ function ProviderTools({ kind, modelAccount, provider, onModelSelected, showFetc
               options={models.map(model => ({ value: model, label: model }))}
               placeholder={t('settings.providers.selectModel')}
               ariaLabel={t('settings.providers.selectModel')}
-              style={{ ...inputStyle, flex: mobile ? '1 1 100%' : '1 1 180px', maxWidth: mobile ? '100%' : 220 }}
+              style={{ flex: mobile ? '1 1 100%' : '1 1 180px', maxWidth: mobile ? '100%' : 220, minWidth: 0 }}
             />
           )}
         </div>
@@ -1162,7 +1217,7 @@ function CredentialField({ label, account, provider, placeholder, mono, mask, de
               placeholder={loaded ? placeholder : t('common.loading')}
               disabled={disabled}
               ariaLabel={label}
-              style={{ ...inputStyle, flex: mobile ? '1 1 180px' : 1, minWidth: 0, maxWidth: '100%', fontFamily: mono ? 'var(--ol-font-mono)' : 'inherit' }}
+              style={{ flex: mobile ? '1 1 180px' : 1, minWidth: 0, maxWidth: '100%', fontFamily: mono ? 'var(--ol-font-mono)' : 'inherit' }}
             />
           ) : (
             <input
