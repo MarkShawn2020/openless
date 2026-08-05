@@ -906,14 +906,15 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
-    const handleEnableFoundry = async () => {
+    const handleEnableFoundry = async (aliasOverride?: FoundryLocalAsrModelAlias) => {
         if (!foundryAvailable) return
+        const alias = aliasOverride ?? selectedFoundryAlias
         setFoundryBusy("enable")
         try {
             setError(null)
-            await setFoundryLocalAsrModel(selectedFoundryAlias)
+            await setFoundryLocalAsrModel(alias)
             await setActiveAsrProvider("foundry-local-whisper")
-            await syncFoundryPrefs(selectedFoundryAlias, true)
+            await syncFoundryPrefs(alias, true)
             foundrySelectionDirty.current = false
             await refreshFoundryStatus()
         } catch (e) {
@@ -923,22 +924,23 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
-    const handlePrepareFoundry = async () => {
+    const handlePrepareFoundry = async (aliasOverride?: FoundryLocalAsrModelAlias) => {
         if (!foundryAvailable) return
+        const alias = aliasOverride ?? selectedFoundryAlias
         setFoundryBusy("prepare")
         setFoundryCancelRequested(false)
         setFoundryProgress({
             phase: "runtime",
-            modelAlias: selectedFoundryAlias,
+            modelAlias: alias,
             label: t("localAsr.foundryPrepareRuntime"),
             percent: 0,
             error: null,
         })
         try {
             setError(null)
-            await setFoundryLocalAsrModel(selectedFoundryAlias)
-            await syncFoundryPrefs(selectedFoundryAlias, false)
-            await prepareFoundryLocalAsr(selectedFoundryAlias)
+            await setFoundryLocalAsrModel(alias)
+            await syncFoundryPrefs(alias, false)
+            await prepareFoundryLocalAsr(alias)
             foundrySelectionDirty.current = false
             await refreshFoundryStatus()
             await refreshFoundryCatalog()
@@ -988,11 +990,18 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
-    const handleDeleteFoundry = async () => {
+    const handleDeleteFoundry = async (aliasOverride?: FoundryLocalAsrModelAlias) => {
+        const alias = aliasOverride ?? selectedFoundryAlias
+        const displayName =
+            foundryCatalog.find((m) => m.alias === alias)?.displayName ??
+            t(
+                (FOUNDRY_LOCAL_ASR_MODELS.find((m) => m.alias === alias) ??
+                    FOUNDRY_LOCAL_ASR_MODELS[0]).labelKey,
+            )
         if (
             !window.confirm(
                 t("localAsr.deleteConfirm", {
-                    name: selectedFoundryDisplayName,
+                    name: displayName,
                 }),
             )
         ) {
@@ -1001,10 +1010,10 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         setFoundryBusy("delete")
         try {
             setError(null)
-            await deleteFoundryLocalAsrModel(selectedFoundryAlias)
+            await deleteFoundryLocalAsrModel(alias)
             await refreshFoundryStatus()
             await refreshFoundryCatalog()
-            await refreshFoundryModelDir(selectedFoundryAlias)
+            await refreshFoundryModelDir(alias)
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e))
         } finally {
@@ -1155,11 +1164,18 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
-    const handleDeleteSherpa = async () => {
+    const handleDeleteSherpa = async (aliasOverride?: SherpaOnnxModelAlias) => {
+        const alias = aliasOverride ?? selectedSherpaAlias
+        const displayName =
+            sherpaCatalog.find((m) => m.alias === alias)?.displayName ??
+            t(
+                (SHERPA_ONNX_ASR_MODELS.find((m) => m.alias === alias) ??
+                    SHERPA_ONNX_ASR_MODELS[0]).labelKey,
+            )
         if (
             !window.confirm(
                 t("localAsr.deleteConfirm", {
-                    name: selectedSherpaDisplayName,
+                    name: displayName,
                 }),
             )
         ) {
@@ -1168,10 +1184,10 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         setSherpaBusy("delete")
         try {
             setError(null)
-            await deleteSherpaOnnxAsrModel(selectedSherpaAlias)
+            await deleteSherpaOnnxAsrModel(alias)
             setSherpaDownloadProgress((prev) => {
                 const next = { ...prev }
-                delete next[selectedSherpaAlias]
+                delete next[alias]
                 return next
             })
             await refreshSherpaStatus()
@@ -1183,9 +1199,9 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
-    const handleDownloadSherpa = async () => {
+    const handleDownloadSherpa = async (aliasOverride?: SherpaOnnxModelAlias) => {
         if (!sherpaAvailable) return
-        const modelAlias = selectedSherpaAlias
+        const modelAlias = aliasOverride ?? selectedSherpaAlias
         const remoteSize = sherpaRemoteSizes[modelAlias]
         const model = sherpaCatalog.find((item) => item.alias === modelAlias)
         const initialDownloaded =
@@ -1728,20 +1744,22 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
             const alias = entry.id as SherpaOnnxModelAlias
             if (action === "download") {
                 setSelectedSherpaAlias(alias)
-                window.setTimeout(() => void handleDownloadSherpa(), 0)
+                // 显式传 alias：setTimeout 里的闭包拿不到新 state（handler 读的是
+                // 当前 render 的 selectedSherpaAlias），不传会操作到上一个模型。
+                window.setTimeout(() => void handleDownloadSherpa(alias), 0)
             } else if (action === "delete") {
                 setSelectedSherpaAlias(alias)
-                window.setTimeout(() => void handleDeleteSherpa(), 0)
+                window.setTimeout(() => void handleDeleteSherpa(alias), 0)
             }
         } else if (entry.engine === "foundry") {
             const alias = entry.id as FoundryLocalAsrModelAlias
             if (action === "download") {
                 setSelectedFoundryAlias(alias)
-                void handleEnableFoundry()
-                window.setTimeout(() => void handlePrepareFoundry(), 0)
+                void handleEnableFoundry(alias)
+                window.setTimeout(() => void handlePrepareFoundry(alias), 0)
             } else if (action === "delete") {
                 setSelectedFoundryAlias(alias)
-                void handleDeleteFoundry()
+                void handleDeleteFoundry(alias)
             }
         }
     }

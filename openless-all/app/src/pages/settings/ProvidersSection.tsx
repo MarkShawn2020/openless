@@ -268,27 +268,48 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
   useEffect(() => {
     if (committedAsrProvider !== 'bailian') setBailianModel('');
   }, [committedAsrProvider]);
-  // 本地引擎激活时，ASR 区块展示本地已下载模型（标注「本地下载」），可直接选用。
+  // 本地引擎激活时，ASR 区块展示本地已下载模型（标注「本地」），可直接选用。
+  // selectedLocalModelId 是受控 value：只跟模型列表 / 后端 active 模型联动，
+  // 否则下拉会一直停留在第一个已下载模型（pr-agent #922 反馈）。
   const [localAsrModels, setLocalAsrModels] = useState<{ id: string; isDownloaded: boolean }[]>([]);
+  const [selectedLocalModelId, setSelectedLocalModelId] = useState('');
   useEffect(() => {
     let cancelled = false;
+    const apply = (models: { id: string; isDownloaded: boolean }[]) => {
+      if (cancelled) return;
+      setLocalAsrModels(models);
+      // 优先保持后端当前激活的模型；不在已下载列表里则退回第一个已下载。
+      const activeId = committedAsrProvider === 'local-qwen3'
+        ? prefs?.localAsrActiveModel
+        : committedAsrProvider === 'sherpa-onnx-local'
+          ? prefs?.sherpaOnnxModel
+          : committedAsrProvider === 'foundry-local-whisper'
+            ? prefs?.foundryLocalAsrModel
+            : undefined;
+      setSelectedLocalModelId(
+        activeId && models.some(m => m.id === activeId && m.isDownloaded)
+          ? activeId
+          : (models.find(m => m.isDownloaded)?.id ?? ''),
+      );
+    };
     if (committedAsrProvider === 'local-qwen3') {
       void listLocalAsrModels().then(models => {
-        if (!cancelled) setLocalAsrModels(models.map(m => ({ id: m.id, isDownloaded: m.isDownloaded })));
-      }).catch(() => { if (!cancelled) setLocalAsrModels([]); });
+        apply(models.map(m => ({ id: m.id, isDownloaded: m.isDownloaded })));
+      }).catch(() => { if (!cancelled) { setLocalAsrModels([]); setSelectedLocalModelId(''); } });
     } else if (committedAsrProvider === 'sherpa-onnx-local') {
       void getSherpaOnnxAsrCatalog().then(catalog => {
-        if (!cancelled) setLocalAsrModels(catalog.map(c => ({ id: c.alias, isDownloaded: c.cached })));
-      }).catch(() => { if (!cancelled) setLocalAsrModels([]); });
+        apply(catalog.map(c => ({ id: c.alias, isDownloaded: c.cached })));
+      }).catch(() => { if (!cancelled) { setLocalAsrModels([]); setSelectedLocalModelId(''); } });
     } else if (committedAsrProvider === 'foundry-local-whisper') {
       void getFoundryLocalAsrCatalog().then(catalog => {
-        if (!cancelled) setLocalAsrModels(catalog.map(c => ({ id: c.alias, isDownloaded: c.cached })));
-      }).catch(() => { if (!cancelled) setLocalAsrModels([]); });
+        apply(catalog.map(c => ({ id: c.alias, isDownloaded: c.cached })));
+      }).catch(() => { if (!cancelled) { setLocalAsrModels([]); setSelectedLocalModelId(''); } });
     } else {
       setLocalAsrModels([]);
+      setSelectedLocalModelId('');
     }
     return () => { cancelled = true; };
-  }, [committedAsrProvider]);
+  }, [committedAsrProvider, prefs?.localAsrActiveModel, prefs?.sherpaOnnxModel, prefs?.foundryLocalAsrModel]);
 
   // 本地引擎（qwen3 / foundry / sherpa）直接作为常规选项放进主下拉（按平台 gating），
   // 选项名标注「本地」——选了本地模型供应商，ASR 就用本地模型（与 Apple 语音同理），
@@ -668,8 +689,9 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
           ) : (
             <SettingRow label={t('settings.providers.localModelLabel')}>
               <SelectLite
-                value={localAsrModels.find(m => m.isDownloaded)?.id ?? ''}
+                value={selectedLocalModelId}
                 onChange={(next) => {
+                  setSelectedLocalModelId(next);
                   if (committedAsrProvider === 'local-qwen3') {
                     void setLocalAsrActiveModel(next);
                   } else if (committedAsrProvider === 'sherpa-onnx-local') {
