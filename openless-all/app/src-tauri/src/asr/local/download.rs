@@ -164,6 +164,129 @@ fn keep_file(path: &str) -> bool {
     )
 }
 
+/// HF 模型卡片（下载量 / 收藏 / 简介）——下载弹窗右侧展示用。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HfModelCard {
+    pub model_id: String,
+    pub mirror: String,
+    pub downloads: u64,
+    pub likes: u64,
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfApiModelCard {
+    #[serde(default)]
+    downloads: u64,
+    #[serde(default)]
+    likes: u64,
+    #[serde(default, rename = "cardData")]
+    card_data: Option<HfApiCardData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfApiCardData {
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+/// 拉取 HF 模型卡片：GET `{mirror}/api/models/{repo}` 拿 downloads / likes /
+/// cardData.summary。summary 缺失时回退读 README 首个非空段落当简介；
+/// 描述统一截断到 [`HF_CARD_DESC_MAX_CHARS`]，防超长文本把弹窗撑爆。
+pub async fn fetch_hf_card(model_id: ModelId, mirror: Mirror) -> Result<HfModelCard> {
+    let client = build_client()?;
+    let repo = model_id.hf_repo();
+    let url = format!("{}/api/models/{}", mirror.base_url(), repo);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("HF model card API GET 失败: {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HF model card API HTTP {}: {url}", resp.status());
+    }
+    let api: HfApiModelCard = resp
+        .json()
+        .await
+        .with_context(|| format!("HF model card JSON 解码失败: {url}"))?;
+
+    let mut description = api
+        .card_data
+        .as_ref()
+        .and_then(|c| c.summary.clone())
+        .unwrap_or_default();
+    if description.trim().is_empty() {
+        description = fetch_readme_first_paragraph(&client, repo, mirror).await?;
+    }
+
+    Ok(HfModelCard {
+        model_id: model_id.as_str().into(),
+        mirror: mirror.as_str().into(),
+        downloads: api.downloads,
+        likes: api.likes,
+        description: truncate_description(&description),
+    })
+}
+
+/// 拉取仓库 README 首个非空段落；README 缺失 / 非 200 / 无内容时返回空串。
+async fn fetch_readme_first_paragraph(
+    client: &reqwest::Client,
+    repo: &str,
+    mirror: Mirror,
+) -> Result<String> {
+    let url = format!("{}/{}/raw/main/README.md", mirror.base_url(), repo);
+    let resp = client.get(&url).send().await;
+    let text = match resp {
+        Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+        _ => return Ok(String::new()),
+    };
+    Ok(first_readme_paragraph(&text))
+}
+
+/// 简介最大字符数（按 char 计，避免切在 UTF-8 中间）。
+pub(crate) const HF_CARD_DESC_MAX_CHARS: usize = 280;
+
+/// 纯函数：README markdown → 首个有实质内容的段落。跳过 yaml front-matter、
+/// 标题行（`#` 开头）、图片（`!` 开头）、表格（`|` 开头）与分隔线（`---`）；
+/// 段落内多行合并成一句。便于单测。
+pub(crate) fn first_readme_paragraph(markdown: &str) -> String {
+    for block in markdown.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() || block.starts_with("---") {
+            continue;
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        for raw_line in block.lines() {
+            let line = raw_line.trim();
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with('!')
+                || line.starts_with('|')
+                || line.starts_with("---")
+            {
+                continue;
+            }
+            parts.push(line);
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        return truncate_description(&parts.join(" "));
+    }
+    String::new()
+}
+
+/// 纯函数：描述截断到 [`HF_CARD_DESC_MAX_CHARS`]，超长加省略号。
+pub(crate) fn truncate_description(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= HF_CARD_DESC_MAX_CHARS {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(HF_CARD_DESC_MAX_CHARS).collect();
+    format!("{truncated}…")
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadProgress {
@@ -1077,7 +1200,10 @@ fn emit_cancelled(
 
 #[cfg(test)]
 mod tests {
-    use super::{existing_file_is_complete, remove_partial_artifacts};
+    use super::{
+        existing_file_is_complete, first_readme_paragraph, remove_partial_artifacts,
+        truncate_description, HF_CARD_DESC_MAX_CHARS,
+    };
 
     #[test]
     fn complete_when_size_matches() {
@@ -1125,5 +1251,43 @@ mod tests {
         assert!(dest.exists(), "完整目标文件不应被删除");
         assert!(keep.exists(), "未在清单里的文件不应被删除");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_readme_paragraph_skips_front_matter_and_headers() {
+        let md = "---\nlicense: apache-2.0\n---\n\n# Qwen3-ASR\n\nThis is the first real paragraph.\n\n## Features\n- fast\n- accurate";
+        assert_eq!(
+            first_readme_paragraph(md),
+            "This is the first real paragraph."
+        );
+    }
+
+    #[test]
+    fn first_readme_paragraph_joins_multiline_paragraph() {
+        let md = "# Title\n\nFirst line continues\nonto the second line.\n\n## Next";
+        assert_eq!(
+            first_readme_paragraph(md),
+            "First line continues onto the second line."
+        );
+    }
+
+    #[test]
+    fn first_readme_paragraph_returns_empty_when_only_markup() {
+        let md = "# Only headers\n\n---\n\n![image](x.png)";
+        assert_eq!(first_readme_paragraph(md), "");
+    }
+
+    #[test]
+    fn truncate_description_keeps_short_text() {
+        assert_eq!(truncate_description("hello world"), "hello world");
+        assert_eq!(truncate_description("  padded  "), "padded");
+    }
+
+    #[test]
+    fn truncate_description_cuts_long_text() {
+        let long = "界".repeat(HF_CARD_DESC_MAX_CHARS + 50);
+        let out = truncate_description(&long);
+        assert_eq!(out.chars().count(), HF_CARD_DESC_MAX_CHARS + 1); // +1 省略号
+        assert!(out.ends_with('…'));
     }
 }

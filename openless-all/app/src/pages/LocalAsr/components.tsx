@@ -7,6 +7,7 @@ import { createPortal } from "react-dom"
 import { useTranslation } from "react-i18next"
 import {
     type FoundryPrepareProgress,
+    type HfModelCard,
     type LocalAsrDownloadProgress,
     type LocalAsrModelStatus,
     type LocalAsrTestResult,
@@ -775,6 +776,11 @@ function IconCheck() {
     )
 }
 
+/** 下载量/收藏数展示：千分位分隔（12345 → "12,345"）。 */
+function formatCount(n: number): string {
+    return n.toLocaleString("en-US")
+}
+
 /** 右侧详情看板：选中模型的信息（HF 抓取的尺寸/文件数）+ 操作按钮。 */
 export function ModelDetailPanel({
     entry,
@@ -1015,6 +1021,7 @@ export function DownloadDialog({
     onSelect,
     sizeOf,
     fileCountOf,
+    hfCardOf,
     busy,
     onStart,
     onClose,
@@ -1024,12 +1031,23 @@ export function DownloadDialog({
     onSelect: (id: string) => void
     sizeOf: (id: string) => number | null
     fileCountOf: (id: string) => number | null
+    hfCardOf: (id: string) =>
+        | { status: "loading" }
+        | { status: "error"; message: string }
+        | { status: "ok"; card: HfModelCard }
+        | null
     busy: boolean
     onStart: () => void
     onClose: () => void
 }) {
     const { t } = useTranslation()
-    const selected = entries.find((e) => e.id === selectedId) ?? null
+    // 默认选中第一项：看板可能什么都没选中（零下载用户），弹窗不能停在
+    // 「未选择」空态——高亮、右侧详情与「开始下载」都跟随该解析值。
+    const resolvedId = entries.some((e) => e.id === selectedId)
+        ? selectedId
+        : (entries[0]?.id ?? null)
+    const selected = entries.find((e) => e.id === resolvedId) ?? null
+    const hfCard = selected ? hfCardOf(selected.id) : null
     return createPortal(
         <div
             role="dialog"
@@ -1062,7 +1080,10 @@ export function DownloadDialog({
                     border: "0.5px solid var(--ol-line-strong)",
                     boxShadow: "var(--ol-shadow-xl)",
                     overflow: "hidden",
-                    animation: "ol-modal-card-in 0.24s var(--ol-motion-spring)",
+                    // 用非回弹曲线（--ol-motion-soft）：spring 有 overshoot，
+                    // 弹窗入场会上下弹跳；WKWebView 重放动画时更明显。
+                    animation:
+                        "ol-modal-card-in 0.24s var(--ol-motion-soft)",
                 }}
             >
                 {/* 标题行：左标题 + 右 ✕ 关闭 */}
@@ -1156,11 +1177,11 @@ export function DownloadDialog({
                                     borderRadius: 8,
                                     border: "0.5px solid var(--ol-line-soft)",
                                     background:
-                                        entry.id === selectedId
+                                        entry.id === resolvedId
                                             ? "var(--ol-segmented-active-bg)"
                                             : "transparent",
                                     boxShadow:
-                                        entry.id === selectedId
+                                        entry.id === resolvedId
                                             ? "var(--ol-segmented-active-shadow)"
                                             : "none",
                                     color: "var(--ol-ink)",
@@ -1195,12 +1216,9 @@ export function DownloadDialog({
                             </div>
                         )}
                     </div>
-                    {/* 右侧：说明 + 详情（大小 / 文件数 / 状态） */}
+                    {/* 右侧：模型信息 + HF 模型卡片（下载量/收藏/简介） */}
                     <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
                         <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 16 }}>
-                            <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)", lineHeight: 1.6, marginBottom: 12 }}>
-                                {t("localAsr.downloadDialogDesc")}
-                            </div>
                             {selected ? (
                                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                                     <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--ol-ink)" }}>
@@ -1236,6 +1254,46 @@ export function DownloadDialog({
                                             </span>
                                         )}
                                     </div>
+                                    {hfCard?.status === "loading" && (
+                                        <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)" }}>
+                                            {t("common.loading")}
+                                        </div>
+                                    )}
+                                    {hfCard?.status === "error" && (
+                                        <div style={{ fontSize: 11.5, color: "#9b2c2c", lineHeight: 1.5 }}>
+                                            {t("localAsr.hfCardFailed")}: {hfCard.message}
+                                        </div>
+                                    )}
+                                    {hfCard?.status === "ok" && (
+                                        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                                            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, fontSize: 11 }}>
+                                                <span style={{ padding: "2px 8px", borderRadius: 999, background: "rgba(0,0,0,0.05)", color: "var(--ol-ink-2)" }}>
+                                                    {t("localAsr.hfDownloads")}: {formatCount(hfCard.card.downloads)}
+                                                </span>
+                                                <span style={{ padding: "2px 8px", borderRadius: 999, background: "rgba(0,0,0,0.05)", color: "var(--ol-ink-2)" }}>
+                                                    {t("localAsr.hfLikes")}: {formatCount(hfCard.card.likes)}
+                                                </span>
+                                            </div>
+                                            {hfCard.card.description && (
+                                                <>
+                                                    <div style={{ fontSize: 11, color: "var(--ol-ink-4)", letterSpacing: ".02em" }}>
+                                                        {t("localAsr.hfDescription")}
+                                                    </div>
+                                                    <div style={{
+                                                        fontSize: 12,
+                                                        color: "var(--ol-ink-3)",
+                                                        lineHeight: 1.65,
+                                                        display: "-webkit-box",
+                                                        WebkitLineClamp: 3,
+                                                        WebkitBoxOrient: "vertical",
+                                                        overflow: "hidden",
+                                                    }}>
+                                                        {hfCard.card.description}
+                                                    </div>
+                                                </>
+                                            )}
+                                        </div>
+                                    )}
                                     {selected.isDownloaded && (
                                         <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)" }}>
                                             {t("localAsr.downloadDialogAlreadyHave")}

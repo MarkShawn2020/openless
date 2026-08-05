@@ -61,7 +61,7 @@ export function WindowChrome({
         WebkitBackdropFilter: useSolidSurface ? 'none' : 'blur(var(--ol-glass-blur-strong)) saturate(190%)',
         animation: os === 'win' ? undefined : 'ol-window-enter 0.42s var(--ol-motion-spring) both',
         transition: 'box-shadow 0.28s var(--ol-motion-soft), border-color 0.28s var(--ol-motion-soft), backdrop-filter 0.28s var(--ol-motion-soft)',
-        willChange: 'opacity, transform, filter',
+        willChange: 'opacity, transform',
       } as CSSProperties}
     >
       {os === 'mac' && (

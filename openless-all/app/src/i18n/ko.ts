@@ -1454,6 +1454,11 @@ export const ko: typeof zhCN = {
     downloadDialogAlreadyHave: '이미 다운로드됨 — 바로 사용 가능',
     downloadDialogDesc: '왼쪽에서 모델을 선택하고 「다운로드 시작」을 클릭하세요. 완료 후 「서비스 → AI 공급자 → ASR 음성 전사」에서 로컬 모델 공급자를 선택하면 사용할 수 있습니다.',
     detailRepo: '저장소',
+    hfDownloads: '다운로드 수',
+    hfLikes: '좋아요',
+    hfDescription: '모델 소개',
+    hfCardFailed: '모델 정보를 불러오지 못했습니다',
+
     detailFiles: '개 파일',
     detailDownloaded: '다운로드됨',
     detailEmpty: '왼쪽에서 모델을 선택하세요',

@@ -1452,6 +1452,11 @@ export const zhTW: typeof zhCN = {
     downloadDialogAlreadyHave: '該模型已下載，可直接使用',
     downloadDialogDesc: '選擇左側模型後點擊「開始下載」。下載完成後，到「服務 → AI 提供商 → ASR 語音轉寫」選擇本地模型供應商即可使用。',
     detailRepo: '模型倉庫',
+    hfDownloads: '下載量',
+    hfLikes: '收藏數',
+    hfDescription: '模型簡介',
+    hfCardFailed: '模型資訊取得失敗',
+
     detailFiles: '個檔案',
     detailDownloaded: '已下載',
     detailEmpty: '從左側選擇模型查看詳情',

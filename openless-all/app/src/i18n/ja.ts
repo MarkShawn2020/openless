@@ -1454,6 +1454,11 @@ export const ja: typeof zhCN = {
     downloadDialogAlreadyHave: 'ダウンロード済みです',
     downloadDialogDesc: '左のモデルを選択して「ダウンロード開始」をクリックします。完了後、「サービス → AI プロバイダー → ASR 文字起こし」でローカルモデルのプロバイダーを選択すると利用できます。',
     detailRepo: 'リポジトリ',
+    hfDownloads: 'ダウンロード数',
+    hfLikes: 'いいね',
+    hfDescription: 'モデル紹介',
+    hfCardFailed: 'モデル情報の取得に失敗しました',
+
     detailFiles: 'ファイル',
     detailDownloaded: 'ダウンロード済み',
     detailEmpty: '左側からモデルを選択',
