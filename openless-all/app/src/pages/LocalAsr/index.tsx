@@ -954,6 +954,14 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
+    // 侧栏「下载」动作：先启用（切供应商 + 写模型），再顺序准备/下载/加载。
+    // 不能并行跑 handleEnableFoundry + handlePrepareFoundry——两者都写 foundryBusy
+    // 与 syncFoundryPrefs，竞态会留下互相矛盾的启用状态（pr-agent #922）。
+    const handleEnableAndPrepareFoundry = async (alias: FoundryLocalAsrModelAlias) => {
+        await handleEnableFoundry(alias)
+        await handlePrepareFoundry(alias)
+    }
+
     const handleCancelFoundryPrepare = async () => {
         if (foundryBusy !== "prepare") return
         setFoundryCancelRequested(true)
@@ -1728,7 +1736,12 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
 
     // 侧栏选中默认：首次渲染后若没有选中项，选中第一个已下载模型。
     useLayoutEffect(() => {
-        if (selectedModelId) return
+        // 选中项被删除（或从未选中）时回落到第一个已下载模型，避免侧栏无高亮、
+        // 详情面板停在空态。
+        const stillExists =
+            selectedModelId !== null &&
+            sidebarEntries.some((e) => e.id === selectedModelId)
+        if (stillExists) return
         const firstDownloaded = sidebarEntries.find((e) => e.isDownloaded)
         setSelectedModelId(firstDownloaded?.id ?? sidebarEntries[0]?.id ?? null)
     }, [sidebarEntries, selectedModelId])
@@ -1755,8 +1768,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
             const alias = entry.id as FoundryLocalAsrModelAlias
             if (action === "download") {
                 setSelectedFoundryAlias(alias)
-                void handleEnableFoundry(alias)
-                window.setTimeout(() => void handlePrepareFoundry(alias), 0)
+                void handleEnableAndPrepareFoundry(alias)
             } else if (action === "delete") {
                 setSelectedFoundryAlias(alias)
                 void handleDeleteFoundry(alias)
