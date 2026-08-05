@@ -95,7 +95,12 @@ import {
 import {
     DownloadProgressBlock,
     FoundryPrepareProgressBlock,
+    GlobalDownloadProgress,
+    ModelDetailPanel,
     ModelRow,
+    ModelSidebar,
+    type SidebarModelEntry,
+    DownloadDialog,
 } from "./components"
 import type { RemoteSize } from "./types"
 
@@ -124,6 +129,10 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     const { prefs, updatePrefs } = useHotkeySettings()
     const [settings, setSettings] = useState<LocalAsrSettings | null>(null)
     const [models, setModels] = useState<LocalAsrModelStatus[]>([])
+    // 两栏看板：右侧当前选中的模型（默认选第一个已下载的）。
+    const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
+    // 下载弹框开关：点侧栏「下载新模型」/ 看板「下载」打开。
+    const [downloadDialogOpen, setDownloadDialogOpen] = useState(false)
     const [modelDirs, setModelDirs] = useState<Record<string, string>>({})
     const [progress, setProgress] = useState<
         Record<string, LocalAsrDownloadProgress>
@@ -1651,6 +1660,146 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         </div>
     )
 
+    // ─── 两栏看板的统一模型条目（Qwen3 / sherpa-onnx / foundry 归一化） ───
+    const sidebarEntries = useMemo<SidebarModelEntry[]>(() => {
+        const entries: SidebarModelEntry[] = []
+        // macOS：Qwen3 引擎
+        for (const m of models) {
+            entries.push({
+                id: m.id,
+                name: m.id,
+                repo: m.hfRepo,
+                remoteBytes:
+                    remoteSizes[m.id]?.totalBytes || m.downloadedBytes || undefined,
+                isDownloaded: m.isDownloaded,
+                isDownloading: Boolean(progress[m.id]) &&
+                    (progress[m.id]?.phase === "started" ||
+                        progress[m.id]?.phase === "progress"),
+                isActive:
+                    settings?.activeModel === m.id &&
+                    prefs?.activeAsrProvider === "local-qwen3",
+                engine: "qwen3",
+            })
+        }
+        // Windows：sherpa-onnx + foundry
+        for (const c of sherpaCatalog) {
+            entries.push({
+                id: c.alias,
+                name: c.displayName || c.alias,
+                remoteBytes:
+                    sherpaRemoteSizes[c.alias]?.totalBytes ||
+                    (c.fileSizeMb != null ? c.fileSizeMb * 1024 * 1024 : undefined),
+                isDownloaded: c.cached,
+                isDownloading: Boolean(sherpaDownloadProgress[c.alias]) &&
+                    (sherpaDownloadProgress[c.alias]?.phase === "started" ||
+                        sherpaDownloadProgress[c.alias]?.phase === "progress"),
+                isActive:
+                    sherpaStatus?.activeModel === c.alias &&
+                    prefs?.activeAsrProvider === "sherpa-onnx-local",
+                engine: "sherpa",
+            })
+        }
+        for (const c of foundryCatalog) {
+            entries.push({
+                id: c.alias,
+                name: c.displayName || c.alias,
+                remoteBytes:
+                    c.fileSizeMb != null ? c.fileSizeMb * 1024 * 1024 : undefined,
+                isDownloaded: c.cached,
+                isDownloading: false,
+                isActive:
+                    foundryStatus?.activeModel === c.alias &&
+                    prefs?.activeAsrProvider === "foundry-local-whisper",
+                engine: "foundry",
+            })
+        }
+        return entries
+    }, [
+        models,
+        remoteSizes,
+        progress,
+        settings?.activeModel,
+        prefs?.activeAsrProvider,
+        sherpaCatalog,
+        sherpaRemoteSizes,
+        sherpaDownloadProgress,
+        sherpaStatus?.activeModel,
+        foundryCatalog,
+        foundryStatus?.activeModel,
+    ])
+
+    const selectedEntry =
+        sidebarEntries.find((e) => e.id === selectedModelId) ?? null
+
+    // 侧栏选中默认：首次渲染后若没有选中项，选中第一个已下载模型。
+    useLayoutEffect(() => {
+        if (selectedModelId) return
+        const firstDownloaded = sidebarEntries.find((e) => e.isDownloaded)
+        setSelectedModelId(firstDownloaded?.id ?? sidebarEntries[0]?.id ?? null)
+    }, [sidebarEntries, selectedModelId])
+
+    // 从侧栏/看板分派引擎动作。
+    const dispatchEntryAction = (entry: SidebarModelEntry, action: "download" | "setActive" | "delete" | "reveal") => {
+        if (entry.engine === "qwen3") {
+            if (action === "download") void handleDownload(entry.id)
+            else if (action === "setActive") void handleSetActiveModel(entry.id)
+            else if (action === "delete") void handleDelete(entry.id)
+            else if (action === "reveal") void handleRevealModelDir(entry.id)
+        } else if (entry.engine === "sherpa") {
+            const alias = entry.id as SherpaOnnxModelAlias
+            if (action === "download") {
+                setSelectedSherpaAlias(alias)
+                window.setTimeout(() => void handleDownloadSherpa(), 0)
+            } else if (action === "setActive") {
+                setSelectedSherpaAlias(alias)
+                window.setTimeout(() => void handleSherpaModelChange(alias), 0)
+            } else if (action === "delete") {
+                setSelectedSherpaAlias(alias)
+                window.setTimeout(() => void handleDeleteSherpa(), 0)
+            }
+        } else if (entry.engine === "foundry") {
+            const alias = entry.id as FoundryLocalAsrModelAlias
+            if (action === "download") {
+                setSelectedFoundryAlias(alias)
+                void handleEnableFoundry()
+                window.setTimeout(() => void handlePrepareFoundry(), 0)
+            } else if (action === "setActive") {
+                setSelectedFoundryAlias(alias)
+                void handleEnableFoundry()
+            } else if (action === "delete") {
+                setSelectedFoundryAlias(alias)
+                void handleDeleteFoundry()
+            }
+        }
+    }
+
+    // 下载弹框「开始下载」：把弹框当前选中项分派到对应引擎的下载入口。
+    const startDownloadFromDialog = () => {
+        if (!selectedEntry || selectedEntry.isDownloaded) return
+        dispatchEntryAction(selectedEntry, "download")
+        setDownloadDialogOpen(false)
+    }
+
+    const selectedEntryRemote = selectedEntry
+        ? selectedEntry.engine === "qwen3"
+            ? remoteSizes[selectedEntry.id]
+            : selectedEntry.engine === "sherpa"
+              ? sherpaRemoteSizes[selectedEntry.id]
+              : null
+        : null
+    const selectedEntryProgress =
+        selectedEntry?.engine === "qwen3"
+            ? progress[selectedEntry.id]
+            : selectedEntry?.engine === "sherpa"
+              ? sherpaDownloadProgress[selectedEntry.id]
+              : undefined
+    const selectedEntryPercent =
+        selectedEntryProgress && selectedEntryProgress.bytesTotal > 0
+            ? (selectedEntryProgress.bytesDownloaded /
+                  selectedEntryProgress.bytesTotal) *
+              100
+            : null
+
     return (
         <Wrapper>
             {!embedded && (
@@ -1660,6 +1809,38 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                     desc={t("localAsr.desc")}
                 />
             )}
+
+            {/* ─── 右上角下载进度浮层：所有引擎的下载进度聚合显示，完成即消失。 ─── */}
+            <GlobalDownloadProgress
+                items={[
+                    // Qwen3（macOS）
+                    ...Object.entries(progress).map(([id, p]) => ({
+                        id: `qwen3:${id}`,
+                        name: id,
+                        percent:
+                            p.bytesTotal > 0
+                                ? (p.bytesDownloaded / p.bytesTotal) * 100
+                                : 0,
+                        finished:
+                            p.phase === "finished" ||
+                            p.phase === "cancelled" ||
+                            p.phase === "failed",
+                    })),
+                    // sherpa-onnx（Windows）
+                    ...Object.entries(sherpaDownloadProgress).map(([alias, p]) => ({
+                        id: `sherpa:${alias}`,
+                        name: alias,
+                        percent:
+                            p.bytesTotal > 0
+                                ? (p.bytesDownloaded / p.bytesTotal) * 100
+                                : 0,
+                        finished:
+                            p.phase === "finished" ||
+                            p.phase === "cancelled" ||
+                            p.phase === "failed",
+                    })),
+                ]}
+            />
 
             {!embedded && (
                 /* 性能/质量预期警告 —— embedded 模式下由 AdvancedSection 自己渲染，避免重复。 */
@@ -1681,51 +1862,120 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                 </Card>
             )}
 
-            {/* ─── 模型选择板块：下拉直接选用已下载的本地模型（macOS Qwen3 引擎）。 ─── */}
-            {IS_MAC && (
-                <Card style={{ marginBottom: 16 }}>
+            {/* ─── 模型管理看板：左侧模型选择（竖排，已下载打绿勾），右侧详情
+                 （HF 实时抓取的尺寸/文件数）+ 操作。全平台归一化（Qwen3 /
+                 sherpa-onnx / foundry），作为设置里的单独板块而非独立窗口。 ─── */}
+            <Card style={{ marginBottom: 16 }}>
+                <div
+                    style={{
+                        fontSize: 14,
+                        fontWeight: 700,
+                        color: "var(--ol-ink)",
+                        marginBottom: 2,
+                    }}
+                >
+                    {t("localAsr.modelSelectTitle")}
+                </div>
+                <div
+                    style={{
+                        fontSize: 12.5,
+                        color: "var(--ol-ink-3)",
+                        lineHeight: 1.55,
+                        marginBottom: 12,
+                    }}
+                >
+                    {t("localAsr.modelSelectDesc")}
+                </div>
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(0, 240px) minmax(0, 1fr)",
+                        gap: 16,
+                    }}
+                >
+                    <ModelSidebar
+                        entries={sidebarEntries}
+                        selectedId={selectedModelId}
+                        onSelect={setSelectedModelId}
+                        onOpenDownload={() => setDownloadDialogOpen(true)}
+                        downloadDisabled={busyModelId !== null || sherpaBusy !== null}
+                    />
                     <div
                         style={{
-                            fontSize: 14,
-                            fontWeight: 700,
-                            color: "var(--ol-ink)",
-                            marginBottom: 6,
+                            paddingLeft: 16,
+                            borderLeft: "0.5px solid var(--ol-line)",
+                            minWidth: 0,
                         }}
                     >
-                        {t("localAsr.modelSelectTitle")}
-                    </div>
-                    <div
-                        style={{
-                            fontSize: 12.5,
-                            color: "var(--ol-ink-3)",
-                            lineHeight: 1.55,
-                            marginBottom: 10,
-                        }}
-                    >
-                        {t("localAsr.modelSelectDesc")}
-                    </div>
-                    {models.some(m => m.isDownloaded) ? (
-                        <SelectLite
-                            value={settings?.activeModel ?? ""}
-                            onChange={(id) => void handleSetActiveModel(id)}
-                            options={models
-                                .filter(m => m.isDownloaded)
-                                .map(m => ({ value: m.id, label: m.id }))}
-                            placeholder={t("localAsr.modelSelectPlaceholder")}
-                            ariaLabel={t("localAsr.modelSelectTitle")}
-                            style={{ maxWidth: 300 }}
-                        />
-                    ) : (
-                        <div
-                            style={{
-                                fontSize: 12,
-                                color: "var(--ol-ink-4)",
+                        <ModelDetailPanel
+                            entry={selectedEntry}
+                            fileCount={selectedEntryRemote?.fileCount ?? null}
+                            mirrorLabel={
+                                selectedEntry?.engine === "qwen3"
+                                    ? settings?.mirror === "hf-mirror"
+                                        ? "hf-mirror"
+                                        : "huggingface"
+                                    : selectedEntry?.engine === "sherpa"
+                                      ? (settings?.mirror ?? "huggingface")
+                                      : undefined
+                            }
+                            downloading={selectedEntry ? Boolean(selectedEntryProgress) : false}
+                            progressPercent={selectedEntryPercent}
+                            busy={busyModelId !== null || sherpaBusy !== null}
+                            onDownload={() =>
+                                selectedEntry && dispatchEntryAction(selectedEntry, "download")
+                            }
+                            onCancel={() => {
+                                if (!selectedEntry) return
+                                if (selectedEntry.engine === "qwen3")
+                                    void handleCancel(selectedEntry.id)
+                                else if (selectedEntry.engine === "sherpa")
+                                    void handleCancelSherpaDownload()
                             }}
-                        >
-                            {t("localAsr.modelSelectEmpty")}
-                        </div>
-                    )}
-                </Card>
+                            onSetActive={() =>
+                                selectedEntry && dispatchEntryAction(selectedEntry, "setActive")
+                            }
+                            onDelete={() =>
+                                selectedEntry && dispatchEntryAction(selectedEntry, "delete")
+                            }
+                            onReveal={() =>
+                                selectedEntry && dispatchEntryAction(selectedEntry, "reveal")
+                            }
+                            onTest={() =>
+                                selectedEntry?.engine === "qwen3" &&
+                                void handleTest(selectedEntry.id)
+                            }
+                            showTest={selectedEntry?.engine === "qwen3"}
+                        />
+                    </div>
+                </div>
+            </Card>
+
+            {/* ─── 下载弹框：左侧模型选择 + 右侧详情，最下方开始下载。 ─── */}
+            {downloadDialogOpen && (
+                <DownloadDialog
+                    entries={sidebarEntries}
+                    selectedId={selectedModelId}
+                    onSelect={setSelectedModelId}
+                    sizeOf={(id) => {
+                        const entry = sidebarEntries.find((e) => e.id === id)
+                        return entry?.remoteBytes ?? null
+                    }}
+                    fileCountOf={(id) => {
+                        const entry = sidebarEntries.find((e) => e.id === id)
+                        if (!entry) return null
+                        const remote =
+                            entry.engine === "qwen3"
+                                ? remoteSizes[id]
+                                : entry.engine === "sherpa"
+                                  ? sherpaRemoteSizes[id]
+                                  : null
+                        return remote?.fileCount ?? null
+                    }}
+                    busy={busyModelId !== null}
+                    onStart={startDownloadFromDialog}
+                    onClose={() => setDownloadDialogOpen(false)}
+                />
             )}
 
             {/* ─── 分组：下载与管理（各引擎的模型获取/准备/下载） ─── */}
@@ -2788,48 +3038,6 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                 </Card>
             )}
 
-            {IS_MAC && (
-                <div
-                    style={{
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: 12,
-                    }}
-                >
-                    {models.map((model) => (
-                        <ModelRow
-                            key={model.id}
-                            model={model}
-                            modelDir={modelDirs[model.id] ?? ""}
-                            remoteSize={remoteSizes[model.id]}
-                            progress={progress[model.id]}
-                            // 「当前使用」只在本地 Qwen3 确实是激活的 ASR provider 时才亮。
-                            // settings.activeModel 只是本地引擎内部「选中的模型」(默认
-                            // qwen3-asr-0.6b),不代表整体在用本地 ASR——否则用户在跑云端
-                            // (火山/百炼)时这里仍误标 0.6B「当前使用」。与 foundry/sherpa/
-                            // apple 三处的 activeAsrProvider 门保持一致。
-                            isActive={
-                                settings?.activeModel === model.id &&
-                                prefs?.activeAsrProvider === "local-qwen3"
-                            }
-                            engineAvailable={engineAvailable}
-                            disabled={
-                                busyModelId !== null && busyModelId !== model.id
-                            }
-                            testing={testingModelId === model.id}
-                            testResult={testResults[model.id]}
-                            onDownload={() => void handleDownload(model.id)}
-                            onCancel={() => void handleCancel(model.id)}
-                            onDelete={() => void handleDelete(model.id)}
-                            onReveal={() => void handleRevealModelDir(model.id)}
-                            onSetActive={() =>
-                                void handleSetActiveModel(model.id)
-                            }
-                            onTest={() => void handleTest(model.id)}
-                        />
-                    ))}
-                </div>
-            )}
 
             {/* Apple Speech（macOS 系统语音识别）：无下载、无凭据，零网络兜底。
                 issue #574。和 Qwen3 模型行平级摆一张卡片即可。 */}
