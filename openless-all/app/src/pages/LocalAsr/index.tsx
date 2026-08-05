@@ -81,7 +81,7 @@ import {
 import { useHotkeySettings } from "../../state/HotkeySettingsContext"
 import { detectOS } from "../../components/WindowChrome"
 import { SelectLite } from "../../components/ui/SelectLite"
-import { Btn, Card, PageHeader, Pill } from "../_atoms"
+import { Btn, Card, Collapsible, PageHeader, Pill } from "../_atoms"
 import {
     formatBytes,
     formatFoundrySizeMb,
@@ -769,47 +769,6 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
 
-    const handleSetActiveModel = async (modelId: string) => {
-        setBusyModelId(modelId)
-        try {
-            await setLocalAsrActiveModel(modelId)
-            // 顺手把 active provider 也切到本地（避免用户改了模型却忘了切 provider）
-            await setActiveAsrProvider("local-qwen3")
-            await updatePrefs((current) =>
-                current.activeAsrProvider === "local-qwen3" &&
-                current.localAsrActiveModel === modelId
-                    ? current
-                    : {
-                          ...current,
-                          activeAsrProvider: "local-qwen3",
-                          localAsrActiveModel: modelId,
-                      },
-            )
-            await refresh()
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e))
-        } finally {
-            setBusyModelId(null)
-        }
-    }
-
-    // Apple Speech（macOS 系统语音识别）：无模型下载、无凭据，只需把 active
-    // provider 切到 "apple-speech"。复用 setActiveAsrProvider IPC（后端持久化），
-    // 再 updatePrefs 同步本地受控状态。
-    const handleUseAppleSpeech = async () => {
-        try {
-            setError(null)
-            await setActiveAsrProvider("apple-speech")
-            await updatePrefs((current) =>
-                current.activeAsrProvider === "apple-speech"
-                    ? current
-                    : { ...current, activeAsrProvider: "apple-speech" },
-            )
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e))
-        }
-    }
-
     const applyModelsBaseDir = async (modelsBaseDir: string | null) => {
         setStorageBusy(true)
         try {
@@ -1422,7 +1381,28 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
+    // 「加载并测试」（qwen3）：先设为当前模型（含把 active provider 切到本地
+    // —— 与 ProvidersSection 的本地模型下拉一致），再跑内置音频测试。不再单独
+    // 提供「设为默认」按钮：激活 = 在 ASR 语音转写里选择本地模型供应商。
     const handleTest = async (modelId: string) => {
+        try {
+            await setLocalAsrActiveModel(modelId)
+            await setActiveAsrProvider("local-qwen3")
+            await updatePrefs((current) =>
+                current.activeAsrProvider === "local-qwen3" &&
+                current.localAsrActiveModel === modelId
+                    ? current
+                    : {
+                          ...current,
+                          activeAsrProvider: "local-qwen3",
+                          localAsrActiveModel: modelId,
+                      },
+            )
+            await refresh()
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e))
+            return
+        }
         setTestingModelId(modelId)
         setTestResults((prev) => {
             const next = { ...prev }
@@ -1496,7 +1476,6 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         sherpaStatus?.available === true ||
         (foundryPlatformAvailable && sherpaStatus?.available !== false)
     const sherpaDefault = prefs?.activeAsrProvider === "sherpa-onnx-local"
-    const appleSpeechActive = prefs?.activeAsrProvider === "apple-speech"
     const selectedSherpaModel =
         SHERPA_ONNX_ASR_MODELS.find(
             (model) => model.alias === selectedSherpaAlias,
@@ -1738,11 +1717,11 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         setSelectedModelId(firstDownloaded?.id ?? sidebarEntries[0]?.id ?? null)
     }, [sidebarEntries, selectedModelId])
 
-    // 从侧栏/看板分派引擎动作。
-    const dispatchEntryAction = (entry: SidebarModelEntry, action: "download" | "setActive" | "delete" | "reveal") => {
+    // 从侧栏/看板分派引擎动作。不再有 setActive——激活 = 在 ASR 语音转写里
+    // 选本地模型供应商，「加载并测试」负责把模型设为当前使用。
+    const dispatchEntryAction = (entry: SidebarModelEntry, action: "download" | "delete" | "reveal") => {
         if (entry.engine === "qwen3") {
             if (action === "download") void handleDownload(entry.id)
-            else if (action === "setActive") void handleSetActiveModel(entry.id)
             else if (action === "delete") void handleDelete(entry.id)
             else if (action === "reveal") void handleRevealModelDir(entry.id)
         } else if (entry.engine === "sherpa") {
@@ -1750,9 +1729,6 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
             if (action === "download") {
                 setSelectedSherpaAlias(alias)
                 window.setTimeout(() => void handleDownloadSherpa(), 0)
-            } else if (action === "setActive") {
-                setSelectedSherpaAlias(alias)
-                window.setTimeout(() => void handleSherpaModelChange(alias), 0)
             } else if (action === "delete") {
                 setSelectedSherpaAlias(alias)
                 window.setTimeout(() => void handleDeleteSherpa(), 0)
@@ -1763,9 +1739,6 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                 setSelectedFoundryAlias(alias)
                 void handleEnableFoundry()
                 window.setTimeout(() => void handlePrepareFoundry(), 0)
-            } else if (action === "setActive") {
-                setSelectedFoundryAlias(alias)
-                void handleEnableFoundry()
             } else if (action === "delete") {
                 setSelectedFoundryAlias(alias)
                 void handleDeleteFoundry()
@@ -1932,9 +1905,6 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                                 else if (selectedEntry.engine === "sherpa")
                                     void handleCancelSherpaDownload()
                             }}
-                            onSetActive={() =>
-                                selectedEntry && dispatchEntryAction(selectedEntry, "setActive")
-                            }
                             onDelete={() =>
                                 selectedEntry && dispatchEntryAction(selectedEntry, "delete")
                             }
@@ -1951,7 +1921,314 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                 </div>
             </Card>
 
-            {/* ─── 下载弹框：左侧模型选择 + 右侧详情，最下方开始下载。 ─── */}
+            {/* ─── 收纳：下载与存储设置（镜像源 · 模型存储位置 · 内存引擎）——默认收起，
+                 需要手动点开。日常的下载 / 管理 / 测试不依赖这些低频配置。 ─── */}
+            <div style={{ marginBottom: 16 }}>
+                <Collapsible
+                    title={t("localAsr.downloadSettingsTitle")}
+                    desc={t("localAsr.downloadSettingsDesc")}
+                >
+                    {IS_MAC && (
+                        <>
+                        <Card style={{ marginBottom: 16 }}>
+                            <div
+                                style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    justifyContent: "space-between",
+                                    gap: 16,
+                                }}
+                            >
+                                <div>
+                                    <div
+                                        style={{
+                                            fontSize: 12,
+                                            fontWeight: 600,
+                                            color: "var(--ol-ink-4)",
+                                            marginBottom: 4,
+                                        }}
+                                    >
+                                        {t("localAsr.mirrorLabel")}
+                                    </div>
+                                    <div
+                                        style={{
+                                            fontSize: 13,
+                                            color: "var(--ol-ink-3)",
+                                        }}
+                                    >
+                                        {t("localAsr.mirrorDesc")}
+                                    </div>
+                                </div>
+                                <select
+                                    value={settings?.mirror ?? "huggingface"}
+                                    onChange={(e) =>
+                                        void handleMirrorChange(e.target.value)
+                                    }
+                                    style={{
+                                        fontSize: 13,
+                                        padding: "6px 10px",
+                                        borderRadius: 8,
+                                        border: "0.5px solid rgba(0,0,0,0.12)",
+                                        background: "var(--ol-surface)",
+                                        color: "var(--ol-ink)",
+                                        minWidth: 200,
+                                    }}
+                                >
+                                    <option value="huggingface">
+                                        {t("localAsr.mirrorHuggingface")}
+                                    </option>
+                                    <option value="hf-mirror">
+                                        {t("localAsr.mirrorHfMirror")}
+                                    </option>
+                                </select>
+                            </div>
+                        </Card>
+                        {/* 运行时设置卡：内存中的引擎状态 + 多久释放 + 立即释放 */}
+                        {engineAvailable && (
+                            <Card style={{ marginBottom: 16 }}>
+                                <div
+                                    style={{
+                                        display: "flex",
+                                        flexDirection: "column",
+                                        gap: 12,
+                                    }}
+                                >
+                                    <div
+                                        style={{
+                                            display: "flex",
+                                            alignItems: "center",
+                                            justifyContent: "space-between",
+                                            gap: 12,
+                                            flexWrap: "wrap",
+                                        }}
+                                    >
+                                        <div>
+                                            <div
+                                                style={{
+                                                    fontSize: 12,
+                                                    fontWeight: 600,
+                                                    color: "var(--ol-ink-4)",
+                                                    marginBottom: 4,
+                                                }}
+                                            >
+                                                {t("localAsr.engineStatusLabel")}
+                                            </div>
+                                            <div
+                                                style={{
+                                                    fontSize: 13,
+                                                    color: "var(--ol-ink-3)",
+                                                }}
+                                            >
+                                                {engineStatus?.loaded
+                                                    ? t("localAsr.engineLoaded", {
+                                                          model:
+                                                              engineStatus.modelId ??
+                                                              "",
+                                                      })
+                                                    : t("localAsr.engineUnloaded")}
+                                            </div>
+                                        </div>
+                                        <div style={{ display: "flex", gap: 8 }}>
+                                            {engineStatus?.loaded ? (
+                                                <Btn
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    onClick={() =>
+                                                        void handleReleaseEngine()
+                                                    }
+                                                >
+                                                    {t("localAsr.releaseNow")}
+                                                </Btn>
+                                            ) : (
+                                                <Btn
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    onClick={() =>
+                                                        void handlePreload()
+                                                    }
+                                                >
+                                                    {t("localAsr.loadNow")}
+                                                </Btn>
+                                            )}
+                                        </div>
+                                    </div>
+                                    <div
+                                        style={{
+                                            display: "flex",
+                                            alignItems: "center",
+                                            justifyContent: "space-between",
+                                            gap: 12,
+                                            flexWrap: "wrap",
+                                        }}
+                                    >
+                                        <div style={{ minWidth: 0 }}>
+                                            <div
+                                                style={{
+                                                    fontSize: 12,
+                                                    fontWeight: 600,
+                                                    color: "var(--ol-ink-4)",
+                                                    marginBottom: 4,
+                                                }}
+                                            >
+                                                {t("localAsr.keepLoadedLabel")}
+                                            </div>
+                                            <div
+                                                style={{
+                                                    fontSize: 12,
+                                                    color: "var(--ol-ink-3)",
+                                                    lineHeight: 1.5,
+                                                }}
+                                            >
+                                                {t("localAsr.keepLoadedDesc")}
+                                            </div>
+                                        </div>
+                                        <select
+                                            value={
+                                                engineStatus?.keepLoadedSecs ?? 300
+                                            }
+                                            onChange={(e) =>
+                                                void handleKeepLoadedChange(
+                                                    Number(e.target.value),
+                                                )
+                                            }
+                                            style={{
+                                                fontSize: 13,
+                                                padding: "6px 10px",
+                                                borderRadius: 8,
+                                                border: "0.5px solid rgba(0,0,0,0.12)",
+                                                background: "var(--ol-surface)",
+                                                color: "var(--ol-ink)",
+                                                minWidth: 200,
+                                            }}
+                                        >
+                                            <option value={0}>
+                                                {t("localAsr.keepImmediate")}
+                                            </option>
+                                            <option value={60}>
+                                                {t("localAsr.keep1min")}
+                                            </option>
+                                            <option value={300}>
+                                                {t("localAsr.keep5min")}
+                                            </option>
+                                            <option value={1800}>
+                                                {t("localAsr.keep30min")}
+                                            </option>
+                                            <option value={86400}>
+                                                {t("localAsr.keepForever")}
+                                            </option>
+                                        </select>
+                                    </div>
+                                </div>
+                            </Card>
+                        )}
+                        </>
+                    )}
+                    <Card style={{ marginBottom: 16 }}>
+                        <div
+                            style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: 12,
+                            }}
+                        >
+                            <div
+                                style={{
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    gap: 16,
+                                    flexWrap: "wrap",
+                                }}
+                            >
+                                <div style={{ minWidth: 0, flex: "1 1 360px" }}>
+                                    <div
+                                        style={{
+                                            fontSize: 14,
+                                            fontWeight: 700,
+                                            color: "var(--ol-ink)",
+                                            marginBottom: 6,
+                                        }}
+                                    >
+                                        {t("localAsr.storageTitle")}
+                                    </div>
+                                    <div
+                                        style={{
+                                            fontSize: 12.5,
+                                            color: "var(--ol-ink-3)",
+                                            lineHeight: 1.6,
+                                        }}
+                                    >
+                                        <div>
+                                            <span
+                                                style={{ color: "var(--ol-ink-4)" }}
+                                            >
+                                                {t("localAsr.storageBaseDir")}:{" "}
+                                            </span>
+                                            <code>
+                                                {settings?.modelsBaseDir ??
+                                                    t("localAsr.storageDefault")}
+                                            </code>
+                                        </div>
+                                        <div>
+                                            <span
+                                                style={{ color: "var(--ol-ink-4)" }}
+                                            >
+                                                {t("localAsr.storageModelsRoot")}:{" "}
+                                            </span>
+                                            <code>{settings?.modelsRootDir ?? "—"}</code>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div
+                                    style={{
+                                        display: "flex",
+                                        gap: 8,
+                                        flexWrap: "wrap",
+                                        justifyContent: "flex-end",
+                                        alignContent: "flex-start",
+                                    }}
+                                >
+                                    <Btn
+                                        variant="primary"
+                                        size="sm"
+                                        disabled={storageBusy}
+                                        onClick={() => void handleChooseModelsBaseDir()}
+                                    >
+                                        {storageBusy
+                                            ? t("common.loading")
+                                            : t("localAsr.storageChoose")}
+                                    </Btn>
+                                    <Btn
+                                        variant="ghost"
+                                        size="sm"
+                                        disabled={storageBusy || !settings?.modelsBaseDir}
+                                        onClick={() => void handleResetModelsBaseDir()}
+                                    >
+                                        {t("localAsr.storageReset")}
+                                    </Btn>
+                                    <Btn
+                                        variant="ghost"
+                                        size="sm"
+                                        disabled={storageBusy}
+                                        onClick={() => void handleRevealModelsRoot()}
+                                    >
+                                        {t("localAsr.storageReveal")}
+                                    </Btn>
+                                </div>
+                            </div>
+                            <div
+                                style={{
+                                    fontSize: 12,
+                                    color: "var(--ol-ink-4)",
+                                    lineHeight: 1.55,
+                                }}
+                            >
+                                {t("localAsr.storageDesc")}
+                            </div>
+                        </div>
+                    </Card>
+                </Collapsible>
+            </div>
+{/* ─── 下载弹框：左侧模型选择 + 右侧详情，最下方开始下载。 ─── */}
             {downloadDialogOpen && (
                 <DownloadDialog
                     entries={sidebarEntries}
@@ -2799,230 +3076,22 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
           Windows / Linux 看见镜像源 / 下载 / 模型列表都是 dead UI。Foundry 块自身已经
           被上方 IS_WINDOWS 守卫，错误 Card（共享 setError，被 Foundry handler 也写）
           保持无条件露出。 */}
-            {IS_MAC && (
-                <>
-                    {!engineAvailable && (
-                        <Card
-                            style={{
-                                marginBottom: 16,
-                                background: "rgba(255, 235, 200, 0.4)",
-                            }}
-                        >
-                            <div
-                                style={{
-                                    fontSize: 13,
-                                    color: "var(--ol-ink-2)",
-                                }}
-                            >
-                                {t("localAsr.engineUnavailable")}
-                            </div>
-                        </Card>
-                    )}
-
+            {IS_MAC && !engineAvailable && (
+                <Card
+                    style={{
+                        marginBottom: 16,
+                        background: "rgba(255, 235, 200, 0.4)",
+                    }}
+                >
                     <div
                         style={{
                             fontSize: 13,
-                            fontWeight: 700,
-                            color: "var(--ol-ink)",
-                            margin: "4px 0 10px",
+                            color: "var(--ol-ink-2)",
                         }}
                     >
-                        {t("localAsr.qwenTitle")}
+                        {t("localAsr.engineUnavailable")}
                     </div>
-
-                    <Card style={{ marginBottom: 16 }}>
-                        <div
-                            style={{
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "space-between",
-                                gap: 16,
-                            }}
-                        >
-                            <div>
-                                <div
-                                    style={{
-                                        fontSize: 12,
-                                        fontWeight: 600,
-                                        color: "var(--ol-ink-4)",
-                                        marginBottom: 4,
-                                    }}
-                                >
-                                    {t("localAsr.mirrorLabel")}
-                                </div>
-                                <div
-                                    style={{
-                                        fontSize: 13,
-                                        color: "var(--ol-ink-3)",
-                                    }}
-                                >
-                                    {t("localAsr.mirrorDesc")}
-                                </div>
-                            </div>
-                            <select
-                                value={settings?.mirror ?? "huggingface"}
-                                onChange={(e) =>
-                                    void handleMirrorChange(e.target.value)
-                                }
-                                style={{
-                                    fontSize: 13,
-                                    padding: "6px 10px",
-                                    borderRadius: 8,
-                                    border: "0.5px solid rgba(0,0,0,0.12)",
-                                    background: "var(--ol-surface)",
-                                    color: "var(--ol-ink)",
-                                    minWidth: 200,
-                                }}
-                            >
-                                <option value="huggingface">
-                                    {t("localAsr.mirrorHuggingface")}
-                                </option>
-                                <option value="hf-mirror">
-                                    {t("localAsr.mirrorHfMirror")}
-                                </option>
-                            </select>
-                        </div>
-                    </Card>
-
-                    {/* 运行时设置卡：内存中的引擎状态 + 多久释放 + 立即释放 */}
-                    {engineAvailable && (
-                        <Card style={{ marginBottom: 16 }}>
-                            <div
-                                style={{
-                                    display: "flex",
-                                    flexDirection: "column",
-                                    gap: 12,
-                                }}
-                            >
-                                <div
-                                    style={{
-                                        display: "flex",
-                                        alignItems: "center",
-                                        justifyContent: "space-between",
-                                        gap: 12,
-                                        flexWrap: "wrap",
-                                    }}
-                                >
-                                    <div>
-                                        <div
-                                            style={{
-                                                fontSize: 12,
-                                                fontWeight: 600,
-                                                color: "var(--ol-ink-4)",
-                                                marginBottom: 4,
-                                            }}
-                                        >
-                                            {t("localAsr.engineStatusLabel")}
-                                        </div>
-                                        <div
-                                            style={{
-                                                fontSize: 13,
-                                                color: "var(--ol-ink-3)",
-                                            }}
-                                        >
-                                            {engineStatus?.loaded
-                                                ? t("localAsr.engineLoaded", {
-                                                      model:
-                                                          engineStatus.modelId ??
-                                                          "",
-                                                  })
-                                                : t("localAsr.engineUnloaded")}
-                                        </div>
-                                    </div>
-                                    <div style={{ display: "flex", gap: 8 }}>
-                                        {engineStatus?.loaded ? (
-                                            <Btn
-                                                variant="ghost"
-                                                size="sm"
-                                                onClick={() =>
-                                                    void handleReleaseEngine()
-                                                }
-                                            >
-                                                {t("localAsr.releaseNow")}
-                                            </Btn>
-                                        ) : (
-                                            <Btn
-                                                variant="ghost"
-                                                size="sm"
-                                                onClick={() =>
-                                                    void handlePreload()
-                                                }
-                                            >
-                                                {t("localAsr.loadNow")}
-                                            </Btn>
-                                        )}
-                                    </div>
-                                </div>
-                                <div
-                                    style={{
-                                        display: "flex",
-                                        alignItems: "center",
-                                        justifyContent: "space-between",
-                                        gap: 12,
-                                        flexWrap: "wrap",
-                                    }}
-                                >
-                                    <div style={{ minWidth: 0 }}>
-                                        <div
-                                            style={{
-                                                fontSize: 12,
-                                                fontWeight: 600,
-                                                color: "var(--ol-ink-4)",
-                                                marginBottom: 4,
-                                            }}
-                                        >
-                                            {t("localAsr.keepLoadedLabel")}
-                                        </div>
-                                        <div
-                                            style={{
-                                                fontSize: 12,
-                                                color: "var(--ol-ink-3)",
-                                                lineHeight: 1.5,
-                                            }}
-                                        >
-                                            {t("localAsr.keepLoadedDesc")}
-                                        </div>
-                                    </div>
-                                    <select
-                                        value={
-                                            engineStatus?.keepLoadedSecs ?? 300
-                                        }
-                                        onChange={(e) =>
-                                            void handleKeepLoadedChange(
-                                                Number(e.target.value),
-                                            )
-                                        }
-                                        style={{
-                                            fontSize: 13,
-                                            padding: "6px 10px",
-                                            borderRadius: 8,
-                                            border: "0.5px solid rgba(0,0,0,0.12)",
-                                            background: "var(--ol-surface)",
-                                            color: "var(--ol-ink)",
-                                            minWidth: 200,
-                                        }}
-                                    >
-                                        <option value={0}>
-                                            {t("localAsr.keepImmediate")}
-                                        </option>
-                                        <option value={60}>
-                                            {t("localAsr.keep1min")}
-                                        </option>
-                                        <option value={300}>
-                                            {t("localAsr.keep5min")}
-                                        </option>
-                                        <option value={1800}>
-                                            {t("localAsr.keep30min")}
-                                        </option>
-                                        <option value={86400}>
-                                            {t("localAsr.keepForever")}
-                                        </option>
-                                    </select>
-                                </div>
-                            </div>
-                        </Card>
-                    )}
-                </>
+                </Card>
             )}
 
             {error && (
@@ -3034,174 +3103,6 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                 >
                     <div style={{ fontSize: 13, color: "#9b2c2c" }}>
                         {error}
-                    </div>
-                </Card>
-            )}
-
-
-            {/* Apple Speech（macOS 系统语音识别）：无下载、无凭据，零网络兜底。
-                issue #574。和 Qwen3 模型行平级摆一张卡片即可。 */}
-
-            {/* ─── 分组：其他（存储位置 / 系统语音等） ─── */}
-            <GroupTitle>{t("localAsr.groupOther")}</GroupTitle>
-
-            <Card style={{ marginBottom: 16 }}>
-                <div
-                    style={{
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: 12,
-                    }}
-                >
-                    <div
-                        style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            gap: 16,
-                            flexWrap: "wrap",
-                        }}
-                    >
-                        <div style={{ minWidth: 0, flex: "1 1 360px" }}>
-                            <div
-                                style={{
-                                    fontSize: 14,
-                                    fontWeight: 700,
-                                    color: "var(--ol-ink)",
-                                    marginBottom: 6,
-                                }}
-                            >
-                                {t("localAsr.storageTitle")}
-                            </div>
-                            <div
-                                style={{
-                                    fontSize: 12.5,
-                                    color: "var(--ol-ink-3)",
-                                    lineHeight: 1.6,
-                                }}
-                            >
-                                <div>
-                                    <span
-                                        style={{ color: "var(--ol-ink-4)" }}
-                                    >
-                                        {t("localAsr.storageBaseDir")}:{" "}
-                                    </span>
-                                    <code>
-                                        {settings?.modelsBaseDir ??
-                                            t("localAsr.storageDefault")}
-                                    </code>
-                                </div>
-                                <div>
-                                    <span
-                                        style={{ color: "var(--ol-ink-4)" }}
-                                    >
-                                        {t("localAsr.storageModelsRoot")}:{" "}
-                                    </span>
-                                    <code>{settings?.modelsRootDir ?? "—"}</code>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style={{
-                                display: "flex",
-                                gap: 8,
-                                flexWrap: "wrap",
-                                justifyContent: "flex-end",
-                                alignContent: "flex-start",
-                            }}
-                        >
-                            <Btn
-                                variant="primary"
-                                size="sm"
-                                disabled={storageBusy}
-                                onClick={() => void handleChooseModelsBaseDir()}
-                            >
-                                {storageBusy
-                                    ? t("common.loading")
-                                    : t("localAsr.storageChoose")}
-                            </Btn>
-                            <Btn
-                                variant="ghost"
-                                size="sm"
-                                disabled={storageBusy || !settings?.modelsBaseDir}
-                                onClick={() => void handleResetModelsBaseDir()}
-                            >
-                                {t("localAsr.storageReset")}
-                            </Btn>
-                            <Btn
-                                variant="ghost"
-                                size="sm"
-                                disabled={storageBusy}
-                                onClick={() => void handleRevealModelsRoot()}
-                            >
-                                {t("localAsr.storageReveal")}
-                            </Btn>
-                        </div>
-                    </div>
-                    <div
-                        style={{
-                            fontSize: 12,
-                            color: "var(--ol-ink-4)",
-                            lineHeight: 1.55,
-                        }}
-                    >
-                        {t("localAsr.storageDesc")}
-                    </div>
-                </div>
-            </Card>
-            {IS_MAC && (
-                <Card style={{ marginTop: 16 }}>
-                    <div
-                        style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            gap: 16,
-                            flexWrap: "wrap",
-                        }}
-                    >
-                        <div style={{ minWidth: 0 }}>
-                            <div
-                                style={{
-                                    display: "flex",
-                                    alignItems: "center",
-                                    gap: 8,
-                                    marginBottom: 4,
-                                }}
-                            >
-                                <div
-                                    style={{
-                                        fontSize: 13,
-                                        fontWeight: 700,
-                                        color: "var(--ol-ink)",
-                                    }}
-                                >
-                                    {t("localAsr.appleSpeechTitle")}
-                                </div>
-                                {appleSpeechActive && (
-                                    <Pill tone="ok" size="sm">
-                                        {t("localAsr.activeBadge")}
-                                    </Pill>
-                                )}
-                            </div>
-                            <div
-                                style={{
-                                    fontSize: 12.5,
-                                    color: "var(--ol-ink-3)",
-                                    lineHeight: 1.6,
-                                }}
-                            >
-                                {t("localAsr.appleSpeechDesc")}
-                            </div>
-                        </div>
-                        <Btn
-                            variant={appleSpeechActive ? "soft" : "primary"}
-                            disabled={appleSpeechActive}
-                            onClick={() => void handleUseAppleSpeech()}
-                        >
-                            {appleSpeechActive
-                                ? t("localAsr.activeBadge")
-                                : t("localAsr.appleSpeechUse")}
-                        </Btn>
                     </div>
                 </Card>
             )}

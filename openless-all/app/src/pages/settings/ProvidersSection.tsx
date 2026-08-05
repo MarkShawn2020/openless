@@ -33,6 +33,16 @@ import {
   setSherpaOnnxAsrModel,
 } from '../../lib/localAsr';
 
+// 本地模型供应商：在主下拉里标注「本地」后缀，与云端供应商区分开。
+const LOCAL_ASR_PRESET_IDS: ReadonlySet<string> = new Set([
+  'local-qwen3',
+  'foundry-local-whisper',
+  'sherpa-onnx-local',
+]);
+function isLocalAsrPreset(id: string): boolean {
+  return LOCAL_ASR_PRESET_IDS.has(id);
+}
+
 function LlmThinkingToggle({ enabled, onToggle }: { enabled: boolean; onToggle: (next: boolean) => void }) {
   const { t } = useTranslation();
   const mobile = useMobileLayout();
@@ -280,13 +290,13 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
     return () => { cancelled = true; };
   }, [committedAsrProvider]);
 
-  // 本地重引擎（qwen3 / sherpa / foundry）仍只在「高级 → 本地模型」里启用，
-  // 防止新手在主下拉误开 CPU 推理。Apple 语音是系统自带、零凭据、轻量，
-  // 在 macOS 上直接作为常规选项放进主下拉，方便随时选用 / 切走。
+  // 本地引擎（qwen3 / foundry / sherpa）直接作为常规选项放进主下拉（按平台 gating），
+  // 选项名标注「本地」——选了本地模型供应商，ASR 就用本地模型（与 Apple 语音同理），
+  // 不再需要单独的启用开关。模型下载与管理在「服务 → 本地模型」的看板里。
   const visibleAsrPresets = ASR_PRESETS.filter(
-    p => p.id !== 'foundry-local-whisper'
-      && p.id !== 'local-qwen3'
-      && p.id !== 'sherpa-onnx-local'
+    p => (p.id !== 'foundry-local-whisper' || os === 'win')
+      && (p.id !== 'sherpa-onnx-local' || os === 'win')
+      && (p.id !== 'local-qwen3' || os === 'mac')
       && (p.id !== 'apple-speech' || os === 'mac')
       // 百炼三协议收成一个「阿里云百炼」入口(id=bailian)+ 模型下拉。qwen3 / fun-asr-flash
       // 两个旧 id 作隐藏别名:新用户下拉里看不到,只有已经停在该 id 上的老用户仍显示,
@@ -531,7 +541,9 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
                   options={[
                     ...visibleAsrPresets.map(p => ({
                       value: p.id,
-                      label: t(`settings.providers.presets.${p.nameKey}`),
+                      label: isLocalAsrPreset(p.id)
+                        ? `${t(`settings.providers.presets.${p.nameKey}`)}（${t('settings.providers.localTag')}）`
+                        : t(`settings.providers.presets.${p.nameKey}`),
                     })),
                     ...(hiddenLocalActive && hiddenLocalNameKey
                       ? [{
@@ -552,6 +564,8 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
             );
           })()}
         </SettingRow>
+        {/* 供应商切换时 ASR 板块高度 / 内容会变：keyed 淡入动画平滑过渡（ol-tab-fade）。 */}
+        <div key={committedAsrProvider} style={{ animation: 'ol-tab-fade 0.22s var(--ol-motion-soft)' }}>
         {committedAsrProvider === 'volcengine' ? (
           <>
             <SettingRow label={t('settings.providers.volcengineAuthModeLabel')}>
@@ -664,9 +678,9 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
                     void setFoundryLocalAsrModel(next);
                   }
                 }}
-                options={localAsrModels.map(m => ({
+                options={localAsrModels.filter(m => m.isDownloaded).map(m => ({
                   value: m.id,
-                  label: `${m.id} 本地下载（本地下载）`,
+                  label: `${m.id}（${t('settings.providers.localTag')}）`,
                 }))}
                 placeholder={t('settings.providers.localModelEmpty')}
                 ariaLabel={t('settings.providers.localModelLabel')}
@@ -726,6 +740,7 @@ export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
             )}
           </>
         )}
+        </div>
       </Card>
       )}
     </>

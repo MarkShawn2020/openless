@@ -3,6 +3,7 @@
 // stateless beyond local render memoization.
 
 import { useMemo } from "react"
+import { createPortal } from "react-dom"
 import { useTranslation } from "react-i18next"
 import {
     type FoundryPrepareProgress,
@@ -11,6 +12,7 @@ import {
     type LocalAsrTestResult,
 } from "../../lib/localAsr"
 import { Btn, Card, Pill } from "../_atoms"
+import { Icon } from "../../components/Icon"
 import { formatBytes } from "./helpers"
 import type { RemoteSize } from "./types"
 
@@ -726,13 +728,14 @@ export function ModelSidebar({
                 disabled={downloadDisabled}
                 style={{
                     marginTop: 4,
-                    padding: "8px 10px",
+                    padding: "11px 10px",
                     borderRadius: 8,
-                    border: "0.5px dashed var(--ol-line-strong)",
+                    border: "1px dashed var(--ol-line-strong)",
                     background: "transparent",
-                    color: "var(--ol-ink-2)",
+                    color: "var(--ol-blue)",
                     fontFamily: "inherit",
-                    fontSize: 12,
+                    fontSize: 12.5,
+                    fontWeight: 600,
                     cursor: downloadDisabled ? "not-allowed" : "pointer",
                     opacity: downloadDisabled ? 0.5 : 1,
                     transition:
@@ -769,7 +772,6 @@ export function ModelDetailPanel({
     busy,
     onDownload,
     onCancel,
-    onSetActive,
     onDelete,
     onReveal,
     onTest,
@@ -783,7 +785,6 @@ export function ModelDetailPanel({
     busy: boolean
     onDownload: () => void
     onCancel: () => void
-    onSetActive: () => void
     onDelete: () => void
     onReveal: () => void
     onTest: () => void
@@ -895,6 +896,8 @@ export function ModelDetailPanel({
                 </div>
             )}
 
+            {/* 第一行：下载 / 取消，或「加载并测试」——加载即作为当前模型使用，
+                不再单独设「设为默认」（激活 = 在 ASR 语音转写里选本地模型供应商）。 */}
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 {!entry.isDownloaded && (
                     <Btn variant="primary" size="sm" disabled={busy} onClick={onDownload}>
@@ -906,31 +909,36 @@ export function ModelDetailPanel({
                         {t("common.cancel")}
                     </Btn>
                 )}
-                {entry.isDownloaded && (
-                    <>
-                        <Btn variant="primary" size="sm" disabled={busy || entry.isActive} onClick={onSetActive}>
-                            {entry.isActive ? t("localAsr.activePill") : t("localAsr.setDefault")}
-                        </Btn>
-                        {showTest && (
-                            <Btn variant="ghost" size="sm" disabled={busy} onClick={onTest}>
-                                {t("localAsr.test")}
-                            </Btn>
-                        )}
-                        <Btn variant="ghost" size="sm" onClick={onReveal}>
-                            {t("localAsr.revealDir")}
-                        </Btn>
-                        <Btn variant="ghost" size="sm" onClick={onDelete}>
-                            {t("localAsr.delete")}
-                        </Btn>
-                    </>
+                {entry.isDownloaded && showTest && (
+                    <Btn variant="primary" size="sm" disabled={busy} onClick={onTest}>
+                        {t("localAsr.test")}
+                    </Btn>
                 )}
             </div>
+            {/* 第二行：打开目录 + 删除（已下载模型，同一行）。 */}
+            {entry.isDownloaded && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    <Btn variant="ghost" size="sm" onClick={onReveal}>
+                        {t("localAsr.revealDir")}
+                    </Btn>
+                    <Btn variant="ghost" size="sm" onClick={onDelete}>
+                        {t("localAsr.delete")}
+                    </Btn>
+                </div>
+            )}
         </div>
     )
 }
 
-/** 下载弹框：左侧可选模型（竖排，已下载标勾），右侧详情 + 大小，底部开始下载。
- *  布局与两栏看板一致——「下载」只是进入一个聚焦该动作的弹层。 */
+/** 下载弹框：全页式（与设置弹窗同尺寸、顶部锚定），左侧模型选择（竖排，
+ *  已下载标勾）+ 右侧详情，右上角 ✕ 关闭，底部开始下载。
+ *
+ *  必须 createPortal 到 document.body：WindowChrome 根节点带常驻 transform /
+ *  will-change（ol-window-enter 动画 fill-mode: both 保留终帧 transform），
+ *  会创建 containing block —— 直接渲染的话 `position: fixed` 会相对设置弹窗
+ *  而不是视口定位，遮罩只盖住设置面板（内容发灰）、弹框被裁掉一半且点不到
+ *  （与 Modal.tsx 的 GitHub 登录弹窗同一 bug 根因）。portal 出去后 fixed
+ *  相对视口，铺满整窗、始终置顶。 */
 export function DownloadDialog({
     entries,
     selectedId,
@@ -952,7 +960,7 @@ export function DownloadDialog({
 }) {
     const { t } = useTranslation()
     const selected = entries.find((e) => e.id === selectedId) ?? null
-    return (
+    return createPortal(
         <div
             role="dialog"
             aria-modal="true"
@@ -960,13 +968,12 @@ export function DownloadDialog({
                 position: "fixed",
                 inset: 0,
                 background: "var(--ol-overlay-bg)",
-                backdropFilter: "blur(8px)",
-                WebkitBackdropFilter: "blur(8px)",
                 display: "flex",
-                alignItems: "center",
+                alignItems: "flex-start",
                 justifyContent: "center",
                 zIndex: 1000,
-                padding: 16,
+                padding: 28,
+                animation: "ol-modal-backdrop-in 0.18s var(--ol-motion-soft)",
             }}
             onClick={(e) => {
                 if (e.target === e.currentTarget && !busy) onClose()
@@ -974,31 +981,74 @@ export function DownloadDialog({
         >
             <div
                 style={{
-                    width: 640,
-                    maxWidth: "100%",
-                    maxHeight: "80vh",
+                    width: "min(880px, 100%)",
+                    height: "min(600px, calc(100vh - 56px))",
                     display: "flex",
                     flexDirection: "column",
                     borderRadius: 14,
                     background: "var(--ol-surface)",
                     border: "0.5px solid var(--ol-line-strong)",
-                    boxShadow: "var(--ol-shadow-lg)",
+                    boxShadow: "var(--ol-shadow-xl)",
                     overflow: "hidden",
+                    animation: "ol-modal-card-in 0.24s var(--ol-motion-spring)",
                 }}
             >
+                {/* 标题行：左标题 + 右 ✕ 关闭 */}
                 <div
                     style={{
-                        padding: "14px 18px",
-                        fontSize: 14,
-                        fontWeight: 650,
-                        color: "var(--ol-ink)",
+                        padding: "13px 16px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 12,
                         borderBottom: "0.5px solid var(--ol-line)",
                     }}
                 >
-                    {t("localAsr.downloadDialogTitle")}
+                    <div
+                        style={{
+                            fontSize: 14,
+                            fontWeight: 650,
+                            color: "var(--ol-ink)",
+                            letterSpacing: "-0.01em",
+                        }}
+                    >
+                        {t("localAsr.downloadDialogTitle")}
+                    </div>
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        disabled={busy}
+                        aria-label={t("common.close")}
+                        style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            width: 26,
+                            height: 26,
+                            borderRadius: 7,
+                            border: 0,
+                            padding: 0,
+                            background: "transparent",
+                            color: "var(--ol-ink-3)",
+                            cursor: busy ? "not-allowed" : "pointer",
+                            opacity: busy ? 0.5 : 1,
+                            transition:
+                                "background 0.12s var(--ol-motion-quick), color 0.12s var(--ol-motion-quick)",
+                        }}
+                        onMouseEnter={(e) => {
+                            e.currentTarget.style.background = "var(--ol-surface-2)"
+                            e.currentTarget.style.color = "var(--ol-ink)"
+                        }}
+                        onMouseLeave={(e) => {
+                            e.currentTarget.style.background = "transparent"
+                            e.currentTarget.style.color = "var(--ol-ink-3)"
+                        }}
+                    >
+                        <Icon name="close" size={13} />
+                    </button>
                 </div>
-                <div style={{ display: "flex", minHeight: 220, flex: 1, overflow: "hidden" }}>
-                    {/* 左侧：模型选择（竖排） */}
+                <div style={{ display: "flex", minHeight: 0, flex: 1, overflow: "hidden" }}>
+                    {/* 左侧：模型选择（竖排，结构与设置页侧栏一致） */}
                     <div
                         style={{
                             width: 230,
@@ -1011,6 +1061,16 @@ export function DownloadDialog({
                             gap: 6,
                         }}
                     >
+                        <div
+                            style={{
+                                fontSize: 12,
+                                fontWeight: 600,
+                                color: "var(--ol-ink-4)",
+                                marginBottom: 2,
+                            }}
+                        >
+                            {t("localAsr.sidebarTitle")}
+                        </div>
                         {entries.map((entry) => (
                             <button
                                 key={entry.id}
@@ -1027,11 +1087,17 @@ export function DownloadDialog({
                                         entry.id === selectedId
                                             ? "var(--ol-segmented-active-bg)"
                                             : "transparent",
+                                    boxShadow:
+                                        entry.id === selectedId
+                                            ? "var(--ol-segmented-active-shadow)"
+                                            : "none",
                                     color: "var(--ol-ink)",
                                     fontFamily: "inherit",
                                     fontSize: 12.5,
                                     textAlign: "left",
                                     cursor: "pointer",
+                                    transition:
+                                        "background 0.16s var(--ol-motion-quick), box-shadow 0.18s var(--ol-motion-soft)",
                                 }}
                             >
                                 <span
@@ -1051,84 +1117,96 @@ export function DownloadDialog({
                                 </span>
                             </button>
                         ))}
-                    </div>
-                    {/* 右侧：详情（大小 / 文件数 / 状态） */}
-                    <div style={{ flex: 1, minWidth: 0, padding: 14, overflowY: "auto" }}>
-                        {selected ? (
-                            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                                <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--ol-ink)" }}>
-                                    {selected.name}
-                                </div>
-                                {selected.repo && (
-                                    <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)" }}>
-                                        {t("localAsr.detailRepo")}: {selected.repo}
-                                    </div>
-                                )}
-                                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, fontSize: 11 }}>
-                                    {(() => {
-                                        const bytes = sizeOf(selected.id)
-                                        const files = fileCountOf(selected.id)
-                                        return (
-                                            <>
-                                                {bytes != null && bytes > 0 && (
-                                                    <span style={{ padding: "2px 8px", borderRadius: 999, background: "rgba(0,0,0,0.05)", color: "var(--ol-ink-2)" }}>
-                                                        {formatBytes(bytes)}
-                                                    </span>
-                                                )}
-                                                {files != null && files > 0 && (
-                                                    <span style={{ padding: "2px 8px", borderRadius: 999, background: "rgba(0,0,0,0.05)", color: "var(--ol-ink-2)" }}>
-                                                        {files} {t("localAsr.detailFiles")}
-                                                    </span>
-                                                )}
-                                            </>
-                                        )
-                                    })()}
-                                    {selected.isDownloaded && (
-                                        <span style={{ padding: "2px 8px", borderRadius: 999, background: "rgba(40,160,90,0.12)", color: "var(--ol-ok)" }}>
-                                            ✓ {t("localAsr.detailDownloaded")}
-                                        </span>
-                                    )}
-                                </div>
-                                {selected.isDownloaded && (
-                                    <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)" }}>
-                                        {t("localAsr.downloadDialogAlreadyHave")}
-                                    </div>
-                                )}
-                            </div>
-                        ) : (
-                            <div style={{ fontSize: 12, color: "var(--ol-ink-4)" }}>
-                                {t("localAsr.detailEmpty")}
+                        {entries.length === 0 && (
+                            <div style={{ fontSize: 12, color: "var(--ol-ink-4)", padding: "4px 2px" }}>
+                                {t("localAsr.modelSelectEmpty")}
                             </div>
                         )}
                     </div>
-                </div>
-                <div
-                    style={{
-                        padding: "12px 18px",
-                        borderTop: "0.5px solid var(--ol-line)",
-                        display: "flex",
-                        justifyContent: "flex-end",
-                        gap: 8,
-                    }}
-                >
-                    <Btn variant="ghost" size="sm" disabled={busy} onClick={onClose}>
-                        {t("common.cancel")}
-                    </Btn>
-                    <Btn
-                        variant="primary"
-                        size="sm"
-                        disabled={busy || !selected || selected.isDownloaded}
-                        onClick={onStart}
-                    >
-                        {t("localAsr.startDownload")}
-                    </Btn>
+                    {/* 右侧：说明 + 详情（大小 / 文件数 / 状态） */}
+                    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+                        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 16 }}>
+                            <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)", lineHeight: 1.6, marginBottom: 12 }}>
+                                {t("localAsr.downloadDialogDesc")}
+                            </div>
+                            {selected ? (
+                                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                                    <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--ol-ink)" }}>
+                                        {selected.name}
+                                    </div>
+                                    {selected.repo && (
+                                        <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)" }}>
+                                            {t("localAsr.detailRepo")}: {selected.repo}
+                                        </div>
+                                    )}
+                                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, fontSize: 11 }}>
+                                        {(() => {
+                                            const bytes = sizeOf(selected.id)
+                                            const files = fileCountOf(selected.id)
+                                            return (
+                                                <>
+                                                    {bytes != null && bytes > 0 && (
+                                                        <span style={{ padding: "2px 8px", borderRadius: 999, background: "rgba(0,0,0,0.05)", color: "var(--ol-ink-2)" }}>
+                                                            {formatBytes(bytes)}
+                                                        </span>
+                                                    )}
+                                                    {files != null && files > 0 && (
+                                                        <span style={{ padding: "2px 8px", borderRadius: 999, background: "rgba(0,0,0,0.05)", color: "var(--ol-ink-2)" }}>
+                                                            {files} {t("localAsr.detailFiles")}
+                                                        </span>
+                                                    )}
+                                                </>
+                                            )
+                                        })()}
+                                        {selected.isDownloaded && (
+                                            <span style={{ padding: "2px 8px", borderRadius: 999, background: "rgba(40,160,90,0.12)", color: "var(--ol-ok)" }}>
+                                                ✓ {t("localAsr.detailDownloaded")}
+                                            </span>
+                                        )}
+                                    </div>
+                                    {selected.isDownloaded && (
+                                        <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)" }}>
+                                            {t("localAsr.downloadDialogAlreadyHave")}
+                                        </div>
+                                    )}
+                                </div>
+                            ) : (
+                                <div style={{ fontSize: 12, color: "var(--ol-ink-4)" }}>
+                                    {t("localAsr.detailEmpty")}
+                                </div>
+                            )}
+                        </div>
+                        <div
+                            style={{
+                                padding: "12px 18px",
+                                borderTop: "0.5px solid var(--ol-line)",
+                                display: "flex",
+                                justifyContent: "flex-end",
+                                gap: 8,
+                            }}
+                        >
+                            <Btn variant="ghost" size="sm" disabled={busy} onClick={onClose}>
+                                {t("common.cancel")}
+                            </Btn>
+                            <Btn
+                                variant="primary"
+                                size="sm"
+                                disabled={busy || !selected || selected.isDownloaded}
+                                onClick={onStart}
+                            >
+                                {t("localAsr.startDownload")}
+                            </Btn>
+                        </div>
+                    </div>
                 </div>
             </div>
-        </div>
+        </div>,
+        document.body,
     )
 }
 
-/** 右上角下载进度浮层：多个下载条目叠放，直到各自下载完成才消失。 */
+/** 右上角下载进度浮层：多个下载条目叠放，直到各自下载完成才消失。
+ *  同样 portal 到 document.body——fixed 定位必须相对视口（见 DownloadDialog 注释）。 */
 export function GlobalDownloadProgress({
     items,
 }: {
@@ -1142,7 +1220,7 @@ export function GlobalDownloadProgress({
     const { t } = useTranslation()
     const visible = items.filter((item) => !item.finished)
     if (visible.length === 0) return null
-    return (
+    return createPortal(
         <div
             style={{
                 position: "fixed",
@@ -1196,6 +1274,7 @@ export function GlobalDownloadProgress({
                     </div>
                 </div>
             ))}
-        </div>
+        </div>,
+        document.body,
     )
 }
