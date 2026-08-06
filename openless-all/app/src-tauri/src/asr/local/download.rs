@@ -248,15 +248,17 @@ async fn fetch_readme_first_paragraph(
 pub(crate) const HF_CARD_DESC_MAX_CHARS: usize = 280;
 
 /// 纯函数：README markdown → 首个有实质内容的段落。跳过 yaml front-matter、
-/// 标题行（`#` 开头）、图片（`!` 开头）、表格（`|` 开头）与分隔线（`---`）；
-/// 段落内多行合并成一句。便于单测。
+/// 标题行（`#` 开头）、图片（`!` 开头）、表格（`|` 开头）、分隔线（`---`）、
+/// HTML 标签行（`<div`/`<p`/`<img`…，badges 区常见）与整行为 markdown 链接
+/// 的行（`[![badge](…)](…)` / `[中文](…)` 语言切换行）；段落内多行合并成
+/// 一句，并剥掉行内链接 / 强调符。便于单测。
 pub(crate) fn first_readme_paragraph(markdown: &str) -> String {
     for block in markdown.split("\n\n") {
         let block = block.trim();
         if block.is_empty() || block.starts_with("---") {
             continue;
         }
-        let mut parts: Vec<&str> = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
         for raw_line in block.lines() {
             let line = raw_line.trim();
             if line.is_empty()
@@ -264,10 +266,15 @@ pub(crate) fn first_readme_paragraph(markdown: &str) -> String {
                 || line.starts_with('!')
                 || line.starts_with('|')
                 || line.starts_with("---")
+                || line.starts_with('<')
+                || is_link_only_line(line)
             {
                 continue;
             }
-            parts.push(line);
+            let stripped = strip_markdown_inline(line);
+            if !stripped.is_empty() {
+                parts.push(stripped);
+            }
         }
         if parts.is_empty() {
             continue;
@@ -275,6 +282,75 @@ pub(crate) fn first_readme_paragraph(markdown: &str) -> String {
         return truncate_description(&parts.join(" "));
     }
     String::new()
+}
+
+/// 整行是否只有 markdown 链接（badges 链 `[![a](u)](v)`、语言切换行
+/// `[中文](url) | [English](url)`）。逐个剥离 `[text](url)`，检查链接之间
+/// 与行首尾只允许纯分隔符（`|`、逗号、顿号、空白）；badge 链（img.shields.io）
+/// 剥不干净（嵌套 `]` 残留括号碎片），直接按特征跳过。
+fn is_link_only_line(line: &str) -> bool {
+    if line.contains("img.shields.io") || line.trim_start().starts_with("[![") {
+        return true;
+    }
+    let mut rest = line;
+    loop {
+        let Some(open) = rest.find('[') else { break };
+        if !is_separator_only(&rest[..open]) {
+            return false;
+        }
+        let tail = &rest[open + 1..];
+        let Some(close) = tail.find("](") else {
+            return false;
+        };
+        let after = &tail[close + 2..];
+        let Some(end) = after.find(')') else {
+            return false;
+        };
+        rest = &after[end + 1..];
+    }
+    is_separator_only(rest)
+}
+
+/// 片段是否只含分隔符 / 空白（链接行允许的行首、行尾与链接间间隔）。
+fn is_separator_only(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_whitespace() || matches!(c, '|' | ',' | '·' | '、'))
+}
+
+/// 剥掉行内 markdown 语法，保留链接显示文本：`[text](url)` → `text`、
+/// `![alt](url)` → 空（`!` 在 `[` 前面，图片 alt 不保留）、
+/// `` `code` `` / `**bold**` / `*italic*` / `_x_` → 裸文本。
+fn strip_markdown_inline(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let tail = &rest[open + 1..];
+        if let Some(close) = tail.find("](") {
+            let text = &tail[..close];
+            let after = &tail[close + 2..];
+            if let Some(end) = after.find(')') {
+                let is_image = out.ends_with('!');
+                if is_image {
+                    out.pop(); // 图片标记 `!` 在链接外，随 alt 一起丢弃
+                }
+                let text = text.trim();
+                if !is_image && !text.is_empty() {
+                    out.push_str(text);
+                }
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+        // 不是链接结构的 `[`：原样保留继续扫。
+        out.push('[');
+        rest = tail;
+    }
+    out.push_str(rest);
+    out.replace("**", "")
+        .replace('`', "")
+        .replace('*', "")
+        .replace('_', "")
 }
 
 /// 纯函数：描述截断到 [`HF_CARD_DESC_MAX_CHARS`]，超长加省略号。
@@ -548,9 +624,7 @@ async fn run_download(
                 // 节流：距上次 emit < 150ms 的中间进度直接丢弃（高频事件会让
                 // 前端进度条抽搐），in_flight 仍照常累计，下次 emit 带的是最新值。
                 let now = now_millis();
-                if now - last_emit.load(Ordering::Relaxed)
-                    < PROGRESS_EMIT_MIN_INTERVAL_MS
-                {
+                if now - last_emit.load(Ordering::Relaxed) < PROGRESS_EMIT_MIN_INTERVAL_MS {
                     return;
                 }
                 last_emit.store(now, Ordering::Relaxed);
@@ -1201,8 +1275,9 @@ fn emit_cancelled(
 #[cfg(test)]
 mod tests {
     use super::{
-        existing_file_is_complete, first_readme_paragraph, remove_partial_artifacts,
-        truncate_description, HF_CARD_DESC_MAX_CHARS,
+        existing_file_is_complete, first_readme_paragraph, is_link_only_line,
+        remove_partial_artifacts, strip_markdown_inline, truncate_description,
+        HF_CARD_DESC_MAX_CHARS,
     };
 
     #[test]
@@ -1275,6 +1350,53 @@ mod tests {
     fn first_readme_paragraph_returns_empty_when_only_markup() {
         let md = "# Only headers\n\n---\n\n![image](x.png)";
         assert_eq!(first_readme_paragraph(md), "");
+    }
+
+    #[test]
+    fn first_readme_paragraph_skips_html_badge_lines() {
+        // Qwen3 README 实际结构：HTML 包裹的 badge 区 + 徽章链接行 + 正文。
+        let md = "# Qwen3\n\n<p align=\"center\">\n  <img src=\"qwen.png\" width=\"400\">\n</p>\n\n<div align=\"center\">\n  <h4> <a href=\"#\">中文</a> | <a href=\"#\">English</a> </h4>\n</div>\n\n[![Model License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)\n\nQwen3 is a next-generation open model.";
+        assert_eq!(
+            first_readme_paragraph(md),
+            "Qwen3 is a next-generation open model."
+        );
+    }
+
+    #[test]
+    fn first_readme_paragraph_skips_link_only_lines() {
+        // 语言切换行与 badge 链整行都是纯链接，不应当正文。
+        assert!(is_link_only_line(
+            "[中文](https://a.cn) | [English](https://a.io)"
+        ));
+        assert!(is_link_only_line(
+            "[![badge](https://img.shields.io/badge/a-1.svg)](https://x)"
+        ));
+        assert!(!is_link_only_line(
+            "See the [docs](https://d.io) for details"
+        ));
+    }
+
+    #[test]
+    fn strip_markdown_inline_keeps_link_text_drops_markup() {
+        assert_eq!(
+            strip_markdown_inline("See [Qwen3](https://hf.co/Qwen/Qwen3) docs"),
+            "See Qwen3 docs"
+        );
+        assert_eq!(strip_markdown_inline("![logo](logo.png)"), "");
+        assert_eq!(
+            strip_markdown_inline("**bold** and `code` and _em_"),
+            "bold and code and em"
+        );
+    }
+
+    #[test]
+    fn first_readme_paragraph_strips_inline_links_and_emphasis() {
+        let md =
+            "# Title\n\nCheck the **official** [Qwen3](https://hf.co/Qwen/Qwen3) page for details.";
+        assert_eq!(
+            first_readme_paragraph(md),
+            "Check the official Qwen3 page for details."
+        );
     }
 
     #[test]

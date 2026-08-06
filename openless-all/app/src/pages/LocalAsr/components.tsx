@@ -1063,7 +1063,10 @@ export function DownloadDialog({
                 justifyContent: "center",
                 zIndex: 1000,
                 padding: 28,
-                animation: "ol-modal-backdrop-in 0.18s var(--ol-motion-soft)",
+                // 无入场动画：WKWebView 上遮罩/卡片的合成层动画（opacity/
+                // transform）叠加在弹窗打开瞬间的 setState 重渲染上，会被
+                // 反复重栅格化——用户感知为「弹窗闪一下」。淡入只有 0.2s，
+                // 收益为零，去掉最稳（#928 实测后回退）。
             }}
             onClick={(e) => {
                 // busy = 真实下载中（index 传 anyDownloadInFlight）：下载中点击
@@ -1083,10 +1086,8 @@ export function DownloadDialog({
                     border: "0.5px solid var(--ol-line-strong)",
                     boxShadow: "var(--ol-shadow-xl)",
                     overflow: "hidden",
-                    // 用非回弹曲线（--ol-motion-soft）：spring 有 overshoot，
-                    // 弹窗入场会上下弹跳；WKWebView 重放动画时更明显。
-                    animation:
-                        "ol-modal-card-in 0.24s var(--ol-motion-soft)",
+                    // 无入场动画，见上方遮罩注释：动画重放是「弹窗闪一下 /
+                    // 上下动」的 WKWebView 合成层根源，去掉后纯静态出现。
                 }}
             >
                 {/* 标题行：左标题 + 右 ✕ 关闭 */}
@@ -1279,7 +1280,7 @@ export function DownloadDialog({
                                                     {t("localAsr.hfLikes")}: {formatCount(hfCard.card.likes)}
                                                 </span>
                                             </div>
-                                            {hfCard.card.description && (
+                                            {hfCard.card.description ? (
                                                 <>
                                                     <div style={{ fontSize: 11, color: "var(--ol-ink-4)", letterSpacing: ".02em" }}>
                                                         {t("localAsr.hfDescription")}
@@ -1296,6 +1297,10 @@ export function DownloadDialog({
                                                         {hfCard.card.description}
                                                     </div>
                                                 </>
+                                            ) : (
+                                                <div style={{ fontSize: 11.5, color: "var(--ol-ink-4)" }}>
+                                                    {t("localAsr.hfNoDescription")}
+                                                </div>
                                             )}
                                         </div>
                                     )}

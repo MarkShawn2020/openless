@@ -200,9 +200,6 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     const [engineStatus, setEngineStatus] =
         useState<LocalAsrEngineStatus | null>(null)
     const refreshTimer = useRef<number | null>(null)
-    // 弹窗打开期间停掉 3s 轮询：轮询会 setState 重排遮罩后的看板内容，
-    // 透过半透明遮罩看得到内容在跳（配合 WKWebView 重栅格化更明显）。
-    const downloadDialogOpenRef = useRef(false)
     const foundryRefreshTimer = useRef<number | null>(null)
     const sherpaRefreshTimer = useRef<number | null>(null)
     const sherpaDownloadRefreshTimer = useRef<number | null>(null)
@@ -561,10 +558,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         // 3s 轮询磁盘状态：模型被外部删除 / 下载中断时前端自动跟随（删除后
         // 看板选中自动回落、下拉回到引擎级入口），不用等重开页面。qwen3 的
         // list 是本地 fs walk，很轻；远端尺寸有缓存不会重复请求。
-        // 下载弹窗打开时暂停——弹窗是静态目录选择，轮询的重渲染会让遮罩后
-        // 的看板内容每 3s 跳动一次。
         const pollTimer = window.setInterval(() => {
-            if (downloadDialogOpenRef.current) return
             void refresh()
         }, 3000)
         return () => {
@@ -574,9 +568,16 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
 
-    // 弹窗打开状态同步到 ref（上述 mount 闭包读不到最新 state）。
+    // 下载弹窗打开期间暂停 3s 轮询：弹窗是静态目录选择，轮询 setState 会
+    // 重排遮罩后的看板内容，透过半透明遮罩看得到内容在跳。弹窗关闭后轮询
+    // 自动重启（依赖 downloadDialogOpen 的 effect 重建 interval）。
     useEffect(() => {
-        downloadDialogOpenRef.current = downloadDialogOpen
+        if (downloadDialogOpen) return
+        const pollTimer = window.setInterval(() => {
+            void refresh()
+        }, 3000)
+        return () => window.clearInterval(pollTimer)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [downloadDialogOpen])
 
     // 引擎状态改由后端主动 emit（加载/释放/keepLoadedSecs 变更），前端零轮询。
@@ -629,19 +630,9 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [settings?.mirror])
 
-    // 弹窗打开时预加载全部条目的 HF 模型卡片（macOS 两个 Qwen3 模型并行抓取，
-    // 毫秒级）。切换选项时右侧内容直接有数据——不做「加载中→内容」的替换，
-    // 切换闪烁也就不存在了。结果缓存；失败条目靠下方选中时补拉重试。
-    useEffect(() => {
-        if (!downloadDialogOpen || !settings) return
-        for (const entry of allSidebarEntries) {
-            if (!entry.repo) continue
-            void ensureHfCard(entry.id, settings.mirror)
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [downloadDialogOpen, settings?.mirror])
-
-    // 选中模型变化时补一次：缓存命中立即返回（零开销），失败的条目在此重试。
+    // 选中模型变化时按需拉 HF 模型卡片（只请求当前选中项，不做全目录预加载
+    // ——打开瞬间并行发多个网络请求 + setState 是 WKWebView 重栅格化闪烁的
+    // 峰值源）。成功结果缓存，切换回已加载的模型零请求；失败条目在此重试。
     useEffect(() => {
         if (!downloadDialogOpen || !selectedModelId || !settings) return
         const entry = allSidebarEntries.find((e) => e.id === selectedModelId)
@@ -1852,6 +1843,21 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         () => allSidebarEntries.filter((e) => e.isDownloaded || e.isDownloading),
         [allSidebarEntries],
     )
+
+    // 弹窗打开时若看板选中项不在全目录里（零下载用户未选中任何模型），把
+    // 弹窗默认高亮写回 selectedModelId——弹窗高亮与看板 state 一致，后续
+    // 切换 / 开始下载都基于同一值，没有「弹窗内显示 A、逻辑上是 B」的分叉。
+    useEffect(() => {
+        if (!downloadDialogOpen) return
+        const valid = allSidebarEntries.some((e) => e.id === selectedModelId)
+        if (valid) return
+        const fallback =
+            allSidebarEntries.find((e) => !e.isDownloaded) ??
+            allSidebarEntries[0] ??
+            null
+        setSelectedModelId(fallback?.id ?? null)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [downloadDialogOpen, allSidebarEntries, selectedModelId])
 
     const selectedEntry =
         sidebarEntries.find((e) => e.id === selectedModelId) ?? null
