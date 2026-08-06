@@ -8,7 +8,7 @@
 //
 // 设计原则：每个可见控件都必须可用。
 
-import { useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Icon } from './Icon';
 import { SavedToast } from './SavedToast';
@@ -61,6 +61,10 @@ export function SettingsModal({ os: _os, onClose, initialSettingsSection }: Sett
   const mobile = useMobileLayout();
   const [section, setSection] = useState<SettingsSectionId>(initialSettingsSection ?? 'general');
   const savedToast = useSavedToastListener();
+  // [diag] 临时诊断：#928 v8 定位「折叠区 3 秒自动收起」重挂载层
+  useEffect(() => {
+    console.info('[diag] SettingsModal MOUNT section=', section);
+  }, []);
 
   // 与 sidebar nav 一致的滑动指示器：仅 tab 组有 pill；外链组永远不画 pill（desktop）。
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);

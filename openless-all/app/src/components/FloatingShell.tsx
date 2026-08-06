@@ -98,6 +98,13 @@ function FloatingShellBody({ os, initialTab, initialSettings }: { os: OS; initia
   const [hotkeyModePromptOpen, setHotkeyModePromptOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [styleOpen, setStyleOpen] = useState(false);
+  // [diag] 临时诊断：#928 v8 定位「折叠区 3 秒自动收起」重挂载层
+  useEffect(() => {
+    console.info('[diag] settingsOpen =', settingsOpen);
+  }, [settingsOpen]);
+  useEffect(() => {
+    console.info('[diag] settingsInitialSection =', settingsInitialSection);
+  }, [settingsInitialSection]);
 
   // tab 切换的 cross-fade：旧页 blur+fade out（180ms），结束后挂载新页（走 ol-page-slide enter）。
   // displayTab 是实际渲染的 tab，currentTab 是用户点中的目标 tab。

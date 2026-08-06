@@ -2,7 +2,7 @@
 // Ported verbatim from design_handoff_openless/pages.jsx (PageHeader, Card,
 // Pill, Btn). Inline styles preserved 1:1.
 
-import { useState, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Icon } from '../components/Icon';
 import { useMobileLayout } from '../lib/useMobileLayout';
 
@@ -182,6 +182,12 @@ interface CollapsibleProps {
 /// `embedded=false`：独立 block，自带 Card 同款外观（border / radius / shadow）。
 export function Collapsible({ title, desc, defaultOpen = false, embedded = false, children }: CollapsibleProps) {
   const [open, setOpen] = useState(defaultOpen);
+  // [diag] 临时诊断：复现「折叠区 3 秒自动收起」时区分重挂载层（#928 v8）
+  const mountCountRef = useRef(0);
+  useEffect(() => {
+    mountCountRef.current += 1;
+    console.info(`[diag] Collapsible MOUNT #${mountCountRef.current} open=${open} title=${typeof title === 'string' ? title : '(node)'}`);
+  }, []);
   return (
     <div
       style={{

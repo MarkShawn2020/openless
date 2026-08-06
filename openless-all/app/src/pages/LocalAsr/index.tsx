@@ -553,6 +553,12 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
+    // [diag] 临时诊断：#928 v8 复现「折叠区 3 秒自动收起」时定位重挂载层
+    useEffect(() => {
+        console.info("[diag] LocalAsr MOUNT")
+        return () => console.info("[diag] LocalAsr UNMOUNT")
+    }, [])
+
     useEffect(() => {
         void refresh()
         // 3s 轮询磁盘状态：模型被外部删除 / 下载中断时前端自动跟随（删除后
@@ -574,10 +580,16 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     useEffect(() => {
         if (downloadDialogOpen) return
         const pollTimer = window.setInterval(() => {
+            console.info("[diag] poll tick")
             void refresh()
         }, 3000)
         return () => window.clearInterval(pollTimer)
         // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [downloadDialogOpen])
+
+    // [diag] 弹窗开关变化日志
+    useEffect(() => {
+        console.info("[diag] downloadDialogOpen =", downloadDialogOpen)
     }, [downloadDialogOpen])
 
     // 引擎状态改由后端主动 emit（加载/释放/keepLoadedSecs 变更），前端零轮询。
