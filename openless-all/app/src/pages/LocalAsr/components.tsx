@@ -1066,6 +1066,9 @@ export function DownloadDialog({
                 animation: "ol-modal-backdrop-in 0.18s var(--ol-motion-soft)",
             }}
             onClick={(e) => {
+                // busy = 真实下载中（index 传 anyDownloadInFlight）：下载中点击
+                // 遮罩不关闭——否则用户点遮罩下的设置项时弹窗会「像按了叉一样
+                // 消失」，误以为是设置页闪退。只能走右上角 ✕ 关闭。
                 if (e.target === e.currentTarget && !busy) onClose()
             }}
         >
@@ -1141,17 +1144,19 @@ export function DownloadDialog({
                     </button>
                 </div>
                 <div style={{ display: "flex", minHeight: 0, flex: 1, overflow: "hidden" }}>
-                    {/* 左侧：模型选择（竖排，结构与设置页侧栏一致） */}
+                    {/* 左侧：模型选择（竖排）——与设置页左栏 rail 同风格，
+                        宽度对齐设置页（200px），让弹窗看起来和设置页是一体的 */}
                     <div
                         style={{
-                            width: 230,
+                            width: 200,
                             flexShrink: 0,
-                            borderRight: "0.5px solid var(--ol-line)",
-                            padding: 12,
+                            background: "var(--ol-settings-rail-bg)",
+                            borderRight: "0.5px solid var(--ol-line-soft)",
+                            padding: "14px 12px",
                             overflowY: "auto",
                             display: "flex",
                             flexDirection: "column",
-                            gap: 6,
+                            gap: 4,
                         }}
                     >
                         <div
@@ -1159,7 +1164,7 @@ export function DownloadDialog({
                                 fontSize: 12,
                                 fontWeight: 600,
                                 color: "var(--ol-ink-4)",
-                                marginBottom: 2,
+                                marginBottom: 6,
                             }}
                         >
                             {t("localAsr.sidebarTitle")}
@@ -1173,9 +1178,9 @@ export function DownloadDialog({
                                     display: "flex",
                                     alignItems: "center",
                                     gap: 8,
-                                    padding: "8px 10px",
+                                    padding: "7px 10px",
                                     borderRadius: 8,
-                                    border: "0.5px solid var(--ol-line-soft)",
+                                    border: 0,
                                     background:
                                         entry.id === resolvedId
                                             ? "var(--ol-segmented-active-bg)"
@@ -1190,7 +1195,7 @@ export function DownloadDialog({
                                     textAlign: "left",
                                     cursor: "pointer",
                                     transition:
-                                        "background 0.16s var(--ol-motion-quick), box-shadow 0.18s var(--ol-motion-soft)",
+                                        "background 0.12s var(--ol-motion-quick), box-shadow 0.12s var(--ol-motion-quick)",
                                 }}
                             >
                                 <span

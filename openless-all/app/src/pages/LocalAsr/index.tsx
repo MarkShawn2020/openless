@@ -629,8 +629,19 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [settings?.mirror])
 
-    // 弹窗打开且选中模型（有 HF 仓库的）时抓取模型卡片（下载量/收藏/简介）。
-    // 结果缓存；切换弹窗内选择时增量抓取。
+    // 弹窗打开时预加载全部条目的 HF 模型卡片（macOS 两个 Qwen3 模型并行抓取，
+    // 毫秒级）。切换选项时右侧内容直接有数据——不做「加载中→内容」的替换，
+    // 切换闪烁也就不存在了。结果缓存；失败条目靠下方选中时补拉重试。
+    useEffect(() => {
+        if (!downloadDialogOpen || !settings) return
+        for (const entry of allSidebarEntries) {
+            if (!entry.repo) continue
+            void ensureHfCard(entry.id, settings.mirror)
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [downloadDialogOpen, settings?.mirror])
+
+    // 选中模型变化时补一次：缓存命中立即返回（零开销），失败的条目在此重试。
     useEffect(() => {
         if (!downloadDialogOpen || !selectedModelId || !settings) return
         const entry = allSidebarEntries.find((e) => e.id === selectedModelId)
@@ -1516,6 +1527,17 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     }
 
     const engineAvailable = settings?.engineAvailable ?? false
+    // 真实「下载中」判定：busyModelId 在下载启动后立即清空（Rust 命令同步返回，
+    // 下载跑在后端线程），下载中的可靠标志是 progress 条目的 phase。用于：
+    // 1) 下载弹窗 busy —— 遮罩点击不误关（用户点遮罩下的设置项时弹窗不能
+    //    「像按了叉一样消失」）；2) 「＋ 下载新模型」按钮下载中禁用。
+    const anyDownloadInFlight =
+        Object.values(progress).some(
+            (p) => p.phase === "started" || p.phase === "progress",
+        ) ||
+        Object.values(sherpaDownloadProgress).some(
+            (p) => p.phase === "started" || p.phase === "progress",
+        )
     const foundryPlatformAvailable = isWindowsLikePlatform()
     const foundryAvailable =
         foundryStatus?.available === true ||
@@ -1977,7 +1999,11 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                             void refresh()
                         }}
                         onOpenDownload={() => setDownloadDialogOpen(true)}
-                        downloadDisabled={busyModelId !== null || sherpaBusy !== null}
+                        downloadDisabled={
+                            busyModelId !== null ||
+                            sherpaBusy !== null ||
+                            anyDownloadInFlight
+                        }
                     />                    <div
                         style={{
                             paddingLeft: 16,
@@ -2363,7 +2389,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                                   : null
                         return remote?.fileCount ?? null
                     }}
-                    busy={busyModelId !== null}
+                    busy={busyModelId !== null || anyDownloadInFlight}
                     hfCardOf={(id) => {
                         const state = hfCards[id]
                         if (!state) return null
