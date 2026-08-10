@@ -27,7 +27,7 @@
   <a href="https://github.com/Open-Less/openless/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Open-Less/openless?style=flat-square&color=2c5282" /></a>
   <a href="https://github.com/Open-Less/openless/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/Open-Less/openless?style=flat-square&color=2f855a" /></a>
   <a href="https://github.com/Open-Less/openless/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/Open-Less/openless?style=flat-square&color=805ad5" /></a>
-  <a href="https://discord.gg/vTZHTFGFm"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
+  <a href="https://discord.gg/hK6maSPkkF"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@
 </p>
 
 <p align="center">
-  💬 &nbsp;<a href="https://discord.gg/vTZHTFGFm"><strong>加入 Discord 社区</strong></a> &nbsp;·&nbsp; QQ 群&nbsp; <strong>1078960553</strong>
+  💬 &nbsp;<a href="https://discord.gg/hK6maSPkkF"><strong>加入 Discord 社区</strong></a> &nbsp;·&nbsp; QQ 群&nbsp; <strong>1078960553</strong>
 </p>
 
 <br/>
