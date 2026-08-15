@@ -8,13 +8,14 @@ import { ShortcutsSection } from './ShortcutsSection';
 import { SelectionPolishSection } from './SelectionPolishSection';
 import { LanguageSection } from './LanguageSection';
 import { ThemeSection } from './ThemeSection';
-import { ProvidersSection } from './ProvidersSection';
+import { ProvidersSection } from './ChannelList';
 import { NetworkSection } from './NetworkSection';
 import { MarketplaceSection } from './MarketplaceSection';
 import { PermissionsSection } from './PermissionsSection';
 import { DataStorageSection } from './DataStorageSection';
 import { LocalModelSection } from './LocalModelSection';
 import { DebugToolsSection } from './DebugToolsSection';
+import { MultimodalPipelineSection } from './MultimodalPipelineSection';
 import { CodingAgentSection } from './CodingAgentSection';
 import { ClaudeConsoleSection } from './ClaudeConsoleSection';
 import { BetaChannelSection } from './BetaChannelSection';
@@ -116,6 +117,7 @@ export function AdvancedTab() {
     <>
       {showDesktopAdvanced && os !== 'win' && <CodingAgentSection />}
       {showDesktopAdvanced && os !== 'win' && <ClaudeConsoleSection />}
+      <MultimodalPipelineSection />
       {showDebugTools && <DebugToolsSection />}
     </>
   );

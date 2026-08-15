@@ -43,8 +43,8 @@ pub(crate) use crate::coordinator::Coordinator;
 pub(crate) use crate::net;
 pub(crate) use crate::permissions::{self, PermissionStatus};
 pub(crate) use crate::persistence::{
-    sync_style_pack_preferences, CredentialAccount, CredentialsSnapshot, CredentialsVault,
-    PreferencesStore,
+    sync_style_pack_preferences, ChannelKind, CredentialAccount, CredentialsSnapshot,
+    CredentialsVault, PreferencesStore,
 };
 pub(crate) use crate::polish::{
     http_client_builder, openai_compatible_temperature_for_provider, CodexOAuthConfig,
@@ -58,12 +58,16 @@ pub(crate) use crate::types::WindowsImeStatus;
 pub(crate) use crate::types::{
     builtin_style_pack_id, default_active_style_pack_id, ActivityDay,
     AndroidAccessibilityStatus,
-    AndroidOverlayStatus, ChineseScriptPreference, ComboBinding, CorrectionRule, CredentialsStatus,
+    AndroidAccessibilityRecoveryOutcome,
+    AndroidAccessibilityRecoveryResult,
+    AndroidOverlayStatus, AndroidShizukuStatus, ChineseScriptPreference, ComboBinding, CorrectionRule, CredentialsStatus,
     DictationSession, DictionaryEntry, HotkeyCapability, HotkeyStatus, OutputLanguagePreference,
-    PolishMode, ShortcutBinding, StylePack, StylePackKind, StylePackRuntimeDiagnostics,
+    PolishMode, ShortcutBinding, StylePack, StylePackHotkey, StylePackKind,
+    StylePackRuntimeDiagnostics,
     StyleSystemPrompts, UpdateChannel, UserPreferences, VocabPresetStore,
 };
 
+mod channels;
 mod credentials;
 mod dictation;
 mod dictionary;
@@ -90,6 +94,7 @@ mod selection_polish;
 mod selection_polish_preview;
 mod style_packs;
 
+pub use channels::*;
 pub use credentials::*;
 pub use dictation::*;
 pub use dictionary::*;
