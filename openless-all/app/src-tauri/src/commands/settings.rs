@@ -446,7 +446,7 @@ pub fn set_settings(
     app: AppHandle,
     tray_microphones: State<'_, TrayMicrophoneMenuState>,
     mut prefs: UserPreferences,
-) -> Result<(), String> {
+) -> Result<UserPreferences, String> {
     // 捕获旧值用于远程输入服务的 diff（persist 后端口/开关变化时启停/重启）。
     let remote_prev = coord.prefs().get();
     let packs = coord.style_packs().list().map_err(|e| e.to_string())?;
@@ -502,7 +502,7 @@ pub fn set_settings(
     {
         coord.refresh_remote_server();
     }
-    Ok(())
+    Ok(prefs)
 }
 
 #[cfg(mobile)]
@@ -511,7 +511,7 @@ pub fn set_settings(
     coord: CoordinatorState<'_>,
     app: AppHandle,
     mut prefs: UserPreferences,
-) -> Result<(), String> {
+) -> Result<UserPreferences, String> {
     let previous = coord.prefs().get();
     let packs = coord.style_packs().list().map_err(|e| e.to_string())?;
     sync_style_pack_preferences(&mut prefs, &packs);
@@ -528,7 +528,7 @@ pub fn set_settings(
     coord.apply_android_overlay_settings_change(&previous, &prefs);
     let _ = app.emit("prefs:changed", &prefs);
     let _ = app.emit_to("main", "prefs:changed", &prefs);
-    Ok(())
+    Ok(prefs)
 }
 
 #[cfg(test)]
