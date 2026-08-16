@@ -22,6 +22,7 @@ import type {
 import i18n, { outputPrefsForLocale, type SupportedLocale } from "../i18n"
 import { applyThemeFromPreference } from "../lib/themeMode"
 import { emitSaved } from "../lib/savedEvent"
+import { PreferencesWriteGate } from "./preferencesWriteGate"
 
 interface HotkeySettingsContextValue {
     prefs: UserPreferences | null
@@ -50,6 +51,7 @@ export function HotkeySettingsProvider({ children }: { children: ReactNode }) {
     const persistQueueRef = useRef<Promise<void>>(Promise.resolve())
     const latestPrefsRef = useRef<UserPreferences | null>(null)
     const persistedPrefsRef = useRef<UserPreferences | null>(null)
+    const writeGateRef = useRef(new PreferencesWriteGate<UserPreferences>())
 
     const refresh = useCallback(async () => {
         setLoading(true)
@@ -93,17 +95,32 @@ export function HotkeySettingsProvider({ children }: { children: ReactNode }) {
         }
     }, [])
 
+    const applyIncomingPrefs = useCallback((nextPrefs: UserPreferences) => {
+        latestPrefsRef.current = nextPrefs
+        persistedPrefsRef.current = nextPrefs
+        setPrefs(nextPrefs)
+        applyThemeFromPreference(nextPrefs.themeMode ?? "system")
+    }, [])
+
     const queueSetSettings = useCallback(
         (resolved: UserPreferences) => {
+            const finishWrite = writeGateRef.current.beginWrite()
+            let savedPrefs: UserPreferences | null = null
             const task = persistQueueRef.current
                 .catch(() => undefined)
                 .then(async () => {
-                    await setSettings(resolved)
+                    savedPrefs = await setSettings(resolved)
+                })
+                .then(() => {
+                    persistedPrefsRef.current = savedPrefs
+                })
+                .finally(() => {
+                    if (finishWrite() && savedPrefs) applyIncomingPrefs(savedPrefs)
                 })
             persistQueueRef.current = task
             return task
         },
-        [],
+        [applyIncomingPrefs],
     )
 
     useEffect(() => {
@@ -122,10 +139,10 @@ export function HotkeySettingsProvider({ children }: { children: ReactNode }) {
                     (event) => {
                         const nextPrefs = event.payload
                         if (!nextPrefs) return
-                        latestPrefsRef.current = nextPrefs
-                        persistedPrefsRef.current = nextPrefs
-                        setPrefs(nextPrefs)
-                        applyThemeFromPreference(nextPrefs.themeMode ?? "system")
+                        // A save emits before its IPC promise resolves. An older queued save can
+                        // otherwise overwrite a newer optimistic click and make its toggle snap back.
+                        const applicable = writeGateRef.current.receiveIncoming(nextPrefs)
+                        if (applicable) applyIncomingPrefs(applicable)
                     },
                 )
                 if (cancelled) {
@@ -144,7 +161,7 @@ export function HotkeySettingsProvider({ children }: { children: ReactNode }) {
             cancelled = true
             unlisten?.()
         }
-    }, [])
+    }, [applyIncomingPrefs])
 
     useEffect(() => {
         latestPrefsRef.current = prefs
@@ -202,7 +219,6 @@ export function HotkeySettingsProvider({ children }: { children: ReactNode }) {
             latestPrefsRef.current = resolved
             try {
                 await queueSetSettings(resolved)
-                persistedPrefsRef.current = resolved
             } catch (error) {
                 // 兜底（#904）：保存失败必须回滚乐观状态并可见，
                 // 不能出现界面显示已切换、重启后回退的“假保存”。

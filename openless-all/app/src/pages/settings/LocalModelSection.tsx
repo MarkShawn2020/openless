@@ -12,6 +12,7 @@ import { LocalAsr } from '../LocalAsr';
 import { detectOS } from '../../components/WindowChrome';
 import { getPlatformCapabilities } from '../../lib/platform';
 import { Card } from '../_atoms';
+import { ExperimentalSectionTitle } from './shared';
 
 export function LocalModelSection() {
   const { t } = useTranslation();
@@ -31,7 +32,9 @@ export function LocalModelSection() {
           Windows：标题区整体灰显 —— 本地 ASR 在 Win 上走 Foundry / sherpa 独立路径。 */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 14 }}>
         <div style={{ minWidth: 0, opacity: isWin ? 0.45 : 1 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, letterSpacing: '-0.01em' }}>{t('settings.advanced.localAsrTitle')}</div>
+          <ExperimentalSectionTitle badge={t('common.experimental')} style={{ marginBottom: 0 }}>
+            {t('settings.advanced.localAsrTitle')}
+          </ExperimentalSectionTitle>
         </div>
         <div style={{
           fontSize: 11,

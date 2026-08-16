@@ -303,7 +303,7 @@ pub(crate) fn reconcile_hotkey_collisions(
 pub(crate) fn persist_settings<T: SettingsWriter>(
     coord: &T,
     prefs: UserPreferences,
-) -> Result<(), String> {
+) -> Result<UserPreferences, String> {
     persist_settings_with_keyboard_apply(
         coord,
         prefs,
@@ -436,7 +436,7 @@ pub(crate) fn persist_settings_with_keyboard_apply<T: SettingsWriter>(
     if coding_agent_changed {
         coord.refresh_coding_agent_hotkey();
     }
-    Ok(())
+    Ok(prefs)
 }
 
 #[cfg(not(mobile))]
@@ -446,7 +446,7 @@ pub fn set_settings(
     app: AppHandle,
     tray_microphones: State<'_, TrayMicrophoneMenuState>,
     mut prefs: UserPreferences,
-) -> Result<(), String> {
+) -> Result<UserPreferences, String> {
     // 捕获旧值用于远程输入服务的 diff（persist 后端口/开关变化时启停/重启）。
     let remote_prev = coord.prefs().get();
     let packs = coord.style_packs().list().map_err(|e| e.to_string())?;
@@ -502,7 +502,7 @@ pub fn set_settings(
     {
         coord.refresh_remote_server();
     }
-    Ok(())
+    Ok(prefs)
 }
 
 #[cfg(mobile)]
