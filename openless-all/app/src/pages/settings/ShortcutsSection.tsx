@@ -101,6 +101,7 @@ export function ShortcutsSection() {
           <ShortcutRecorder
             value={prefs.dictationHotkey}
             sideSpecificModifiers
+            allowFn
             // 与「录音与输入」页一致：核心热键不可停用，置灰并提示。
             disableDisabled
             disableHint={t('settings.recording.comboDisableHint')}

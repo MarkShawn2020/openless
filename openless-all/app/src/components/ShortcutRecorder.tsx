@@ -28,6 +28,7 @@ export function ShortcutRecorder({
   resetLabel,
   comboOnly = false,
   sideSpecificModifiers = false,
+  allowFn = false,
 }: {
   value: ShortcutBinding | null;
   onSave: (binding: ShortcutBinding) => Promise<void>;
@@ -45,6 +46,9 @@ export function ShortcutRecorder({
   comboOnly?: boolean;
   /** 听写 start/stop 专用：录制 cmd-left / ctrl-right 等侧向修饰键。 */
   sideSpecificModifiers?: boolean;
+  /** 听写 start/stop 专用：Fn 键无法通过浏览器 keydown 录制（系统修饰键被隐藏），
+      用此开关在菜单里给一个「Fn」一键设置入口，绕开录制限制。 */
+  allowFn?: boolean;
 }) {
   const { t } = useTranslation();
   const [recording, setRecording] = useState(false);
@@ -118,6 +122,35 @@ export function ShortcutRecorder({
       setError(t('settings.recording.comboConflict'));
     }
   };
+
+  // 录制态按下 Fn：浏览器不向网页层下发 Fn keydown（系统修饰键被隐藏），recorder 收不到。
+  // Rust 端 CGEventTap 在录制态检测到 Fn 后经 `fn-shortcut-pressed` 事件上报，这里在
+  // 录制态收到即提交 Fn 绑定。用 ref 拿最新 finish，避免 effect 因 finish 引用变化反复注册。
+  const finishRef = useRef(finish);
+  finishRef.current = finish;
+  useEffect(() => {
+    if (!recording) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const handle = await listen('fn-shortcut-pressed', () => {
+          if (cancelled) return;
+          setMenuOpen(false);
+          void finishRef.current({ primary: 'Fn', modifiers: [] });
+        });
+        if (cancelled) handle();
+        else unlisten = handle;
+      } catch (error) {
+        console.warn('[shortcut] fn-shortcut-pressed listener failed', error);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [recording]);
 
   /** 开始录入：同时收起菜单——「录制快捷键」按下后，重置/停用两个按钮随之消失。 */
   const startRecording = () => {
@@ -342,6 +375,23 @@ export function ShortcutRecorder({
                     >
                       {t('settings.recording.comboRecordBtn')}
                     </motion.button>
+                    {allowFn && (
+                      <motion.button
+                        initial={{ y: 4, opacity: 0 }}
+                        animate={{ y: 0, opacity: 1 }}
+                        transition={{ duration: 0.16, ease: menuEase, delay: 0.02 }}
+                        whileHover={{ y: -1 }}
+                        whileTap={{ scale: 0.96 }}
+                        onClick={() => {
+                          setMenuOpen(false);
+                          void finish({ primary: 'Fn', modifiers: [] });
+                        }}
+                        title={t('settings.recording.comboFnHint', 'Fn 键无法直接录制，点击直接设为触发键')}
+                        style={menuButtonStyle}
+                      >
+                        {t('settings.recording.comboFnLabel', 'Fn')}
+                      </motion.button>
+                    )}
                     {onReset && (
                       <motion.button
                         initial={{ y: 4, opacity: 0 }}

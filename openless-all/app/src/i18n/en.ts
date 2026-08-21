@@ -850,6 +850,8 @@ export const en: typeof zhCN = {
       comboResetBtn: 'Reset',
       comboMenuToggle: 'More options',
       comboDisableHint: 'Core hotkey cannot be disabled — recording needs a hotkey',
+      comboFnLabel: 'Fn',
+      comboFnHint: 'Fn cannot be recorded directly — click to set it as the trigger',
       comboRecordHint: 'Press your shortcut combination\u2026',
       comboNeedKey: 'Use a key combo (e.g. \u2318\u21e7J); a lone modifier will not work',
       comboRecorded: 'Recorded',
