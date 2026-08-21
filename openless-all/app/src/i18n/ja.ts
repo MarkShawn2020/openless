@@ -852,8 +852,6 @@ export const ja: typeof zhCN = {
       comboResetBtn: 'リセット',
       comboMenuToggle: 'その他の操作',
       comboDisableHint: 'コアショートカットは無効化できません（録音にはショートカットが必須です）',
-      comboFnLabel: 'Fn',
-      comboFnHint: 'Fnキーは直接録音できません。クリックでトリガーに設定します',
       comboRecordHint: 'ショートカットの組み合わせを押してください…',
       comboNeedKey: '組み合わせキー（例: ⌘⇧J）を設定してください。修飾キー単体は使えません',
       comboRecorded: '記録済み',

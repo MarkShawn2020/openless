@@ -822,8 +822,6 @@ export const zhTW: typeof zhCN = {
       comboResetBtn: '重置',
       comboMenuToggle: '更多操作',
       comboDisableHint: '核心快捷鍵不可停用，錄音必須綁定一個快捷鍵',
-      comboFnLabel: 'Fn',
-      comboFnHint: 'Fn 鍵無法直接錄製，點擊直接設為觸發鍵',
       comboRecordHint: '請按下快捷鍵組合…',
       comboNeedKey: '請設定組合鍵（如 ⌘⇧J），不支援單獨的修飾鍵',
       comboRecorded: '已錄製',

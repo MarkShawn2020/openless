@@ -852,8 +852,6 @@ export const ko: typeof zhCN = {
       comboResetBtn: '초기화',
       comboMenuToggle: '더보기',
       comboDisableHint: '핵심 단축키는 비활성화할 수 없습니다 (녹음에는 단축키가 필수입니다)',
-      comboFnLabel: 'Fn',
-      comboFnHint: 'Fn 키는 직접 기록할 수 없습니다. 클릭하여 트리거로 설정합니다',
       comboRecordHint: '단축키 조합을 눌러 주세요…',
       comboNeedKey: '조합 키(예: ⌘⇧J)를 설정하세요. 단일 보조 키는 사용할 수 없습니다',
       comboRecorded: '녹화됨',

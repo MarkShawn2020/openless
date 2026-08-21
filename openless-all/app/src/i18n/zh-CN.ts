@@ -848,8 +848,6 @@ export const zhCN = {
       comboResetBtn: '重置',
       comboMenuToggle: '更多操作',
       comboDisableHint: '核心快捷键不可停用，录音必须绑定一个热键',
-      comboFnLabel: 'Fn',
-      comboFnHint: 'Fn 键无法直接录制，点击直接设为触发键',
       comboRecordHint: '请按下快捷键组合…',
       comboNeedKey: '请配组合键（如 ⌘⇧J），不支持单独的修饰键',
       comboRecorded: '已录制',
