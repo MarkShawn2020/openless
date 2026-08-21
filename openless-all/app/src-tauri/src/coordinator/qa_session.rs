@@ -144,7 +144,6 @@ pub(super) async fn finalize_dictation_as_qa_question(inner: &Arc<Inner>) -> Res
     log::info!("[coord] QA finalize from overlay: capturing selection before opening panel");
     let capture = crate::selection::capture_selection_with_status();
     let selection = capture.selection;
-    let selection_warning = capture.warning_code;
     let selection_preview_text = selection.as_ref().map(|s| s.text.clone());
 
     log::info!("[coord] QA finalize from overlay: opening panel and waiting for ASR result");
@@ -173,7 +172,6 @@ pub(super) async fn finalize_dictation_as_qa_question(inner: &Arc<Inner>) -> Res
                     "kind": "loading",
                     "session_id": session_id,
                     "selection_preview": selection_preview_text,
-                    "selection_warning": selection_warning,
                     "messages": state.messages.clone(),
                 }),
             );
@@ -208,6 +206,7 @@ pub(super) async fn finalize_dictation_as_qa_question(inner: &Arc<Inner>) -> Res
         raw.duration_ms,
         session_id,
         None,
+        super::CapsuleFeedback::Show,
     )
     .await
 }
@@ -245,7 +244,6 @@ pub(super) async fn submit_qa_text_question(
         .selection
         .as_ref()
         .map(|selection| selection.text.clone());
-    let selection_warning = capture.warning_code;
     {
         let mut state = inner.qa_state.lock();
         if !qa_turn_can_continue(&state, session_id) {
@@ -263,14 +261,21 @@ pub(super) async fn submit_qa_text_question(
                     "kind": "thinking",
                     "session_id": session_id,
                     "selection_preview": selection_preview_text,
-                    "selection_warning": selection_warning,
                     "messages": state.messages.clone(),
                 }),
             );
         }
     }
 
-    answer_qa_question_text(inner, question, 0, session_id, None).await
+    answer_qa_question_text(
+        inner,
+        question,
+        0,
+        session_id,
+        None,
+        super::CapsuleFeedback::Hide,
+    )
+    .await
 }
 
 pub(super) async fn take_current_dictation_transcript_for_qa(
@@ -310,8 +315,15 @@ pub(super) async fn take_current_dictation_transcript_for_qa(
             state.phase = SessionPhase::Idle;
             state.focus_target = None;
         }
-        answer_qa_question_text(inner, String::new(), duration_ms, qa_session_id, Some(wav))
-            .await?;
+        answer_qa_question_text(
+            inner,
+            String::new(),
+            duration_ms,
+            qa_session_id,
+            Some(wav),
+            super::CapsuleFeedback::Show,
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -551,20 +563,47 @@ pub(super) async fn transcribe_overlay_dictation_asr(
             debug_assert!(!uses_global_timeout);
             let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
             let timeout_duration = windows_local_asr_transcribe_timeout(audio_secs);
-            match local.transcribe(timeout_duration).await {
-                Ok(raw) => {
+            let notices = foundry_dictation_fallback_notice_callback(_inner, _current_session_id);
+            tokio::select! {
+                result = local.transcribe_with_fallback_notice(timeout_duration, notices) => match result {
+                    Ok(outcome) => {
+                        debug_assert_eq!(
+                            outcome.used_cpu_fallback,
+                            outcome.primary_recovery.is_some()
+                        );
+                        if _inner.state.lock().cancelled {
+                            local.cancel();
+                            schedule_foundry_local_asr_release(
+                                _inner,
+                                AsrReleaseSession::Dictation(_current_session_id),
+                                None,
+                            );
+                            return OverlayDictationTranscribeOutcome::Cancelled;
+                        }
+                        schedule_foundry_local_asr_release(
+                            _inner,
+                            AsrReleaseSession::Dictation(_current_session_id),
+                            outcome.primary_recovery,
+                        );
+                        Ok(outcome.raw)
+                    }
+                    Err(error) => {
+                        schedule_foundry_local_asr_release(
+                            _inner,
+                            AsrReleaseSession::Dictation(_current_session_id),
+                            None,
+                        );
+                        Err(error.to_string())
+                    }
+                },
+                _ = wait_for_overlay_dictation_cancel(_inner, _current_session_id) => {
+                    local.cancel();
                     schedule_foundry_local_asr_release(
                         _inner,
                         AsrReleaseSession::Dictation(_current_session_id),
+                        None,
                     );
-                    Ok(raw)
-                }
-                Err(error) => {
-                    schedule_foundry_local_asr_release(
-                        _inner,
-                        AsrReleaseSession::Dictation(_current_session_id),
-                    );
-                    Err(error.to_string())
+                    return OverlayDictationTranscribeOutcome::Cancelled;
                 }
             }
         }
@@ -590,18 +629,69 @@ pub(super) async fn transcribe_overlay_dictation_asr(
                 }
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         ActiveAsr::Local(local) => {
             debug_assert!(uses_global_timeout);
             let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
             let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
-            let result = tokio::time::timeout(timeout_duration, local.transcribe()).await;
-            _inner.local_asr_cache.touch();
-            schedule_local_asr_release(_inner);
+            let result = tokio::select! {
+                biased;
+                result = tokio::time::timeout(timeout_duration, local.clone().transcribe()) => result,
+                _ = wait_for_overlay_dictation_cancel(_inner, _current_session_id) => {
+                    local.cancel();
+                    release_local_asr_engines_now(_inner, true, false);
+                    return OverlayDictationTranscribeOutcome::Cancelled;
+                }
+            };
+            if result.is_err() {
+                // 超时只放弃结果：解码任务仍在 spawn_blocking 里跑并持有引擎锁，
+                // cancel() 中止不了它。驱逐引擎让下次会话加载新引擎（与
+                // coordinator/dictation.rs 同款处理）。
+                log::warn!(
+                    "[coord] QA local Qwen3-ASR 超时 {}s，驱逐引擎避免下次会话排队",
+                    timeout_duration.as_secs()
+                );
+                local.cancel();
+                release_local_asr_engines_now(_inner, true, false);
+            } else {
+                _inner.local_asr_cache.touch();
+                schedule_local_asr_release(_inner);
+            }
             match result {
                 Ok(Ok(raw)) => Ok(raw),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(_) => Err("local qwen transcribe timeout".to_string()),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        ActiveAsr::LocalWhisper(local) => {
+            debug_assert!(!uses_global_timeout);
+            let timeout_duration =
+                local_whisper_transcribe_timeout((local.buffer_duration_ms() as f64) / 1000.0);
+            let result = tokio::select! {
+                biased;
+                result = tokio::time::timeout(timeout_duration, local.clone().transcribe()) => result,
+                _ = wait_for_overlay_dictation_cancel(_inner, _current_session_id) => {
+                    local.cancel();
+                    release_local_asr_engines_now(_inner, false, true);
+                    return OverlayDictationTranscribeOutcome::Cancelled;
+                }
+            };
+            if result.is_err() {
+                log::warn!(
+                    "[coord] QA local Whisper 超时 {}s，驱逐引擎避免下次会话排队",
+                    timeout_duration.as_secs()
+                );
+                local.cancel();
+                release_local_asr_engines_now(_inner, false, true);
+            } else {
+                _inner.local_whisper_cache.touch();
+                schedule_local_whisper_release(_inner);
+            }
+            match result {
+                Ok(Ok(raw)) => Ok(raw),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("local whisper transcribe timeout".to_string()),
             }
         }
         #[cfg(target_os = "macos")]
@@ -628,6 +718,10 @@ pub(super) async fn answer_qa_question_text(
     duration_ms: u64,
     session_id: SessionId,
     audio_wav: Option<Vec<u8>>,
+    // QA 面板打字提问传 Hide：回答在面板内流式可见，不应在输入法 auxDown
+    // 闪「✨ 润色中...」（Linux 下 Polishing 会映射到候选词栏）。
+    // 语音/听写路径保持 Show（用户熟悉的小录音条反馈）。
+    capsule_feedback: super::CapsuleFeedback,
 ) -> Result<(), String> {
     {
         let state = inner.qa_state.lock();
@@ -679,7 +773,9 @@ pub(super) async fn answer_qa_question_text(
         }
     }
 
-    emit_capsule(inner, CapsuleState::Polishing, 0.0, 0, None, None);
+    if capsule_feedback == super::CapsuleFeedback::Show {
+        emit_capsule(inner, CapsuleState::Polishing, 0.0, 0, None, None);
+    }
 
     let prefs = inner.prefs.get();
     let working_languages = prefs.working_languages.clone();
@@ -853,7 +949,6 @@ pub(super) async fn begin_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
     // 每轮按 Option 都重新抓一次：用户多轮提问中可以重新选别处文字。
     let capture = capture_qa_turn_selection(inner);
     let selection = capture.selection;
-    let selection_warning = capture.warning_code;
     let selection_preview_text = selection.as_ref().map(|s| s.text.clone());
     {
         let mut state = inner.qa_state.lock();
@@ -870,7 +965,6 @@ pub(super) async fn begin_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                     "kind": "recording",
                     "session_id": session_id,
                     "selection_preview": selection_preview_text,
-                    "selection_warning": selection_warning,
                     "messages": state.messages.clone(),
                 }),
             );
@@ -1088,8 +1182,15 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
         };
         let duration_ms = pcm_consumer.duration_ms();
         let wav = pcm_bytes_to_wav(&pcm_consumer.pcm());
-        return answer_qa_question_text(inner, String::new(), duration_ms, session_id, Some(wav))
-            .await;
+        return answer_qa_question_text(
+            inner,
+            String::new(),
+            duration_ms,
+            session_id,
+            Some(wav),
+            super::CapsuleFeedback::Show,
+        )
+        .await;
     }
 
     let asr = match take_qa_asr_for_session(inner, session_id) {
@@ -1335,13 +1436,37 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                 audio_secs,
                 timeout_duration.as_secs()
             );
-            match local.transcribe(timeout_duration).await {
-                Ok(r) => {
-                    schedule_foundry_local_asr_release(inner, AsrReleaseSession::Qa(qa_session_id));
-                    r
+            let notices = foundry_qa_fallback_notice_callback(inner, session_id);
+            tokio::select! {
+                result = local.transcribe_with_fallback_notice(timeout_duration, notices) => match result {
+                Ok(outcome) => {
+                    debug_assert_eq!(
+                        outcome.used_cpu_fallback,
+                        outcome.primary_recovery.is_some()
+                    );
+                    if !qa_turn_can_continue(&inner.qa_state.lock(), session_id) {
+                        local.cancel();
+                        schedule_foundry_local_asr_release(
+                            inner,
+                            AsrReleaseSession::Qa(qa_session_id),
+                            None,
+                        );
+                        finish_qa_idle_silently_if_current(inner, session_id);
+                        return Ok(());
+                    }
+                    schedule_foundry_local_asr_release(
+                        inner,
+                        AsrReleaseSession::Qa(qa_session_id),
+                        outcome.primary_recovery,
+                    );
+                    outcome.raw
                 }
                 Err(e) => {
-                    schedule_foundry_local_asr_release(inner, AsrReleaseSession::Qa(qa_session_id));
+                    schedule_foundry_local_asr_release(
+                        inner,
+                        AsrReleaseSession::Qa(qa_session_id),
+                        None,
+                    );
                     if inner.qa_state.lock().cancelled {
                         log::info!(
                             "[coord] QA Foundry Local Whisper transcribe cancelled — discarding transcript"
@@ -1352,12 +1477,30 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                         return Ok(());
                     }
                     log::error!("[coord] QA Foundry Local Whisper transcribe failed: {e:#}");
-                    finish_qa_with_error_if_current(
-                        inner,
-                        session_id,
-                        format!("本地识别失败: {e}"),
-                    );
+                    // 终态错误面向用户的消息精简（PR #945 review P2-2）：原始 GPU/CPU
+                    // SDK 错误保留在上方日志，不把冗长的引擎错误文本直接展示给用户。
+                    let user_msg =
+                        if crate::asr::local::foundry_runtime::is_terminal_foundry_fallback_error(
+                            &e,
+                        ) {
+                            crate::asr::local::foundry_runtime::FOUNDRY_FALLBACK_TERMINAL_USER_MESSAGE
+                                .to_string()
+                        } else {
+                            format!("本地识别失败: {e}")
+                        };
+                    finish_qa_with_error_if_current(inner, session_id, user_msg);
                     return Err(e.to_string());
+                }
+                },
+                _ = wait_for_qa_processing_cancel(inner, session_id) => {
+                    local.cancel();
+                    schedule_foundry_local_asr_release(
+                        inner,
+                        AsrReleaseSession::Qa(qa_session_id),
+                        None,
+                    );
+                    finish_qa_idle_silently_if_current(inner, session_id);
+                    return Ok(());
                 }
             }
         }
@@ -1397,7 +1540,7 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                 }
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         ActiveAsr::Local(local) => {
             debug_assert!(uses_global_timeout);
             let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
@@ -1407,9 +1550,30 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                 audio_secs,
                 timeout_duration.as_secs()
             );
-            let result = tokio::time::timeout(timeout_duration, local.transcribe()).await;
-            inner.local_asr_cache.touch();
-            schedule_local_asr_release(inner);
+            let result = tokio::select! {
+                biased;
+                result = tokio::time::timeout(timeout_duration, local.clone().transcribe()) => result,
+                _ = wait_for_qa_processing_cancel(inner, session_id) => {
+                    local.cancel();
+                    release_local_asr_engines_now(inner, true, false);
+                    finish_qa_idle_silently_if_current(inner, session_id);
+                    return Ok(());
+                }
+            };
+            if result.is_err() {
+                // 超时只放弃结果：解码任务仍在 spawn_blocking 里跑并持有引擎锁，
+                // cancel() 中止不了它。驱逐引擎让下次会话加载新引擎（与
+                // coordinator/dictation.rs 同款处理）。
+                log::warn!(
+                    "[coord] QA local Qwen3-ASR 超时 {}s，驱逐引擎避免下次会话排队",
+                    timeout_duration.as_secs()
+                );
+                local.cancel();
+                release_local_asr_engines_now(inner, true, false);
+            } else {
+                inner.local_asr_cache.touch();
+                schedule_local_asr_release(inner);
+            }
             match result {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
@@ -1428,6 +1592,49 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                     );
                     finish_qa_with_error_if_current(inner, session_id, "本地识别超时".to_string());
                     return Err("local qwen transcribe timeout".to_string());
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        ActiveAsr::LocalWhisper(local) => {
+            debug_assert!(!uses_global_timeout);
+            let timeout_duration =
+                local_whisper_transcribe_timeout((local.buffer_duration_ms() as f64) / 1000.0);
+            let result = tokio::select! {
+                biased;
+                result = tokio::time::timeout(timeout_duration, local.clone().transcribe()) => result,
+                _ = wait_for_qa_processing_cancel(inner, session_id) => {
+                    local.cancel();
+                    release_local_asr_engines_now(inner, false, true);
+                    finish_qa_idle_silently_if_current(inner, session_id);
+                    return Ok(());
+                }
+            };
+            if result.is_err() {
+                log::warn!(
+                    "[coord] QA local Whisper 超时 {}s，驱逐引擎避免下次会话排队",
+                    timeout_duration.as_secs()
+                );
+                local.cancel();
+                release_local_asr_engines_now(inner, false, true);
+            } else {
+                inner.local_whisper_cache.touch();
+                schedule_local_whisper_release(inner);
+            }
+            match result {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(error)) => {
+                    log::error!("[coord] QA local Whisper transcribe failed: {error:#}");
+                    finish_qa_with_error_if_current(
+                        inner,
+                        session_id,
+                        format!("本地识别失败: {error}"),
+                    );
+                    return Err(error.to_string());
+                }
+                Err(_) => {
+                    finish_qa_with_error_if_current(inner, session_id, "本地识别超时".to_string());
+                    return Err("local whisper transcribe timeout".to_string());
                 }
             }
         }
@@ -1469,7 +1676,15 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
         return Ok(());
     }
 
-    answer_qa_question_text(inner, question, raw.duration_ms, session_id, None).await
+    answer_qa_question_text(
+        inner,
+        question,
+        raw.duration_ms,
+        session_id,
+        None,
+        super::CapsuleFeedback::Show,
+    )
+    .await
 }
 
 /// 静默收尾：发 idle 事件给前端，phase 复位。**不关浮窗**（v2：浮窗只在用户

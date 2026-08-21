@@ -130,6 +130,23 @@ pub enum WindowsSendInputNewlineMode {
     CrLf,
 }
 
+/// macOS 逐字上屏时换行符怎么发。仅流式插入路径生效。
+///
+/// 默认 `ShiftReturn`：macOS 把 U+000A 当 Return 键，而聊天框里 Return 就是「发送」——
+/// 一条带空行的两段话会被从中间劈开发出去。Shift+Return 在聊天框是软换行，在编辑器 /
+/// 终端 / 网页输入框里就是普通换行。
+///
+/// 保留 `Return` 是因为风格市场里有靠换行发多条消息的风格包，那种效果需要真回车。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MacosNewlineMode {
+    /// Shift+Return：聊天框软换行，不发送。
+    #[default]
+    ShiftReturn,
+    /// Return：聊天框里等于发送 —— 想要「一段话拆成多条消息」的风格包用这个。
+    Return,
+}
+
 /// Auto-update 渠道。决定后台 AutoUpdateGate 拉哪条 manifest。
 /// `Stable` = `latest-android-{arch}.json`（或桌面 plugin-updater 正式版 endpoints）。
 /// `Beta` = `latest-android-{arch}-beta.json`（或桌面 beta endpoints）。
@@ -374,6 +391,28 @@ pub struct PendingCorrection {
 /// 一张卡片上最多列几条。同一次听写里改好几个词会合并到一张卡；再多就该丢最老的了，
 /// 卡片撑得比屏幕还高没有意义。
 pub const MAX_PENDING_CORRECTIONS: usize = 5;
+
+/// 落字失败兜底卡片的内容。
+///
+/// 文本没能落到目标 app 时（焦点在上屏途中离开、Secure Input、插入失败），把**完整**
+/// 的那段话连同复制入口摆到用户面前。此前这些场景唯一的兜底是悄悄写剪贴板 —— 既依赖
+/// 一个默认可关的开关，用户也不知道文本在那儿。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InsertFallbackCardPayload {
+    /// 完整文本。焦点中途离开时屏幕上只有半截，这里给的是整段。
+    pub text: String,
+    /// 为什么没落进去。**只进日志，不上屏** —— 卡片没有标题行。见
+    /// `INSERT_FALLBACK_REASON_*`。
+    pub reason: String,
+    /// 本次卡片展示的代次。尺寸测量 IPC 必须回传它，防止旧卡片迟到的报告缩放新卡片。
+    pub presentation_id: u64,
+}
+
+/// 逐字上屏打到一半断了（Secure Input 中途打开、合成按键被拒）。
+pub const INSERT_FALLBACK_REASON_PARTIAL_STREAM: &str = "partialStream";
+/// 插入没能完成（Secure Input、辅助功能掉权限、粘贴被拒等）。
+pub const INSERT_FALLBACK_REASON_INSERT_FAILED: &str = "insertFailed";
 
 /// 卡片自动消失的时间。
 ///
@@ -910,6 +949,9 @@ pub struct UserPreferences {
     /// Windows SendInput 路径的换行模拟方式。
     #[serde(default, rename = "windowsSendInputNewlineMode")]
     pub windows_sendinput_newline_mode: WindowsSendInputNewlineMode,
+    /// macOS 逐字上屏的换行模拟方式。
+    #[serde(default)]
+    pub macos_newline_mode: MacosNewlineMode,
     /// 旧版 wire 兼容：`true` 等价于 `windows_insertion_mode = SendInput`。
     #[serde(
         default,
@@ -1021,9 +1063,13 @@ pub struct UserPreferences {
     #[serde(default = "default_remote_input_mode")]
     pub remote_input_default_mode: String,
     /// 本地 Qwen3-ASR 当前激活的模型 id（"qwen3-asr-0.6b" / "qwen3-asr-1.7b"）。
-    /// 仅在 active_asr_provider == "local-qwen3" 时有意义。
+    /// 仅在 active_asr_provider 为 local-qwen3 / local-qwen3-mlx / local-qwen3-c 时有意义。
     #[serde(default = "default_local_asr_model")]
     pub local_asr_active_model: String,
+    /// macOS 本地 Whisper 当前激活的模型 id。与 Qwen 偏好分开保存，避免在
+    /// 设置页测试 Whisper 时覆盖 Qwen 的模型选择。
+    #[serde(default = "default_local_whisper_model")]
+    pub local_whisper_active_model: String,
     /// 本地模型下载源镜像（"huggingface" / "hf-mirror"）。
     #[serde(default = "default_local_asr_mirror")]
     pub local_asr_mirror: String,
@@ -1184,6 +1230,17 @@ fn default_local_asr_model() -> String {
     "qwen3-asr-0.6b".into()
 }
 
+fn default_local_whisper_model() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        crate::asr::local::WHISPER_MODEL_ID.into()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "whisper-large-v3-turbo".into()
+    }
+}
+
 fn default_remote_input_port() -> u16 {
     8443
 }
@@ -1282,6 +1339,8 @@ struct UserPreferencesWire {
         alias = "windowsSendinputNewlineMode"
     )]
     windows_sendinput_newline_mode: WindowsSendInputNewlineMode,
+    #[serde(default)]
+    macos_newline_mode: MacosNewlineMode,
     #[serde(
         default,
         rename = "windowsSendInputInsertionOnly",
@@ -1339,6 +1398,9 @@ struct UserPreferencesWire {
     remote_input_default_mode: String,
     #[serde(default = "default_local_asr_model")]
     local_asr_active_model: String,
+    /// `None` 保留“旧配置没有该字段”的信息，供本地 ASR 模型偏好迁移使用。
+    #[serde(default)]
+    local_whisper_active_model: Option<String>,
     #[serde(default = "default_local_asr_mirror")]
     local_asr_mirror: String,
     #[serde(default = "default_local_asr_keep_loaded_secs")]
@@ -1417,6 +1479,33 @@ where
     Option::<ShortcutBinding>::deserialize(deserializer).map(Some)
 }
 
+/// 将旧版共用的 `localAsrActiveModel` 迁移到彼此独立的 Qwen / Whisper 偏好。
+///
+/// 旧字段长期被两套 provider 共用，因此不能只按字符串复制：旧值是 Qwen 时
+/// Whisper 应回到默认值；旧值误存为 Whisper 时则把它迁移到 Whisper，并让
+/// Qwen 回到默认值。新字段显式存在时优先使用它，但只接受 Whisper 模型 id。
+fn migrate_local_asr_models(
+    legacy_model: String,
+    whisper_model: Option<String>,
+) -> (String, String) {
+    let legacy_id = crate::asr::local::ModelId::from_str(&legacy_model);
+    let qwen_model = legacy_id
+        .filter(|id| id.is_qwen())
+        .map(|id| id.as_str().to_string())
+        .unwrap_or_else(default_local_asr_model);
+    let migrated_whisper = match whisper_model {
+        Some(model) => crate::asr::local::ModelId::from_str(&model)
+            .filter(|id| id.is_whisper())
+            .map(|id| id.as_str().to_string())
+            .unwrap_or_else(default_local_whisper_model),
+        None => legacy_id
+            .filter(|id| id.is_whisper())
+            .map(|id| id.as_str().to_string())
+            .unwrap_or_else(default_local_whisper_model),
+    };
+    (qwen_model, migrated_whisper)
+}
+
 impl Default for UserPreferencesWire {
     fn default() -> Self {
         let prefs = UserPreferences::default();
@@ -1448,6 +1537,7 @@ impl Default for UserPreferencesWire {
             allow_non_tsf_insertion_fallback: prefs.allow_non_tsf_insertion_fallback,
             windows_insertion_mode: prefs.windows_insertion_mode,
             windows_sendinput_newline_mode: prefs.windows_sendinput_newline_mode,
+            macos_newline_mode: prefs.macos_newline_mode,
             windows_sendinput_insertion_only: prefs.windows_sendinput_insertion_only,
             windows_show_openless_in_keyboard_list: prefs.windows_show_openless_in_keyboard_list,
             working_languages: prefs.working_languages,
@@ -1479,6 +1569,8 @@ impl Default for UserPreferencesWire {
             remote_input_pin: prefs.remote_input_pin,
             remote_input_default_mode: prefs.remote_input_default_mode,
             local_asr_active_model: prefs.local_asr_active_model,
+            // 新字段必须保持 None：旧配置反序列化时需要区分“字段缺失”和显式值。
+            local_whisper_active_model: None,
             local_asr_mirror: prefs.local_asr_mirror,
             local_asr_keep_loaded_secs: prefs.local_asr_keep_loaded_secs,
             local_asr_models_base_dir: prefs.local_asr_models_base_dir,
@@ -1553,6 +1645,8 @@ impl<'de> Deserialize<'de> for UserPreferences {
         } else {
             true
         };
+        let (local_asr_active_model, local_whisper_active_model) =
+            migrate_local_asr_models(wire.local_asr_active_model, wire.local_whisper_active_model);
 
         Ok(Self {
             hotkey: wire.hotkey,
@@ -1590,6 +1684,7 @@ impl<'de> Deserialize<'de> for UserPreferences {
                 wire.windows_sendinput_insertion_only,
             ),
             windows_sendinput_newline_mode: wire.windows_sendinput_newline_mode,
+            macos_newline_mode: wire.macos_newline_mode,
             windows_sendinput_insertion_only: resolve_windows_sendinput_insertion_only_legacy(
                 wire.windows_insertion_mode,
                 wire.windows_sendinput_insertion_only,
@@ -1627,7 +1722,8 @@ impl<'de> Deserialize<'de> for UserPreferences {
             switch_style_hotkey: wire.switch_style_hotkey,
             open_app_hotkey: wire.open_app_hotkey,
             style_pack_hotkeys: wire.style_pack_hotkeys,
-            local_asr_active_model: wire.local_asr_active_model,
+            local_asr_active_model,
+            local_whisper_active_model,
             local_asr_mirror: wire.local_asr_mirror,
             local_asr_keep_loaded_secs: wire.local_asr_keep_loaded_secs,
             local_asr_models_base_dir: wire.local_asr_models_base_dir,
@@ -2415,6 +2511,7 @@ impl Default for UserPreferences {
             allow_non_tsf_insertion_fallback: true,
             windows_insertion_mode: WindowsInsertionMode::default(),
             windows_sendinput_newline_mode: WindowsSendInputNewlineMode::default(),
+            macos_newline_mode: MacosNewlineMode::default(),
             windows_sendinput_insertion_only: false,
             windows_show_openless_in_keyboard_list: true,
             working_languages: default_working_languages(),
@@ -2445,6 +2542,7 @@ impl Default for UserPreferences {
             remote_input_pin: String::new(),
             remote_input_default_mode: default_remote_input_mode(),
             local_asr_active_model: default_local_asr_model(),
+            local_whisper_active_model: default_local_whisper_model(),
             local_asr_mirror: default_local_asr_mirror(),
             local_asr_keep_loaded_secs: default_local_asr_keep_loaded_secs(),
             local_asr_models_base_dir: String::new(),
@@ -3013,6 +3111,7 @@ pub struct PlatformCapabilities {
     pub supports_desktop_hotkey: bool,
     pub supports_tray: bool,
     pub supports_local_asr: bool,
+    pub supports_local_qwen3_mlx: bool,
     pub supports_in_app_dictation: bool,
     pub supports_auto_update: bool,
 }
@@ -3028,6 +3127,7 @@ impl PlatformCapabilities {
                 supports_desktop_hotkey: false,
                 supports_tray: false,
                 supports_local_asr: false,
+                supports_local_qwen3_mlx: false,
                 supports_in_app_dictation: true,
                 supports_auto_update: true,
             }
@@ -3045,6 +3145,7 @@ impl PlatformCapabilities {
                 supports_desktop_hotkey: false,
                 supports_tray: false,
                 supports_local_asr: false,
+                supports_local_qwen3_mlx: false,
                 supports_in_app_dictation: false,
                 supports_auto_update: false,
             }
@@ -3058,7 +3159,12 @@ impl PlatformCapabilities {
                 supports_overlay: true,
                 supports_desktop_hotkey: true,
                 supports_tray: true,
-                supports_local_asr: cfg!(any(target_os = "macos", target_os = "windows")),
+                supports_local_asr: cfg!(any(
+                    target_os = "macos",
+                    target_os = "linux",
+                    target_os = "windows"
+                )),
+                supports_local_qwen3_mlx: cfg!(all(target_os = "macos", target_arch = "aarch64")),
                 supports_in_app_dictation: false,
                 supports_auto_update: true,
             }
@@ -3354,6 +3460,35 @@ mod translation_effective_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_asr_model_preferences_migrate_without_cross_provider_overwrite() {
+        let old_qwen: UserPreferences =
+            serde_json::from_str(r#"{"localAsrActiveModel":"qwen3-asr-1.7b"}"#).unwrap();
+        assert_eq!(old_qwen.local_asr_active_model, "qwen3-asr-1.7b");
+        assert_eq!(
+            old_qwen.local_whisper_active_model,
+            default_local_whisper_model()
+        );
+
+        let old_whisper: UserPreferences =
+            serde_json::from_str(r#"{"localAsrActiveModel":"whisper-small"}"#).unwrap();
+        assert_eq!(
+            old_whisper.local_asr_active_model,
+            default_local_asr_model()
+        );
+        assert_eq!(old_whisper.local_whisper_active_model, "whisper-small");
+
+        let separated: UserPreferences = serde_json::from_str(
+            r#"{
+                "localAsrActiveModel":"qwen3-asr-1.7b",
+                "localWhisperActiveModel":"whisper-medium"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(separated.local_asr_active_model, "qwen3-asr-1.7b");
+        assert_eq!(separated.local_whisper_active_model, "whisper-medium");
+    }
 
     #[test]
     fn salvage_preserves_valid_fields_when_one_value_is_invalid() {

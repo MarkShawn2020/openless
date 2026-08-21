@@ -121,6 +121,17 @@ enum CapsuleShowStrategy {
     FallbackShow,
 }
 
+/// 是否在回答期间显示「处理中 / 润色中」胶囊反馈。
+///
+/// 语音 / 听写路径显示（用户熟悉的小录音条状态机；Linux 下映射到 fcitx5
+/// auxDown，显示在候选词栏下方）；打字提问路径不显示（回答在 QA 面板内
+/// 流式可见，不应在输入法候选栏闪「✨ 润色中...」）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapsuleFeedback {
+    Show,
+    Hide,
+}
+
 fn capsule_show_strategy_for_platform() -> CapsuleShowStrategy {
     // ⚠️ 如果改下面的 cfg 列表，**必须**同步更新单元测试
     // `capsule_show_strategy_matches_platform_activation_contract` 的两组 cfg —
@@ -242,12 +253,23 @@ pub(crate) fn show_vocab_suggestion_card(inner: &Arc<Inner>) {
         if let Err(e) = window.set_ignore_cursor_events(false) {
             log::warn!("[vocab-card] set_ignore_cursor_events(false) failed: {e}");
         }
+        // 穿透状态也是有缓存的（`capsule_cursor_passthrough`，emit_capsule 靠它跳过
+        // 重复调用）。这里直接碰了窗口就必须同步那个缓存，否则它记着的值和窗口
+        // 真实状态分家，下次 emit_capsule 会以为「没变化」而跳过该调的那一次。
+        #[cfg(not(mobile))]
+        inner
+            .capsule_cursor_passthrough
+            .store(false, Ordering::SeqCst);
         if let Err(e) = window.set_size(tauri::LogicalSize::new(VOCAB_CARD_WIDTH, height)) {
             log::warn!("[vocab-card] resize failed: {e}");
         }
         if let Err(e) = position_vocab_card(&window, VOCAB_CARD_WIDTH, height) {
             log::warn!("[vocab-card] position failed: {e}");
         }
+        // 位置同理：`maybe_position_capsule_bottom_center` 的去重缓存只记「显示器 +
+        // 翻译态」，卡片这一挪它一无所知。不清掉的话，下一次录音时它会拿相同的
+        // 显示器快照判定「没变化」→ 跳过重新定位 → 胶囊留在卡片挪过去的右下角。
+        *inner.capsule_layout.lock() = None;
         let _ = app.emit_to("capsule", "vocab:suggested", &pending);
         show_capsule_window_for_recording(&app, &window, true);
         #[cfg(target_os = "macos")]
@@ -271,24 +293,42 @@ pub(crate) fn hide_vocab_suggestion_card(inner: &Arc<Inner>) {
         return;
     };
     let app_for_main = app.clone();
+    let inner_for_main = Arc::clone(inner);
     let _ = app.run_on_main_thread(move || {
         let app = app_for_main;
+        let inner = inner_for_main;
         let Some(window) = app.get_webview_window("capsule") else {
             return;
         };
         let _ = app.emit_to("capsule", "vocab:suggested", Vec::<crate::types::PendingCorrection>::new());
+        // 先隐藏再改几何：复原要同时动尺寸和位置，窗口还亮着时改就有概率被合成出
+        // 一帧「卡片被拉宽、还横着飞过半个屏幕」。
+        let _ = window.hide();
         // 穿透必须还回去，否则胶囊会一直挡着屏幕底部那一块。
         #[cfg(not(mobile))]
         if let Err(e) = window.set_ignore_cursor_events(true) {
             log::warn!("[vocab-card] restoring cursor passthrough failed: {e}");
         }
+        #[cfg(not(mobile))]
+        inner
+            .capsule_cursor_passthrough
+            .store(true, Ordering::SeqCst);
         // 尺寸也必须还回去 —— 卡片把窗口缩到过自己的大小，不复原的话下一次胶囊
-        // 就挤在一个 300×108 的窗口里，等于看不见。
+        // 就挤在一个 320×108 的窗口里，等于看不见。
         let bounds = crate::capsule_window_bounds(false);
         if let Err(e) = window.set_size(tauri::LogicalSize::new(bounds.width, bounds.height)) {
             log::warn!("[vocab-card] restoring capsule size failed: {e}");
         }
-        let _ = window.hide();
+        // 位置一样要还 —— 卡片把窗口挪到了右下角，胶囊的位置是底部居中。
+        // 只还尺寸不还位置，下一次录音胶囊就出现在右下角（真机上就是这个 bug）。
+        //
+        // 清缓存和这次重定位是两件事，都要做：清缓存保证「就算这次重定位失败，
+        // 下一次 emit_capsule 也一定会重算」，重定位保证「就算有哪条路径绕过了
+        // emit_capsule 直接 show，窗口也已经在对的地方」。
+        *inner.capsule_layout.lock() = None;
+        if let Err(e) = crate::position_capsule_bottom_center(&window, false) {
+            log::warn!("[vocab-card] restoring capsule position failed: {e}");
+        }
     });
 }
 
@@ -309,9 +349,7 @@ pub(crate) fn hide_vocab_suggestion_card(inner: &Arc<Inner>) {
 /// 这条主路径，也就是上面那个 bug 的实际触发路径。三处各写各的，漏一处就等于没修。
 pub(crate) fn disarm_edit_watch(inner: &Arc<Inner>) {
     *inner.edit_watcher.lock() = None;
-    inner
-        .edit_watch_generation
-        .fetch_add(1, Ordering::SeqCst);
+    inner.edit_watch_generation.fetch_add(1, Ordering::SeqCst);
 }
 
 /// 把卡片放到屏幕**右下角**。
@@ -338,6 +376,253 @@ fn position_vocab_card<R: tauri::Runtime>(
     window.set_position(tauri::LogicalPosition::new(x, y))
 }
 
+/// 兜底卡片的窗口宽度（逻辑点）。比词条卡片宽一点 —— 这张要放一整段话。
+const FALLBACK_CARD_WIDTH: f64 = 360.0;
+/// Webview 首次渲染前的安全高度。真实高度由卡片 DOM 测量后通过 IPC 回报。
+const FALLBACK_CARD_INITIAL_HEIGHT: f64 = 260.0;
+/// 尺寸 IPC 的原生安全边界，不表达任何 CSS 布局规则。
+const FALLBACK_CARD_MIN_HEIGHT: f64 = 96.0;
+const FALLBACK_CARD_MAX_HEIGHT: f64 = 320.0;
+
+/// 把兜底卡片摆到屏幕**水平居中、偏下**的位置。
+///
+/// 与词条卡片的右下角不同：那张是「瞄一眼就完事」的建议，躲在角落里不打扰人正好；
+/// 这张是用户切走窗口后要**读完再决定复不复制**的内容，藏在角落容易整个错过。
+/// 底部居中是录音胶囊本来就在的那条视线，用户的眼睛已经习惯往那儿看。
+///
+/// 垂直方向沿用胶囊那套「距底 80pt 给 Dock 留位」，卡片比胶囊高，往上长。
+fn position_fallback_card<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    width: f64,
+    height: f64,
+) -> tauri::Result<()> {
+    let Some(monitor) = window.current_monitor()? else {
+        return Ok(());
+    };
+    let scale = monitor.scale_factor();
+    let size = monitor.size();
+    let pos = monitor.position();
+    let (mon_w, mon_h) = (size.width as f64 / scale, size.height as f64 / scale);
+    let (mon_x, mon_y) = (pos.x as f64 / scale, pos.y as f64 / scale);
+    let x = mon_x + (mon_w - width) / 2.0;
+    let y = mon_y + mon_h - height - 80.0;
+    window.set_position(tauri::LogicalPosition::new(x, y))
+}
+
+fn validated_fallback_card_height(
+    active_presentation_id: Option<u64>,
+    presentation_id: u64,
+    height: f64,
+) -> Result<Option<f64>, String> {
+    if !height.is_finite() {
+        return Err("fallback card height must be finite".into());
+    }
+    if active_presentation_id != Some(presentation_id) {
+        return Ok(None);
+    }
+    Ok(Some(
+        height
+            .ceil()
+            .clamp(FALLBACK_CARD_MIN_HEIGHT, FALLBACK_CARD_MAX_HEIGHT),
+    ))
+}
+
+/// 文本没能落到目标 app 时，把它连同一个复制按钮弹出来。
+///
+/// 为什么需要这张卡片：这些场景下唯一的兜底是「把文本写进剪贴板」，而它既依赖一个
+/// 默认可关的开关，用户也**根本不知道文本在剪贴板里** —— 没有任何提示。屏幕上要么
+/// 什么都没有，要么只有半截。
+///
+/// 窗口机制整套照搬 [`show_vocab_suggestion_card`]（复用胶囊窗口、关穿透、缩尺寸、
+/// 右下角定位），理由见那里。多的一件事是 `insert_fallback_card_visible`：这张卡片
+/// 在会话收尾那一刻弹出，而收尾自己安排了一次 `schedule_capsule_idle` → `hide()`，
+/// 必须让那次 hide 认得出卡片并让路。
+pub(crate) fn show_insert_fallback_card(inner: &Arc<Inner>, text: String, reason: &'static str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let Some(app) = inner.app.lock().clone() else {
+        return;
+    };
+    let app_for_main = app.clone();
+    let inner_for_main = Arc::clone(inner);
+    let _ = app.run_on_main_thread(move || {
+        let app = app_for_main;
+        let inner = inner_for_main;
+        // 与词条卡片同一道闸、同一理由：听写不在 Idle 就绝不碰这个窗口，否则等于把
+        // 正在进行的那次听写的胶囊弄没了。收尾路径是先把 phase 置回 Idle 再走到这里的。
+        if inner.state.lock().phase != crate::coordinator_state::SessionPhase::Idle {
+            log::debug!("[fallback-card] suppressed: a dictation session is in flight");
+            inner.insert_fallback_text.lock().take();
+            return;
+        }
+        let Some(window) = app.get_webview_window("capsule") else {
+            return;
+        };
+        let presentation_id = inner
+            .insert_fallback_presentation_id
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        let payload = crate::types::InsertFallbackCardPayload {
+            text,
+            reason: reason.to_string(),
+            presentation_id,
+        };
+        inner.insert_fallback_deferred_capsule.lock().take();
+        inner
+            .insert_fallback_card_visible
+            .store(true, Ordering::SeqCst);
+        #[cfg(not(mobile))]
+        if let Err(e) = window.set_ignore_cursor_events(false) {
+            log::warn!("[fallback-card] set_ignore_cursor_events(false) failed: {e}");
+        }
+        // 穿透状态有缓存（`capsule_cursor_passthrough`，emit_capsule 靠它跳过重复调用）。
+        // 直接碰了窗口就必须同步它，否则缓存与窗口真实状态分家，下次 emit_capsule
+        // 会以为「没变化」而跳过该调的那一次 —— 表现是胶囊之后一直挡着屏幕不放。
+        #[cfg(not(mobile))]
+        inner
+            .capsule_cursor_passthrough
+            .store(false, Ordering::SeqCst);
+        if let Err(e) = window.set_size(tauri::LogicalSize::new(
+            FALLBACK_CARD_WIDTH,
+            FALLBACK_CARD_INITIAL_HEIGHT,
+        )) {
+            log::warn!("[fallback-card] resize failed: {e}");
+        }
+        if let Err(e) = position_fallback_card(
+            &window,
+            FALLBACK_CARD_WIDTH,
+            FALLBACK_CARD_INITIAL_HEIGHT,
+        ) {
+            log::warn!("[fallback-card] position failed: {e}");
+        }
+        // 位置同理：`maybe_position_capsule_bottom_center` 的去重缓存只记「显示器 +
+        // 翻译态」，卡片这一挪它一无所知。不清掉的话下一次录音会判定「没变化」→
+        // 跳过重新定位 → 胶囊留在卡片挪过去的右下角。
+        *inner.capsule_layout.lock() = None;
+        let _ = app.emit_to("capsule", "insert:fallback", &payload);
+        show_capsule_window_for_recording(&app, &window, true);
+        #[cfg(target_os = "macos")]
+        crate::restore_main_window_key_if_active(&app);
+        log::info!(
+            "[fallback-card] shown: reason={reason} chars={}",
+            payload.text.chars().count()
+        );
+    });
+}
+
+fn report_insert_fallback_card_height(
+    inner: &Arc<Inner>,
+    presentation_id: u64,
+    height: f64,
+) -> Result<(), String> {
+    let active_presentation_id = inner
+        .insert_fallback_card_visible
+        .load(Ordering::SeqCst)
+        .then(|| {
+            inner
+                .insert_fallback_presentation_id
+                .load(Ordering::SeqCst)
+        });
+    let Some(height) =
+        validated_fallback_card_height(active_presentation_id, presentation_id, height)?
+    else {
+        return Ok(());
+    };
+    let Some(app) = inner.app.lock().clone() else {
+        return Ok(());
+    };
+    let app_for_main = app.clone();
+    let inner_for_main = Arc::clone(inner);
+    app.run_on_main_thread(move || {
+        if !inner_for_main
+            .insert_fallback_card_visible
+            .load(Ordering::SeqCst)
+            || inner_for_main
+                .insert_fallback_presentation_id
+                .load(Ordering::SeqCst)
+                != presentation_id
+        {
+            return;
+        }
+        let Some(window) = app_for_main.get_webview_window("capsule") else {
+            return;
+        };
+        if let Err(e) = window.set_size(tauri::LogicalSize::new(FALLBACK_CARD_WIDTH, height)) {
+            log::warn!("[fallback-card] measured resize failed: {e}");
+        }
+        if let Err(e) = position_fallback_card(&window, FALLBACK_CARD_WIDTH, height) {
+            log::warn!("[fallback-card] measured position failed: {e}");
+        }
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// 收起兜底卡片：把窗口完整还给胶囊。
+///
+/// 与 [`hide_vocab_suggestion_card`] 同款：**没有卡片时必须原样返回**，否则每次听写
+/// 开始都会去 hide 那个窗口，和 `emit_capsule` 的 show 抢。
+pub(crate) fn hide_insert_fallback_card(inner: &Arc<Inner>) {
+    inner.insert_fallback_text.lock().take();
+    let _event_guard = inner.capsule_event_lock.lock();
+    if !inner
+        .insert_fallback_card_visible
+        .swap(false, Ordering::SeqCst)
+    {
+        return;
+    }
+    let deferred_capsule = inner.insert_fallback_deferred_capsule.lock().take();
+    let Some(app) = inner.app.lock().clone() else {
+        return;
+    };
+    let app_for_main = app.clone();
+    let inner_for_main = Arc::clone(inner);
+    let _ = app.run_on_main_thread(move || {
+        let app = app_for_main;
+        let inner = inner_for_main;
+        let Some(window) = app.get_webview_window("capsule") else {
+            return;
+        };
+        let _ = app.emit_to(
+            "capsule",
+            "insert:fallback",
+            None::<crate::types::InsertFallbackCardPayload>,
+        );
+        // 先隐藏再改几何：复原要同时动尺寸和位置，窗口还亮着时改就有概率被合成出
+        // 一帧「卡片被拉宽、还横着飞过半个屏幕」。
+        let _ = window.hide();
+        if let Some(payload) = deferred_capsule {
+            // 卡片期间 QA / Selection Polish 仍会推进胶囊状态，只是不能碰共享窗口。
+            // 卡片释放后把最新状态一次性应用回来；若最新是 Idle，该 helper 会正常隐藏。
+            apply_capsule_window_payload(&inner, &app, &window, &payload, false, true);
+            return;
+        }
+        // 卡片期间没有任何胶囊事件：恢复默认隐藏态。
+        // 穿透必须还回去，否则胶囊会一直挡着屏幕那一块。
+        #[cfg(not(mobile))]
+        if let Err(e) = window.set_ignore_cursor_events(true) {
+            log::warn!("[fallback-card] restoring cursor passthrough failed: {e}");
+        }
+        #[cfg(not(mobile))]
+        inner
+            .capsule_cursor_passthrough
+            .store(true, Ordering::SeqCst);
+        // 尺寸也必须还回去 —— 卡片把窗口缩到过自己的大小，不复原的话下一次胶囊
+        // 就挤在一个卡片大小的窗口里，等于看不见。
+        let bounds = crate::capsule_window_bounds(false);
+        if let Err(e) = window.set_size(tauri::LogicalSize::new(bounds.width, bounds.height)) {
+            log::warn!("[fallback-card] restoring capsule size failed: {e}");
+        }
+        // 位置一样要还 —— 卡片把窗口挪到了右下角，胶囊的位置是底部居中。只还尺寸
+        // 不还位置，下一次录音胶囊就出现在右下角（词条卡片在真机上踩过这个 bug）。
+        // 清缓存和这次重定位两件都要做，理由见 `hide_vocab_suggestion_card`。
+        *inner.capsule_layout.lock() = None;
+        if let Err(e) = crate::position_capsule_bottom_center(&window, false) {
+            log::warn!("[fallback-card] restoring capsule position failed: {e}");
+        }
+    });
+}
+
 #[derive(Clone)]
 enum ActiveAsr {
     Volcengine(Arc<VolcengineStreamingASR>),
@@ -358,9 +643,12 @@ enum ActiveAsr {
     /// Windows sherpa-onnx 本地 ASR（offline batch + 实验 online streaming）。
     #[cfg(target_os = "windows")]
     SherpaOnnxLocal(Arc<SherpaOnnxAsr>),
-    /// 本地 Qwen3-ASR；只在 macOS + 模型已下载时可达。
-    #[cfg(target_os = "macos")]
+    /// 本地 Qwen3-ASR；macOS 可选 MLX/C，Linux 使用 C。
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     Local(Arc<crate::asr::local::LocalQwenAsr>),
+    /// 本地 Whisper Large-v3 Turbo；只在 macOS + 模型已迁移时可达。
+    #[cfg(target_os = "macos")]
+    LocalWhisper(Arc<crate::asr::local::LocalWhisperAsr>),
     /// Apple Speech（SFSpeechRecognizer）系统本地 ASR；只在 macOS 可达。
     #[cfg(target_os = "macos")]
     AppleSpeech(Arc<crate::asr::local::AppleSpeechAsr>),
@@ -374,6 +662,8 @@ fn asr_transcribe_uses_global_timeout(asr: &ActiveAsr) -> bool {
         // COORDINATOR_GLOBAL_TIMEOUT；各 provider 自己里面控制細粒度超时。
         #[cfg(target_os = "windows")]
         ActiveAsr::SherpaOnnxLocal(_) => false,
+        #[cfg(target_os = "macos")]
+        ActiveAsr::LocalWhisper(_) => false,
         _ => true,
     }
 }
@@ -724,9 +1014,14 @@ struct Inner {
     /// `multimodal_pipeline_enabled && pipeline_mode == multimodal` 时使用，
     /// 与 asr 槽互斥——同一会话二者有且仅有一个。
     omni_pcm: Mutex<Option<SessionResource<Arc<resources::PcmBufferConsumer>>>>,
-    /// 本地 Qwen3-ASR 引擎缓存。跨会话复用，避免每次重加载 1.2GB+ 模型。
+    /// 本地 Qwen3-ASR MLX 引擎缓存。跨会话复用，避免每次重加载 1.2GB+ 模型。
     /// 释放时机由 prefs.local_asr_keep_loaded_secs 决定。
     local_asr_cache: Arc<crate::asr::local::LocalAsrCache>,
+    #[cfg(target_os = "macos")]
+    local_whisper_cache: Arc<crate::asr::local::LocalWhisperCache>,
+    /// 串行化 Qwen / Whisper 的大模型加载与主动释放。供应商切换会先更新 Vault，
+    /// 再等待正在进行的旧加载完成并释放，避免旧预加载在切换后把非目标模型写回 cache。
+    local_asr_lifecycle: Arc<Mutex<()>>,
     #[cfg(target_os = "windows")]
     foundry_local_runtime: Arc<FoundryLocalRuntime>,
     /// Windows sherpa-onnx 本地 ASR runtime。与 Foundry 同处一个
@@ -765,6 +1060,27 @@ struct Inner {
     /// 门控 `hide_vocab_suggestion_card`：没有卡片时它必须什么都不做，否则每次听写
     /// 开始都会去 hide 胶囊窗口，和 `emit_capsule` 的 show 抢同一个窗口。
     vocab_card_visible: AtomicBool,
+    /// 「流式上屏被焦点守卫拦下」的信号，值是那次的**完整**文本。
+    ///
+    /// 只有那条路径会往里放东西——它是唯一一处「屏幕上的内容 ≠ 完整结果」的场景：
+    /// `polished` 按约定只保留真打出去的半截，而切走窗口的用户要的是整段。收尾处
+    /// (`maybe_show_insert_fallback_card`) 取走它，据此把 `InsertStatus` 从 `Inserted`
+    /// 纠正成 `CopiedFallback`，并决定卡片弹什么内容、标题怎么写。
+    ///
+    /// **取走即消费**，不是「卡片当前内容」的镜像——卡片内容随事件发给前端，后端不留。
+    /// 会话被取消时这里可能有残留，下一轮 `begin_session_as` 的 hide 会清掉。
+    insert_fallback_text: Mutex<Option<String>>,
+    /// 兜底卡片是不是正占着胶囊窗口。与 `vocab_card_visible` 同一职责、同一理由。
+    ///
+    /// 还多担一件事：这张卡片是在**会话收尾那一刻**弹的，而收尾会安排一次
+    /// `schedule_capsule_idle` → `window.hide()`。可见时那次 hide 必须让路，
+    /// 否则卡片刚出现就被自己这轮会话的收尾干掉。
+    insert_fallback_card_visible: AtomicBool,
+    /// 每次展示递增；前端尺寸回报必须携带当前代次，旧卡片的迟到 IPC 才不能缩放新卡片。
+    insert_fallback_presentation_id: AtomicU64,
+    /// 卡片占用共享窗口期间收到的最新胶囊状态。事件仍下发给 webview，但原生窗口变化
+    /// 延后；卡片关闭时用这份 payload 恢复仍在进行的 QA / Selection Polish。
+    insert_fallback_deferred_capsule: Mutex<Option<CapsulePayload>>,
     recording_mute: Mutex<SharedRecordingMuteState>,
     hotkey: Mutex<Option<HotkeyMonitor>>,
     hotkey_status: Mutex<HotkeyStatus>,
@@ -903,27 +1219,46 @@ struct PreparedWindowsImeSessionSlot {
     prepared: PreparedWindowsImeSession,
 }
 
-/// 历史音频静默重试的 ASR 资源护栏。
+/// 历史音频重转录的 ASR 资源护栏。
 ///
-/// 重试 future 被 select 丢弃时，局部 QaAsrStart 不会再经过正常的
-/// end_session 收尾；这里用 Drop 补 cancel 和本地模型释放，尤其覆盖
-/// spawn_blocking 已经开始运行的本地 ASR。
+/// 静默重试 future 被 select 丢弃时，局部 QaAsrStart 不会再经过正常的 end_session
+/// 收尾；这里用 Drop 补 cancel 和本地模型释放。Foundry 的普通历史重转录也持有该 guard，
+/// 确保成功、失败和 future 提前结束都能调度模型释放。
 struct CancellableRetranscribeGuard {
     inner: Arc<Inner>,
     asr: Option<ActiveAsr>,
     session_id: SessionId,
+    cancel_on_drop: bool,
 }
 
 impl CancellableRetranscribeGuard {
-    fn new(inner: Arc<Inner>, asr: ActiveAsr, session_id: SessionId) -> Self {
+    fn new(inner: Arc<Inner>, asr: ActiveAsr, session_id: SessionId, cancel_on_drop: bool) -> Self {
         Self {
             inner,
             asr: Some(asr),
             session_id,
+            cancel_on_drop,
         }
     }
 
     fn disarm(mut self) {
+        self.asr.take();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn finish_foundry(
+        mut self,
+        primary_recovery: Option<crate::asr::local::foundry_runtime::FoundryPrimaryRecoveryToken>,
+    ) {
+        debug_assert!(matches!(
+            self.asr.as_ref(),
+            Some(ActiveAsr::FoundryLocalWhisper(_))
+        ));
+        schedule_foundry_local_asr_release(
+            &self.inner,
+            AsrReleaseSession::Dictation(self.session_id),
+            primary_recovery,
+        );
         self.asr.take();
     }
 }
@@ -933,9 +1268,31 @@ impl Drop for CancellableRetranscribeGuard {
         let Some(asr) = self.asr.take() else {
             return;
         };
-        let asr_for_release = asr.clone();
-        cancel_active_asr(asr);
-        dictation::schedule_cancelled_asr_release(&self.inner, &asr_for_release, self.session_id);
+        if self.cancel_on_drop {
+            cancel_active_asr(asr.clone());
+        }
+        dictation::schedule_cancelled_asr_release(&self.inner, &asr, self.session_id);
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetranscribeCompletion {
+    Disarm,
+    ReleaseFoundry(
+        Option<crate::asr::local::foundry_runtime::FoundryPrimaryRecoveryToken>,
+    ),
+}
+
+#[cfg(target_os = "windows")]
+fn retranscribe_completion(
+    is_foundry: bool,
+    primary_recovery: Option<crate::asr::local::foundry_runtime::FoundryPrimaryRecoveryToken>,
+) -> RetranscribeCompletion {
+    if is_foundry {
+        RetranscribeCompletion::ReleaseFoundry(primary_recovery)
+    } else {
+        RetranscribeCompletion::Disarm
     }
 }
 
@@ -950,6 +1307,34 @@ fn persist_and_commit_remote_pin(
     *slot.lock() = Some(pin.clone());
     refresh();
     Ok(pin)
+}
+
+/// 重转录请求的错误分类：静默重试循环要区分「可再试的瞬态错误」与「Foundry
+/// GPU→CPU 回退已到终态」——终态错误再重试只会重新命中同一 CUDA 路径
+/// （PR #945 review P1-1），应立即耗尽重试而不是空转。
+pub(super) enum RetranscribeError {
+    Retryable(String),
+    TerminalFoundryFallback(String),
+}
+
+impl RetranscribeError {
+    /// 面向用户 / 历史重转录的错误消息。
+    pub(super) fn into_string(self) -> String {
+        match self {
+            Self::Retryable(message) | Self::TerminalFoundryFallback(message) => message,
+        }
+    }
+
+    /// 终态 Foundry 回退失败：静默重试循环据此跳过剩余重试次数。
+    pub(super) const fn is_terminal(&self) -> bool {
+        matches!(self, Self::TerminalFoundryFallback(_))
+    }
+}
+
+impl From<String> for RetranscribeError {
+    fn from(message: String) -> Self {
+        Self::Retryable(message)
+    }
 }
 
 impl Coordinator {
@@ -1027,6 +1412,10 @@ impl Coordinator {
                     edit_watch_generation: std::sync::atomic::AtomicU64::new(0),
                     pending_corrections: Mutex::new(Vec::new()),
                     vocab_card_visible: AtomicBool::new(false),
+                    insert_fallback_text: Mutex::new(None),
+                    insert_fallback_card_visible: AtomicBool::new(false),
+                    insert_fallback_presentation_id: AtomicU64::new(0),
+                    insert_fallback_deferred_capsule: Mutex::new(None),
                     recording_mute: Mutex::new(SharedRecordingMuteState::new()),
                     hotkey: Mutex::new(None),
                     hotkey_status: Mutex::new(HotkeyStatus::default()),
@@ -1068,6 +1457,9 @@ impl Coordinator {
                     qa_recorder: Mutex::new(None),
                     qa_stream_cancelled: Arc::new(AtomicBool::new(false)),
                     local_asr_cache: Arc::new(crate::asr::local::LocalAsrCache::new()),
+                    #[cfg(target_os = "macos")]
+                    local_whisper_cache: Arc::new(crate::asr::local::LocalWhisperCache::new()),
+                    local_asr_lifecycle: Arc::new(Mutex::new(())),
                     shutdown: AtomicBool::new(false),
                     #[cfg(not(mobile))]
                     remote_audio_sink: Mutex::new(None),
@@ -1149,9 +1541,13 @@ impl Coordinator {
                 recorder: Mutex::new(None),
                 audio_archive_active: AtomicBool::new(false),
                 edit_watcher: Mutex::new(None),
-                    edit_watch_generation: std::sync::atomic::AtomicU64::new(0),
+                edit_watch_generation: std::sync::atomic::AtomicU64::new(0),
                 pending_corrections: Mutex::new(Vec::new()),
                 vocab_card_visible: AtomicBool::new(false),
+                insert_fallback_text: Mutex::new(None),
+                insert_fallback_card_visible: AtomicBool::new(false),
+                insert_fallback_presentation_id: AtomicU64::new(0),
+                insert_fallback_deferred_capsule: Mutex::new(None),
                 recording_mute: Mutex::new(SharedRecordingMuteState::new()),
                 hotkey: Mutex::new(None),
                 hotkey_status: Mutex::new(HotkeyStatus::default()),
@@ -1193,6 +1589,9 @@ impl Coordinator {
                 qa_recorder: Mutex::new(None),
                 qa_stream_cancelled: Arc::new(AtomicBool::new(false)),
                 local_asr_cache: Arc::new(crate::asr::local::LocalAsrCache::new()),
+                #[cfg(target_os = "macos")]
+                local_whisper_cache: Arc::new(crate::asr::local::LocalWhisperCache::new()),
+                local_asr_lifecycle: Arc::new(Mutex::new(())),
                 foundry_local_runtime,
                 sherpa_onnx_runtime,
                 shutdown: AtomicBool::new(false),
@@ -1215,57 +1614,67 @@ impl Coordinator {
         }
     }
 
-    /// 后台预加载本地 ASR 引擎；当用户在 UI 切到 local-qwen3 provider 时调一次。
+    /// 后台预加载当前本地 Qwen3-ASR / Whisper 后端；切到对应 provider 时调一次。
     /// 加载是阻塞且数秒，所以放 spawn_blocking 里，不影响 UI 响应。
-    /// 模型未下载或不在 macOS 上时静默跳过。
+    /// 模型未下载或当前平台不支持该后端时静默跳过。
     pub fn preload_local_asr_in_background(self: &Arc<Self>) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let inner = Arc::clone(&self.inner);
             tauri::async_runtime::spawn(async move {
-                let prefs = inner.prefs.get();
-                let model_id =
-                    match crate::asr::local::ModelId::from_str(&prefs.local_asr_active_model) {
-                        Some(m) => m,
-                        None => return,
-                    };
-                if !crate::asr::local::models::is_downloaded(model_id) {
-                    log::info!(
-                        "[coord] local ASR preload skipped: model {} not downloaded",
-                        model_id.as_str()
-                    );
+                // Vault 是运行时 ASR 路由的单一真相；设置页会在随后同步 preferences，
+                // 这里不能读取可能仍是旧值的 prefs 快照。
+                let provider = CredentialsVault::get_active_asr();
+                if crate::asr::local::is_local_qwen3(&provider) {
+                    if let Err(error) = preload_local_qwen3(&inner, &provider).await {
+                        log::warn!("[coord] local Qwen3 preload failed: {error:#}");
+                    }
                     return;
                 }
-                let dir = match crate::asr::local::models::model_dir(model_id) {
-                    Ok(d) => d,
-                    Err(_) => return,
-                };
-                let cache = Arc::clone(&inner.local_asr_cache);
-                let mid = model_id.as_str().to_string();
-                let _ = tauri::async_runtime::spawn_blocking(move || {
-                    if let Err(e) = cache.get_or_load(&mid, &dir) {
-                        log::warn!("[coord] local ASR preload failed: {e:#}");
+
+                #[cfg(target_os = "macos")]
+                if crate::asr::local::is_local_whisper(&provider) {
+                    if let Err(error) = preload_local_whisper(&inner).await {
+                        log::warn!("[coord] local Whisper preload failed: {error:#}");
                     }
-                })
-                .await;
-                // 预热加载完后推一次状态，前端零轮询更新「已加载」。
-                emit_local_asr_engine_status(&inner);
+                    return;
+                }
             });
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // no-op
-        }
+    }
+
+    /// 供应商切换时只释放 Qwen，状态由切换流程在所有 runtime 处理完成后统一上报。
+    pub(crate) fn release_local_qwen_engine(&self) {
+        self.release_local_asr_engines(true, false);
+    }
+
+    /// 供应商切换时只释放 Whisper；非 macOS 平台没有该 cache，保持 no-op。
+    pub(crate) fn release_local_whisper_engine(&self) {
+        self.release_local_asr_engines(false, true);
+    }
+
+    /// 在同一生命周期门闩内释放所有非目标 Qwen / Whisper cache，避免两个粒度化
+    /// release 之间有旧预加载任务插入模型。Foundry / Sherpa 由各自 runtime 管理。
+    pub(crate) fn release_inactive_local_asr_engines(
+        &self,
+        release_qwen: bool,
+        release_whisper: bool,
+    ) {
+        self.release_local_asr_engines(release_qwen, release_whisper);
+    }
+
+    fn release_local_asr_engines(&self, release_qwen: bool, release_whisper: bool) {
+        release_local_asr_engines_now(&self.inner, release_qwen, release_whisper);
     }
 
     /// 释放当前缓存的本地 ASR 引擎（用户主动点 / 或 删除模型时调）。
     pub fn release_local_asr_engine(&self) {
-        self.inner.local_asr_cache.release_now();
+        self.release_local_asr_engines(true, true);
         emit_local_asr_engine_status(&self.inner);
     }
 
     pub fn local_asr_loaded_model(&self) -> Option<String> {
-        self.inner.local_asr_cache.loaded_model_id()
+        active_local_asr_loaded_model(&self.inner)
     }
 
     /// 主动把当前本地 ASR 引擎状态推给前端（keepLoadedSecs 变更等命令侧调用）。
@@ -1829,7 +2238,14 @@ impl Coordinator {
         // callback (SIGABRT). Tauri's runtime handle is safe from either thread.
         tauri::async_runtime::spawn(async move {
             let session_id = crate::coordinator_state::new_session_id();
-            if let Err(e) = dictation::run_voice_agent_transcript(&inner, session_id, text, 0).await
+            if let Err(e) = dictation::run_voice_agent_transcript(
+                &inner,
+                session_id,
+                text,
+                0,
+                CapsuleFeedback::Hide,
+            )
+            .await
             {
                 log::warn!("[less-computer] text submit run failed: {e}");
             }
@@ -1927,6 +2343,19 @@ impl Coordinator {
     /// 卡片 10 秒到期，或新一轮听写开始。
     pub fn dismiss_vocab_suggestions(&self) {
         hide_vocab_suggestion_card(&self.inner);
+    }
+
+    /// 落字失败兜底卡片自己关掉了（用户点关闭 / TTL 到时）。
+    pub fn dismiss_insert_fallback_card(&self) {
+        hide_insert_fallback_card(&self.inner);
+    }
+
+    pub fn report_insert_fallback_card_height(
+        &self,
+        presentation_id: u64,
+        height: f64,
+    ) -> Result<(), String> {
+        report_insert_fallback_card_height(&self.inner, presentation_id, height)
     }
 
     /// 用户关掉了「光标上下文」开关 —— 立刻停掉一切还在跑的观察，别等它自己超时。
@@ -2341,10 +2770,8 @@ impl Coordinator {
                 .get_or_default_active(&prefs.active_style_pack_id)
                 .map_err(|e| e.to_string())?,
         };
-        let style_system_prompt = crate::types::style_pack_prompt(
-            &pack,
-            crate::types::StylePromptKind::DictationAsr,
-        );
+        let style_system_prompt =
+            crate::types::style_pack_prompt(&pack, crate::types::StylePromptKind::DictationAsr);
         let working_languages = prefs.working_languages;
         let chinese_script_preference = prefs.chinese_script_preference;
         let output_language_preference = prefs.output_language_preference;
@@ -2399,13 +2826,15 @@ impl Coordinator {
     /// 返回 (转写文本, 本次实际构建的 ASR (provider, model) 快照)。快照供命令层把
     /// 「重转用了哪个模型」写回历史（构建时归因，PR #826 review）。
     pub async fn retranscribe_pcm(&self, pcm: Vec<u8>) -> Result<(String, AsrCallLabel), String> {
-        self.retranscribe_pcm_inner(pcm, false, None).await
+        self.retranscribe_pcm_inner(pcm, false, None)
+            .await
+            .map_err(RetranscribeError::into_string)
     }
 
     pub(super) async fn retranscribe_pcm_until_cancelled(
         &self,
         pcm: Vec<u8>,
-    ) -> (Result<String, String>, Option<AsrCallLabel>) {
+    ) -> (Result<String, RetranscribeError>, Option<AsrCallLabel>) {
         // 自动静默重试会重新读取当前设置并构建一条全新的 ASR 会话，因此必须把这次
         // 实际构建的标签交还给调用方。即使请求最终失败，也保留“本次尝试了谁”，让
         // 彻底失败的历史不会退回首次会话的旧归因。
@@ -2422,18 +2851,24 @@ impl Coordinator {
         pcm: Vec<u8>,
         cancel_on_drop: bool,
         attempted_label: Option<&mut Option<AsrCallLabel>>,
-    ) -> Result<(String, AsrCallLabel), String> {
+    ) -> Result<(String, AsrCallLabel), RetranscribeError> {
         let inner = &self.inner;
         let active_asr = CredentialsVault::get_active_asr();
         let (start, asr_call_label) = build_qa_asr_start(inner, &active_asr).await?;
         if let Some(label_slot) = attempted_label {
             *label_slot = Some(asr_call_label.clone());
         }
-        let retry_guard = if cancel_on_drop {
+        #[cfg(target_os = "windows")]
+        let is_foundry_retranscribe =
+            matches!(start.active_asr(), ActiveAsr::FoundryLocalWhisper(_));
+        #[cfg(not(target_os = "windows"))]
+        let is_foundry_retranscribe = false;
+        let retry_guard = if cancel_on_drop || is_foundry_retranscribe {
             Some(CancellableRetranscribeGuard::new(
                 Arc::clone(inner),
                 start.active_asr(),
                 inner.state.lock().session_id,
+                cancel_on_drop,
             ))
         } else {
             None
@@ -2446,6 +2881,8 @@ impl Coordinator {
         let elevenlabs_timeout = crate::asr::elevenlabs::transcribe_timeout(
             crate::asr::pcm::pcm_duration_ms(&pcm) as f64 / 1000.0,
         );
+        #[cfg(target_os = "windows")]
+        let mut foundry_primary_recovery = None;
         let raw = match start.active_asr() {
             ActiveAsr::Volcengine(asr) => {
                 asr.send_last_frame().await.map_err(|e| e.to_string())?;
@@ -2496,19 +2933,48 @@ impl Coordinator {
                     .map_err(|_| "重新转录超时".to_string())?
                     .map_err(|e| e.to_string())?
             }
-            ActiveAsr::ElevenLabs(e) => {
-                tokio::time::timeout(elevenlabs_timeout, e.transcribe())
-                    .await
-                    .map_err(|_| "重新转录超时".to_string())?
-                    .map_err(|e| e.to_string())?
-            }
+            ActiveAsr::ElevenLabs(e) => tokio::time::timeout(elevenlabs_timeout, e.transcribe())
+                .await
+                .map_err(|_| "重新转录超时".to_string())?
+                .map_err(|e| e.to_string())?,
             #[cfg(target_os = "windows")]
             ActiveAsr::FoundryLocalWhisper(local) => {
                 let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
-                local
-                    .transcribe(windows_local_asr_transcribe_timeout(audio_secs))
+                // 保留 anyhow::Error 以便按「终态回退失败」分类：静默重试循环据此
+                // 跳过剩余重试，避免重新命中同一 CUDA 路径（PR #945 review P1-1）。
+                let outcome = match local
+                    .transcribe_with_fallback_notice(
+                        windows_local_asr_transcribe_timeout(audio_secs),
+                        Arc::new(|_| {}),
+                    )
                     .await
-                    .map_err(|e| e.to_string())?
+                {
+                    Ok(outcome) => outcome,
+                    Err(error)
+                        if crate::asr::local::foundry_runtime::is_terminal_foundry_fallback_error(
+                            &error,
+                        ) =>
+                    {
+                        // 完整错误链只进日志；面向用户的消息用精简文案（与
+                        // dictation/qa 首轮的 P2-2 处理一致）。此消息会经
+                        // retranscribe_pcm 原样展示在历史重转录入口，不能带
+                        // 原始 SDK 文本。
+                        log::error!(
+                            "[coord] Foundry Local Whisper retranscribe reached terminal fallback error: {error:#}"
+                        );
+                        return Err(RetranscribeError::TerminalFoundryFallback(
+                            crate::asr::local::foundry_runtime::FOUNDRY_FALLBACK_TERMINAL_USER_MESSAGE
+                                .to_string(),
+                        ));
+                    }
+                    Err(error) => return Err(RetranscribeError::Retryable(error.to_string())),
+                };
+                debug_assert_eq!(
+                    outcome.used_cpu_fallback,
+                    outcome.primary_recovery.is_some()
+                );
+                foundry_primary_recovery = outcome.primary_recovery;
+                outcome.raw
             }
             #[cfg(target_os = "windows")]
             ActiveAsr::SherpaOnnxLocal(local) => {
@@ -2518,17 +2984,48 @@ impl Coordinator {
                     .await
                     .map_err(|e| e.to_string())?
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             ActiveAsr::Local(local) => {
                 let dur =
                     local_qwen_transcribe_timeout((local.buffer_duration_ms() as f64) / 1000.0);
-                inner.local_asr_cache.touch();
-                let out = tokio::time::timeout(dur, local.transcribe())
-                    .await
+                let out = tokio::time::timeout(dur, local.clone().transcribe()).await;
+                if out.is_err() {
+                    // 超时只放弃结果：解码任务仍在 spawn_blocking 里跑并持有引擎锁，
+                    // cancel() 中止不了它。驱逐引擎让下次会话加载新引擎（与
+                    // coordinator/dictation.rs 同款处理）。
+                    local.cancel();
+                    log::warn!(
+                        "[coord] 重新转录超时 {}s，驱逐本地 Qwen3-ASR 引擎",
+                        dur.as_secs()
+                    );
+                    release_local_asr_engines_now(inner, true, false);
+                } else {
+                    inner.local_asr_cache.touch();
+                    schedule_local_asr_release(inner);
+                }
+                let out = out
                     .map_err(|_| "重新转录超时".to_string())?
                     .map_err(|e| e.to_string())?;
-                schedule_local_asr_release(inner);
                 out
+            }
+            #[cfg(target_os = "macos")]
+            ActiveAsr::LocalWhisper(local) => {
+                let dur =
+                    local_whisper_transcribe_timeout((local.buffer_duration_ms() as f64) / 1000.0);
+                let out = tokio::time::timeout(dur, local.clone().transcribe()).await;
+                if out.is_err() {
+                    local.cancel();
+                    log::warn!(
+                        "[coord] 重新转录 Whisper 超时 {}s，驱逐本地引擎",
+                        dur.as_secs()
+                    );
+                    release_local_asr_engines_now(inner, false, true);
+                } else {
+                    inner.local_whisper_cache.touch();
+                    schedule_local_whisper_release(inner);
+                }
+                out.map_err(|_| "重新转录超时".to_string())?
+                    .map_err(|e| e.to_string())?
             }
             #[cfg(target_os = "macos")]
             ActiveAsr::AppleSpeech(local) => tokio::time::timeout(timeout, local.transcribe())
@@ -2537,6 +3034,14 @@ impl Coordinator {
                 .map_err(|e| e.to_string())?,
         };
         if let Some(guard) = retry_guard {
+            #[cfg(target_os = "windows")]
+            match retranscribe_completion(is_foundry_retranscribe, foundry_primary_recovery) {
+                RetranscribeCompletion::ReleaseFoundry(primary_recovery) => {
+                    guard.finish_foundry(primary_recovery);
+                }
+                RetranscribeCompletion::Disarm => guard.disarm(),
+            }
+            #[cfg(not(target_os = "windows"))]
             guard.disarm();
         }
         Ok((raw.text, asr_call_label))
@@ -3331,6 +3836,40 @@ fn resolve_ark_endpoint_with_policy(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_card_height_report_rejects_non_finite_values() {
+        assert!(super::validated_fallback_card_height(Some(7), 7, f64::NAN).is_err());
+        assert!(super::validated_fallback_card_height(Some(7), 7, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn fallback_card_height_report_ignores_stale_presentations() {
+        assert_eq!(
+            super::validated_fallback_card_height(Some(8), 7, 180.0).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::validated_fallback_card_height(None, 7, 180.0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_card_height_report_clamps_to_native_safety_bounds() {
+        assert_eq!(
+            super::validated_fallback_card_height(Some(7), 7, 40.0).unwrap(),
+            Some(96.0)
+        );
+        assert_eq!(
+            super::validated_fallback_card_height(Some(7), 7, 500.0).unwrap(),
+            Some(320.0)
+        );
+        assert_eq!(
+            super::validated_fallback_card_height(Some(7), 7, 181.2).unwrap(),
+            Some(182.0)
+        );
+    }
+
     /// 造一条词典条目。传给 `prioritize_vocab_for_asr` 时必须是词典的原始顺序
     /// （最近添加在前）。
     fn vocab_entry(phrase: &str, hits: u64) -> crate::types::DictionaryEntry {
@@ -3364,7 +3903,10 @@ mod tests {
         let ordered = super::prioritize_vocab_for_asr(entries);
 
         let pos = |p: &str| ordered.iter().position(|x| x == p).expect("phrase kept");
-        assert!(pos("hermes") < pos("scrap"), "命中多的必须排在刚收进来的碎片前面");
+        assert!(
+            pos("hermes") < pos("scrap"),
+            "命中多的必须排在刚收进来的碎片前面"
+        );
         assert!(pos("win-shukong") < pos("scrap"));
         assert!(pos("hermes") < pos("win-shukong"), "命中多的在前");
     }
@@ -3408,7 +3950,10 @@ mod tests {
     fn learned_vocab_does_not_consume_fresh_manual_seats() {
         let mut entries = Vec::new();
         for i in 0..super::FRESH_VOCAB_SEATS {
-            entries.push(learned_vocab_entry(&format!("learned{i}"), 1_000 - i as u64));
+            entries.push(learned_vocab_entry(
+                &format!("learned{i}"),
+                1_000 - i as u64,
+            ));
             entries.push(vocab_entry(&format!("manual{i}"), 0));
         }
 
@@ -4206,6 +4751,26 @@ mod tests {
             &runtime,
             &coordinator.inner.foundry_local_runtime
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn foundry_retranscription_completion_requires_release_with_recovery_token() {
+        let runtime = crate::asr::local::FoundryLocalRuntime::new();
+        let token = crate::asr::local::foundry_runtime::FoundryPrimaryRecoveryToken::new(
+            "whisper-medium",
+            "whisper-medium-cuda-gpu:4",
+            runtime.begin_route(),
+        );
+
+        assert_eq!(
+            retranscribe_completion(true, Some(token.clone())),
+            RetranscribeCompletion::ReleaseFoundry(Some(token))
+        );
+        assert_eq!(
+            retranscribe_completion(false, None),
+            RetranscribeCompletion::Disarm
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -5369,6 +5934,13 @@ fn local_qwen_transcribe_timeout(audio_secs: f64) -> std::time::Duration {
     let secs = ((audio_secs * 0.6).ceil() as u64)
         .saturating_add(10)
         .max(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+fn local_whisper_transcribe_timeout(audio_secs: f64) -> std::time::Duration {
+    let secs = ((audio_secs * 0.5).ceil() as u64)
+        .saturating_add(10)
+        .max(15);
     std::time::Duration::from_secs(secs)
 }
 

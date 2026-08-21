@@ -62,23 +62,39 @@
 <table align="center">
   <tr>
     <td align="center" width="170">
-      <a href="https://tripmc.top/" target="_blank" rel="noopener">
-        <img src="assets/people/tripmc.png" width="80" height="80" alt="TRIP" /><br/>
-        <strong>TRIP</strong>
-      </a><br/>
-      <sub>tripmc.top</sub>
+      <img src="assets/people/tripmc.png" width="80" height="80" alt="TRIP" /><br/>
+      <strong><a href="https://tripmc.top/" target="_blank" rel="noopener">TRIP</a></strong><br/>
+      <sub>Author</sub>
     </td>
     <td align="center" width="170">
-      <a href="https://chris233.qzz.io" target="_blank" rel="noopener">
-        <img src="assets/people/Chris233.png" width="80" height="80" alt="Chris233" /><br/>
-        <strong>Chris233</strong>
-      </a><br/>
-      <sub>chris233.qzz.io</sub>
+      <img src="assets/people/Chris233.png" width="80" height="80" alt="Chris233" /><br/>
+      <strong><a href="https://github.com/H-Chris233" target="_blank" rel="noopener">Chris233</a></strong><br/>
+      <sub>Author / Maintainer</sub>
+    </td>
+    <td align="center" width="170">
+      <img src="https://image.bigsong.site/file/1787214963742_b40cd86b033a60bcc8562f7f053c4900.jpg" width="80" height="80" alt="bigsong" /><br/>
+      <strong><a href="https://bigsong.site" target="_blank" rel="noopener">bigsong</a></strong><br/>
+      <sub>Contributor / Tester</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="170">
+      <img src="https://github.com/HKLHaoBin.png" width="80" height="80" alt="HKLHaoBin" /><br/>
+      <strong><a href="https://github.com/HKLHaoBin" target="_blank" rel="noopener">HKLHaoBin</a></strong><br/>
+      <sub>Android author</sub>
+    </td>
+    <td align="center" width="170">
+      <img src="assets/people/cooper.png" width="80" height="80" alt="Cooper" /><br/>
+      <strong><a href="https://github.com/Cooper-X-Oak" target="_blank" rel="noopener">Cooper</a></strong><br/>
+      <sub>Contributor</sub>
+    </td>
+    <td align="center" width="170">
+      <img src="https://github.com/aeoform.png" width="80" height="80" alt="aeoform" /><br/>
+      <strong><a href="https://github.com/aeoform" target="_blank" rel="noopener">aeoform</a></strong><br/>
+      <sub>Contributor</sub>
     </td>
   </tr>
 </table>
-
----
 
 OpenLess is a cross-platform (macOS and Windows) voice-input application — a fully open-source alternative to commercial tools such as [Typeless](https://www.typeless.com/), [Wispr Flow](https://wisprflow.ai), [Lazy](https://heylazy.com), and Superwhisper. Official site: [openless.top](https://openless.top).
 
@@ -177,7 +193,7 @@ OpenLess does one thing: it **turns speech into usable written text — AI promp
 
 Every item below is one more layer sedimented into a default — a capability you authorize once and then never manage again. This is the infrastructure you stand on after launch:
 
-- Tauri 2 backend in Rust with a React/TypeScript frontend. macOS 12+, Windows 10+.
+- Tauri 2 backend in Rust with a React/TypeScript frontend. macOS 14+, Windows 10+.
 - 🎨 **Style Pack Marketplace** — browse, install, and like community **style packs** from the in-app Marketplace, and publish your own (custom system prompt per pack, switchable by hotkey). Backed by a moderated marketplace backend; uploads are reviewed before they go public.
 - ⚡ **Streaming insertion** — polished text is written to the cursor character by character to reduce perceived latency, with an automatic one-shot-paste fallback. Toggle in Settings → Recording.
 - **Toggle and push-to-talk** recording modes, plus a **MediaPlayPause trigger** so wired-earbud inline controls can start and stop recording. `Esc` cancels at any phase, including polish and insertion.
@@ -240,9 +256,11 @@ For the full end-user walkthrough, see [USAGE.md](USAGE.md).
 
 ## Build from source (developers)
 
-The active codebase lives in `openless-all/app/` (Tauri 2 + Rust + React/TS). The macOS build links a vendored C ASR engine ([`Open-Less/qwen-asr`](https://github.com/Open-Less/qwen-asr), forked from `antirez/qwen-asr`) pulled in as a git submodule under `src-tauri/vendor/qwen-asr/`, so initialize submodules on first clone.
+The active codebase lives in `openless-all/app/` (Tauri 2 + Rust + React/TS). The macOS build links a vendored C ASR engine ([`Open-Less/qwen-asr`](https://github.com/Open-Less/qwen-asr), forked from `antirez/qwen-asr`) pulled in as a git submodule under `src-tauri/vendor/qwen-asr/`, so initialize submodules on first clone. **Recursive submodule initialization is required on every platform** — the macOS-only `qwen3-asr-rs` path dependency is still parsed by Cargo on Windows/Linux (skipping it fails `cargo check` at resolution time), and Linux builds compile the vendored C engine too.
 
 Rust 1.88 is the minimum supported toolchain for source builds; the latest stable Rust is recommended. CI verifies both Rust 1.88 and stable on macOS, Windows, and Linux.
+
+On Apple Silicon, compiling the optional Qwen3-ASR MLX backend requires Xcode's MetalToolchain component. Install it with `xcodebuild -downloadComponent MetalToolchain` and verify it with `xcrun --find metal`. This is a source-build dependency; packaged OpenLess applications do not require it at runtime.
 
 ```bash
 # First clone only — pull in vendored submodules

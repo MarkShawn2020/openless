@@ -121,6 +121,17 @@ export interface PendingCorrection {
   replacement: string;
 }
 
+/** 为什么这段话没落进目标 app。只用于后端日志，卡片本身不渲染它。 */
+export type InsertFallbackReason = 'partialStream' | 'insertFailed';
+
+/** 落字失败兜底卡片的内容。`text` 始终是完整的那段话，即便屏幕上只落了半截。 */
+export interface InsertFallbackCardPayload {
+  text: string;
+  reason: InsertFallbackReason;
+  /** 本次展示代次；尺寸回报必须原样携带，后端据此忽略旧卡片的迟到 IPC。 */
+  presentationId: number;
+}
+
 export interface VocabPreset {
   id: string;
   name: string;
@@ -223,6 +234,10 @@ export type WindowsInsertionMode = 'tsf' | 'sendInput' | 'paste';
 
 /** Windows SendInput 路径的换行模拟方式。 */
 export type WindowsSendInputNewlineMode = 'enter' | 'shiftEnter' | 'crlf';
+
+/** macOS 逐字上屏时换行符怎么发。`return` 在聊天框里等于发送 —— 靠换行拆多条消息的
+ *  风格包要的就是这个。 */
+export type MacosNewlineMode = 'shiftReturn' | 'return';
 
 export type WindowsImeInstallState =
   | 'installed'
@@ -365,6 +380,7 @@ export interface UserPreferences {
   windowsInsertionMode: WindowsInsertionMode;
   /** Windows SendInput 路径的换行模拟方式。 */
   windowsSendInputNewlineMode: WindowsSendInputNewlineMode;
+  macosNewlineMode: MacosNewlineMode;
   /** 旧版兼容：`true` 等价于 `windowsInsertionMode === 'sendInput'`。 */
   windowsSendInputInsertionOnly: boolean;
   /** Windows：SendInput 模式下是否在系统键盘列表（Win+Space）中显示 OpenLess。 */
@@ -415,8 +431,10 @@ export interface UserPreferences {
   codingAgentPanelHotkey: ShortcutBinding | null;
   /** 热键 2：快取用键（选中→Claude→回插）。null = 未配置。 */
   codingAgentQuickHotkey: ShortcutBinding | null;
-  /** 本地 Qwen3-ASR 当前激活的模型 id。仅在 activeAsrProvider === 'local-qwen3' 时有意义。 */
+  /** 本地 Qwen3-ASR 当前激活的模型 id。仅在 local-qwen3 系列 provider 时有意义。 */
   localAsrActiveModel: string;
+  /** macOS 本地 Whisper 当前激活的模型 id。 */
+  localWhisperActiveModel: string;
   /** 本地模型下载源镜像（'huggingface' / 'hf-mirror'）。 */
   localAsrMirror: string;
   /** 本地 ASR 引擎在内存中的保留时长（秒）。0 = 说完话即释放；
@@ -562,8 +580,6 @@ export interface QaStatePayload {
   messages?: QaChatMessage[];
   /** recording 状态时附带的选区预览（前 60 字）。 */
   selection_preview?: string | null;
-  /** Linux 选区工具缺失时的非阻断提醒码。 */
-  selection_warning?: 'linux_selection_tools_missing' | null;
   /** error 状态时附带的提示。 */
   error?: string;
   /** answer_delta 事件时附带的本帧增量字符串。 */
@@ -699,6 +715,7 @@ export interface PlatformCapabilities {
   supportsOverlay: boolean;
   supportsImeInput: boolean;
   supportsLocalAsr: boolean;
+  supportsLocalQwen3Mlx: boolean;
   supportsInAppDictation: boolean;
   supportsAutoUpdate: boolean;
 }

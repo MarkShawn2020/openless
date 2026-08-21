@@ -62,23 +62,44 @@
 <table align="center">
   <tr>
     <td align="center" width="170">
-      <a href="https://tripmc.top/" target="_blank" rel="noopener">
-        <img src="assets/people/tripmc.png" width="80" height="80" alt="TRIP" /><br/>
-        <strong>TRIP</strong>
-      </a><br/>
-      <sub>tripmc.top</sub>
+      <img src="assets/people/tripmc.png" width="80" height="80" alt="TRIP" /><br/>
+      <strong><a href="https://tripmc.top/" target="_blank" rel="noopener">TRIP</a></strong><br/>
+      <sub>作者</sub>
     </td>
     <td align="center" width="170">
-      <a href="https://chris233.qzz.io" target="_blank" rel="noopener">
-        <img src="assets/people/Chris233.png" width="80" height="80" alt="Chris233" /><br/>
-        <strong>Chris233</strong>
-      </a><br/>
-      <sub>chris233.qzz.io</sub>
+      <img src="assets/people/Chris233.png" width="80" height="80" alt="Chris233" /><br/>
+      <strong><a href="https://github.com/H-Chris233" target="_blank" rel="noopener">Chris233</a></strong><br/>
+      <sub>作者/维护者</sub>
+    </td>
+    <td align="center" width="170">
+      <img
+        src="https://image.bigsong.site/file/1787214963742_b40cd86b033a60bcc8562f7f053c4900.jpg"
+        width="80"
+        height="80"
+        alt="bigsong"
+      /><br/>
+      <strong><a href="https://bigsong.site" target="_blank" rel="noopener">bigsong</a></strong><br/>
+      <sub>贡献者/测试</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="170">
+      <img src="https://github.com/HKLHaoBin.png" width="80" height="80" alt="HKLHaoBin" /><br/>
+      <strong><a href="https://github.com/HKLHaoBin" target="_blank" rel="noopener">HKLHaoBin</a></strong><br/>
+      <sub>安卓版作者</sub>
+    </td>
+    <td align="center" width="170">
+      <img src="assets/people/cooper.png" width="80" height="80" alt="Cooper" /><br/>
+      <strong><a href="https://github.com/Cooper-X-Oak" target="_blank" rel="noopener">Cooper</a></strong><br/>
+      <sub>贡献者</sub>
+    </td>
+    <td align="center" width="170">
+      <img src="https://github.com/aeoform.png" width="80" height="80" alt="aeoform" /><br/>
+      <strong><a href="https://github.com/aeoform" target="_blank" rel="noopener">aeoform</a></strong><br/>
+      <sub>贡献者</sub>
     </td>
   </tr>
 </table>
-
----
 
 OpenLess 是一款跨平台(macOS 与 Windows)语音输入应用,是 [Typeless](https://www.typeless.com/)、[Wispr Flow](https://wisprflow.ai)、[Lazy](https://heylazy.com)、Superwhisper 等商业工具的完全开源替代品。官网:[openless.top](https://openless.top)。
 
@@ -177,7 +198,7 @@ OpenLess 只做一件事:**把语音变成可用的书面文字(尤其是 AI 提
 
 下面每一项,都是一层已经沉降为默认、你授权一次之后就不必再操心的能力——这就是开屏之后你所站立的基础设施:
 
-- Tauri 2 后端(Rust)+ React/TypeScript 前端。macOS 12+、Windows 10+。
+- Tauri 2 后端(Rust)+ React/TypeScript 前端。macOS 14+、Windows 10+。
 - 🎨 **风格包市场**——在应用内的 Marketplace 浏览、安装、点赞社区**风格包**,并发布自己的(每个包一套自定义系统提示词,可用快捷键切换)。由经过审核的市场后端支撑;上传内容公开前会经过审核。
 - ⚡ **流式插入**——润色后的文本逐字符写入光标以降低感知延迟,并带有自动的一次性粘贴回退。可在 设置 → 录音 中切换。
 - **切换式与按住说话(push-to-talk)** 两种录音模式,外加 **MediaPlayPause 触发**,让有线耳机的线控也能开始 / 停止录音。`Esc` 可在任意阶段取消,包括润色与插入。
@@ -240,9 +261,11 @@ OpenLess 只做一件事:**把语音变成可用的书面文字(尤其是 AI 提
 
 ## 从源码构建(开发者)
 
-活跃的代码库位于 `openless-all/app/`(Tauri 2 + Rust + React/TS)。macOS 构建会链接一个 vendored 的 C 语言 ASR 引擎([`Open-Less/qwen-asr`](https://github.com/Open-Less/qwen-asr),fork 自 `antirez/qwen-asr`),它作为 git 子模块位于 `src-tauri/vendor/qwen-asr/`,因此首次克隆时需初始化子模块。
+活跃的代码库位于 `openless-all/app/`(Tauri 2 + Rust + React/TS)。macOS 构建会链接一个 vendored 的 C 语言 ASR 引擎([`Open-Less/qwen-asr`](https://github.com/Open-Less/qwen-asr),fork 自 `antirez/qwen-asr`),它作为 git 子模块位于 `src-tauri/vendor/qwen-asr/`,因此首次克隆时需初始化子模块。**递归初始化子模块在所有平台都是必需的**——macOS-only 的 `qwen3-asr-rs` path 依赖在 Windows/Linux 上也会被 Cargo 解析器读取(跳过它会让 `cargo check` 在解析阶段硬失败),Linux 构建还要编译 vendored C 引擎。
 
 Rust 1.88 是从源码构建所支持的最低工具链版本；建议使用最新 stable Rust。CI 会在 macOS、Windows 和 Linux 上同时验证 Rust 1.88 与 stable。
+
+Apple Silicon 编译可选的 Qwen3-ASR MLX 后端时需要 Xcode 的 MetalToolchain 组件。执行 `xcodebuild -downloadComponent MetalToolchain` 安装，并用 `xcrun --find metal` 验证。它只属于源码构建依赖，已打包的 OpenLess 应用运行时不需要该组件。
 
 ```bash
 # 仅首次克隆——拉取 vendored 子模块
