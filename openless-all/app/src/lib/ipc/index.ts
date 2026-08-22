@@ -61,8 +61,12 @@ export {
 export {
     listVocab,
     addVocab,
+    addVocabWithMetadata,
     removeVocab,
     setVocabEnabled,
+    setVocabMetadata,
+    listVocabSuggestions,
+    getDictionaryDeliveryPreview,
     listCorrectionRules,
     addCorrectionRule,
     acceptPendingCorrection,

@@ -942,8 +942,7 @@ fn finalize_polished_text(
 /// 该不该武装手改监听。
 ///
 /// 三个条件缺一不可：
-/// - **开关开着**。手改学习和光标上下文共用 `cursorContextEnabled`：两者用的是同一套
-///   AX 读取、面对的是同一个隐私问题，拆成两个开关只会让用户以为关掉一个就安全了。
+/// - **总开关与手改子开关都开着**。总开关是隐私边界，子开关决定是否启动观察器。
 /// - **真的落字了**。`PasteSent` / `CopiedFallback` / `Failed` 意味着文字压根没进目标
 ///   控件，或者进没进我们并不知道 —— 拿它当基线只会学到幻觉。
 /// - **落的字非空**。空文本没有「用户改了哪个词」可言。
@@ -1004,7 +1003,41 @@ async fn read_cursor_context_for_prompt(enabled: bool) -> Option<String> {
 /// 面对的是同一个隐私问题，分成两个开关只会让用户以为关掉一个就安全了。
 ///
 /// 任何一步失败都只是「学不到东西」，绝不影响已经落到屏幕上的文字。
-fn arm_edit_watch(inner: &Arc<Inner>, status: InsertStatus, typed_text: &str) {
+#[derive(Clone)]
+struct EditAttributionSnapshot {
+    asr_original: Option<String>,
+    asr_corrected: Option<String>,
+    llm_final: String,
+    source_app: Option<String>,
+}
+
+fn classify_edit_attribution(
+    edit: &crate::host_document::EditPair,
+    snapshot: &EditAttributionSnapshot,
+) -> crate::types::CorrectionAttribution {
+    if snapshot
+        .asr_original
+        .as_deref()
+        .is_some_and(|text| text.contains(&edit.source))
+        || snapshot
+            .asr_corrected
+            .as_deref()
+            .is_some_and(|text| text.contains(&edit.source))
+    {
+        crate::types::CorrectionAttribution::Asr
+    } else if snapshot.llm_final.contains(&edit.source) {
+        crate::types::CorrectionAttribution::Llm
+    } else {
+        crate::types::CorrectionAttribution::Unknown
+    }
+}
+
+fn arm_edit_watch(
+    inner: &Arc<Inner>,
+    status: InsertStatus,
+    typed_text: &str,
+    attribution: EditAttributionSnapshot,
+) {
     use std::sync::atomic::Ordering;
 
     // 无论如何都先把上一次的解除掉：哪怕这次不武装，旧观察器也不该继续活着。
@@ -1012,12 +1045,17 @@ fn arm_edit_watch(inner: &Arc<Inner>, status: InsertStatus, typed_text: &str) {
     super::disarm_edit_watch(inner);
     let generation = inner.edit_watch_generation.load(Ordering::SeqCst);
 
-    if !should_arm_edit_watch(inner.prefs.get().cursor_context_enabled, status, typed_text) {
+    let prefs = inner.prefs.get();
+    if !should_arm_edit_watch(
+        prefs.cursor_context_enabled && prefs.edit_learning_enabled,
+        status,
+        typed_text,
+    ) {
         return;
     }
     let mut slot = inner.edit_watcher.lock();
     let inner_for_edit = Arc::clone(inner);
-    *slot = crate::host_document::watch_for_edits(typed_text.to_string(), move |edit| {
+    *slot = crate::host_document::watch_for_edits(typed_text.to_string(), move |observation| {
         // 代次对不上 = 这条来自已经被换掉的观察器，丢掉。不打 info：正常解除也会走到
         // 这里，日常并不稀奇。
         let current = inner_for_edit.edit_watch_generation.load(Ordering::SeqCst);
@@ -1029,18 +1067,29 @@ fn arm_edit_watch(inner: &Arc<Inner>, status: InsertStatus, typed_text: &str) {
         }
         log::info!(
             "[cursor-context] user edit detected: source={:?} target={:?}",
-            edit.source,
-            edit.target
+            observation.edit.source,
+            observation.edit.target
         );
-        handle_user_edit(&inner_for_edit, edit);
+        handle_user_edit(&inner_for_edit, observation, &attribution);
     });
 }
 
 /// 两条听写管线共同的插入后反馈：先武装手改监听，再累计词条命中并通知前端。
-fn handle_post_insert_feedback(inner: &Arc<Inner>, status: InsertStatus, typed_text: &str) -> u64 {
-    arm_edit_watch(inner, status, typed_text);
+fn handle_post_insert_feedback(
+    inner: &Arc<Inner>,
+    status: InsertStatus,
+    typed_text: &str,
+    attribution: EditAttributionSnapshot,
+) -> u64 {
+    arm_edit_watch(inner, status, typed_text, attribution);
 
-    let total_hits = match inner.vocab.record_hits(typed_text) {
+    let project_key = super::current_project_key(inner);
+    let temporary_ttl_days = inner.prefs.get().temporary_vocab_ttl_days;
+    let total_hits = match inner.vocab.record_hits(
+        typed_text,
+        project_key.as_deref(),
+        temporary_ttl_days,
+    ) {
         Ok(hits) => hits,
         Err(error) => {
             log::error!("[coord] record_hits failed: {error}");
@@ -1063,12 +1112,22 @@ fn handle_post_insert_feedback(inner: &Arc<Inner>, status: InsertStatus, typed_t
 /// typeless`）。观察器看到的是编辑过程中的每一帧，而中间态和一次纠错在文本上没有区别。
 ///
 /// 分不出来就别猜 —— 一律弹卡片，让用户点勾或点叉。
-fn handle_user_edit(inner: &Arc<Inner>, edit: crate::host_document::EditPair) {
-    let Some(rule) = crate::host_document::learned_rule(&edit) else {
+fn handle_user_edit(
+    inner: &Arc<Inner>,
+    observation: crate::host_document::EditObservation,
+    attribution: &EditAttributionSnapshot,
+) {
+    let Some(rule) = crate::host_document::learned_rule(&observation.edit) else {
         log::debug!("[cursor-context] edit is not word-like; logged only");
         return;
     };
-    queue_correction_suggestion(inner, &rule);
+    queue_correction_suggestion(
+        inner,
+        &rule,
+        observation.confidence,
+        classify_edit_attribution(&observation.edit, attribution),
+        attribution.source_app.clone(),
+    );
 }
 
 /// 排进待确认队列，并把卡片弹到胶囊那个位置。
@@ -1078,7 +1137,27 @@ fn handle_user_edit(inner: &Arc<Inner>, edit: crate::host_document::EditPair) {
 ///
 /// 卡片本身不抢焦点 —— 胶囊窗口是 nonactivating panel，你在别的 app 里打字时它弹
 /// 出来不会把光标夺走。
-fn queue_correction_suggestion(inner: &Arc<Inner>, rule: &crate::host_document::LearnedRule) {
+fn queue_correction_suggestion(
+    inner: &Arc<Inner>,
+    rule: &crate::host_document::LearnedRule,
+    confidence: crate::types::CorrectionConfidence,
+    attribution: crate::types::CorrectionAttribution,
+    source_app: Option<String>,
+) {
+    let prefs = inner.prefs.get();
+    let created_at = Utc::now();
+    let suggestion = crate::types::PendingCorrection {
+        id: uuid::Uuid::new_v4().to_string(),
+        pattern: rule.pattern.clone(),
+        replacement: rule.replacement.clone(),
+        confidence,
+        attribution,
+        created_at: created_at.to_rfc3339(),
+        expires_at: prefs.vocab_suggestion_inbox_enabled.then(|| {
+            (created_at + chrono::Duration::days(7)).to_rfc3339()
+        }),
+        source_app,
+    };
     {
         let mut pending = inner.pending_corrections.lock();
         // 同一条建议重复出现（用户在不同会话里犯了同样的错）不重复排队。
@@ -1091,11 +1170,12 @@ fn queue_correction_suggestion(inner: &Arc<Inner>, rule: &crate::host_document::
         if pending.len() >= crate::types::MAX_PENDING_CORRECTIONS {
             pending.remove(0);
         }
-        pending.push(crate::types::PendingCorrection {
-            id: uuid::Uuid::new_v4().to_string(),
-            pattern: rule.pattern.clone(),
-            replacement: rule.replacement.clone(),
-        });
+        pending.push(suggestion.clone());
+    }
+    if prefs.vocab_suggestion_inbox_enabled {
+        if let Err(error) = inner.vocab.save_suggestion(suggestion) {
+            log::warn!("[cursor-context] save vocab suggestion inbox failed: {error}");
+        }
     }
     log::info!(
         "[cursor-context] vocabulary suggested (awaiting confirmation): {:?} (was {:?})",
@@ -3277,6 +3357,9 @@ fn build_transcribe_failed_session(
         pipeline_mode: None,
         asr_ms: Some(asr_ms),
         polish_ms: None,
+        asr_dictionary_delivery: None,
+        llm_dictionary_sent_count: None,
+        llm_dictionary_delivery: None,
     }
 }
 
@@ -3302,6 +3385,7 @@ fn write_transcribe_failed_history(
     if let Some(label) = asr_call_label {
         session.asr_provider = Some(label.provider.clone());
         session.asr_model = label.model.clone();
+        session.asr_dictionary_delivery = Some(super::dictionary_delivery_report(inner, label));
     }
     if let Err(e) = inner.history.append_with_retention(
         session,
@@ -4326,6 +4410,9 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         Some(label) => (Some(label.provider.clone()), label.model.clone()),
         None => (None, None),
     };
+    let asr_dictionary_delivery = asr_call_label
+        .as_ref()
+        .map(|label| super::dictionary_delivery_report(inner, label));
 
     // ASR 返回空转写护栏（来自 PR #66）：写一条 emptyTranscript 失败历史 + 错误胶囊，
     // 与 main 上其它 error 路径保持一致（带 schedule_capsule_idle 让胶囊自动消失）。
@@ -4380,6 +4467,9 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             pipeline_mode: None,
             asr_ms: Some(asr_ms),
             polish_ms: None,
+            asr_dictionary_delivery: asr_dictionary_delivery.clone(),
+            llm_dictionary_sent_count: None,
+            llm_dictionary_delivery: None,
         };
         let prefs_snapshot = inner.prefs.get();
         if let Err(e) = inner.history.append_with_retention(
@@ -4553,7 +4643,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
 
     // 此刻焦点仍在目标 app 上；开关关闭时公共入口会在任何 AX 调用前返回。
     let cursor_context = read_cursor_context_for_prompt(should_read_cursor_context(
-        prefs.cursor_context_enabled,
+        prefs.cursor_context_enabled && prefs.cursor_context_llm_enabled,
         false,
     ))
     .await;
@@ -4716,7 +4806,21 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let inserted_chars = polished.chars().count() as u32;
 
     // `polished` 在流式路径下就是实际打到屏幕上的 typed_text；公共入口据此武装监听并计数。
-    let total_hits = handle_post_insert_feedback(inner, status, &polished);
+    let total_hits = handle_post_insert_feedback(
+        inner,
+        status,
+        &polished,
+        EditAttributionSnapshot {
+            asr_original: Some(
+                asr_transcript
+                    .clone()
+                    .unwrap_or_else(|| raw.text.clone()),
+            ),
+            asr_corrected: Some(raw.text.clone()),
+            llm_final: polished.clone(),
+            source_app: front_app.clone(),
+        },
+    );
 
     // polish 失败时在 history 里标记 polishFailed，让用户能在历史详情看到为什么这次输出
     // 不是预期的 mode 风格。即使失败也不丢词 — final_text 仍是原文（保留"用户的话不丢"语义）。
@@ -4768,6 +4872,15 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         pipeline_mode: None,
         asr_ms: Some(asr_ms),
         polish_ms,
+        asr_dictionary_delivery,
+        llm_dictionary_sent_count: llm_call
+            .as_ref()
+            .map(|_| hotword_strs.len().min(u32::MAX as usize) as u32),
+        llm_dictionary_delivery: super::llm_dictionary_delivery_report(
+            llm_call.as_ref().map(|label| label.provider.as_str()),
+            hotword_strs.len().min(u32::MAX as usize) as u32,
+            false,
+        ),
     };
     if let Err(e) = inner.history.append_with_retention(
         session,
@@ -4932,7 +5045,7 @@ async fn finish_dictation_multimodal(
     );
     let voice_agent = inner.state.lock().voice_agent;
     let cursor_context = read_cursor_context_for_prompt(should_read_cursor_context(
-        prefs.cursor_context_enabled,
+        prefs.cursor_context_enabled && prefs.cursor_context_llm_enabled,
         voice_agent,
     ))
     .await;
@@ -5025,6 +5138,13 @@ async fn finish_dictation_multimodal(
             pipeline_mode: Some("multimodal".to_string()),
             asr_ms: None,
             polish_ms: Some(omni_ms),
+            asr_dictionary_delivery: None,
+            llm_dictionary_sent_count: Some(enabled_phrases(inner).len().min(u32::MAX as usize) as u32),
+            llm_dictionary_delivery: super::llm_dictionary_delivery_report(
+                Some(&omni_label.provider),
+                enabled_phrases(inner).len().min(u32::MAX as usize) as u32,
+                true,
+            ),
         };
         let prefs_snapshot = inner.prefs.get();
         if let Err(e) = inner.history.append_with_retention(
@@ -5119,7 +5239,17 @@ async fn finish_dictation_multimodal(
     restore_prepared_windows_ime_session(inner, current_session_id);
     let inserted_chars = polished.chars().count() as u32;
 
-    let total_hits = handle_post_insert_feedback(inner, status, &polished);
+    let total_hits = handle_post_insert_feedback(
+        inner,
+        status,
+        &polished,
+        EditAttributionSnapshot {
+            asr_original: None,
+            asr_corrected: None,
+            llm_final: polished.clone(),
+            source_app: inner.state.lock().front_app.clone(),
+        },
+    );
 
     let error_code = dictation_error_code(
         status,
@@ -5158,6 +5288,19 @@ async fn finish_dictation_multimodal(
         pipeline_mode: Some("multimodal".to_string()),
         asr_ms: None,
         polish_ms: Some(omni_ms),
+        asr_dictionary_delivery: Some(crate::types::DictionaryDeliveryReport {
+            provider: omni_label.provider.clone(),
+            mode: crate::types::DictionaryDeliveryMode::MultimodalPrompt,
+            sent_count: enabled_phrases(inner).len().min(u32::MAX as usize) as u32,
+            dropped_count: 0,
+            reason: None,
+        }),
+        llm_dictionary_sent_count: Some(enabled_phrases(inner).len().min(u32::MAX as usize) as u32),
+        llm_dictionary_delivery: super::llm_dictionary_delivery_report(
+            Some(&omni_label.provider),
+            enabled_phrases(inner).len().min(u32::MAX as usize) as u32,
+            true,
+        ),
     };
     if let Err(e) = inner.history.append_with_retention(
         session,
@@ -5792,6 +5935,9 @@ mod tests {
             pipeline_mode: None,
             asr_ms: None,
             polish_ms: None,
+            asr_dictionary_delivery: None,
+            llm_dictionary_sent_count: None,
+            llm_dictionary_delivery: None,
         }
     }
 

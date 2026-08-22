@@ -2290,6 +2290,25 @@ impl Coordinator {
     pub fn vocab(&self) -> &DictionaryStore {
         &self.inner.vocab
     }
+    pub fn dictionary_delivery_preview(&self) -> crate::types::DictionaryDeliveryReport {
+        let active = self.inner.prefs.get().active_asr_provider;
+        let model = CredentialsVault::get(CredentialAccount::AsrModel)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let effective = resolve_effective_asr_provider(&active, &model).unwrap_or(active);
+        dictionary_delivery_report_for_provider(&effective, &asr_vocab_phrases(&self.inner))
+    }
+    pub fn active_project_key(&self) -> Option<String> {
+        current_project_key(&self.inner)
+    }
+    pub fn temporary_vocab_expiry(&self) -> String {
+        let days = self.inner.prefs.get().temporary_vocab_ttl_days.clamp(1, 365);
+        (Utc::now() + chrono::Duration::days(days as i64)).to_rfc3339()
+    }
+    pub fn temporary_vocab_capacity(&self) -> u32 {
+        self.inner.prefs.get().temporary_vocab_capacity.clamp(1, 10_000)
+    }
     pub fn correction_rules(&self) -> &CorrectionRuleStore {
         &self.inner.correction_rules
     }
@@ -2321,11 +2340,26 @@ impl Coordinator {
     }
 
     fn take_pending_correction(&self, id: &str) -> Option<crate::types::PendingCorrection> {
-        let mut pending = self.inner.pending_corrections.lock();
-        pending
-            .iter()
-            .position(|p| p.id == id)
-            .map(|idx| pending.remove(idx))
+        let in_memory = {
+            let mut pending = self.inner.pending_corrections.lock();
+            pending
+                .iter()
+                .position(|p| p.id == id)
+                .map(|idx| pending.remove(idx))
+        };
+        if let Some(item) = in_memory {
+            if let Err(error) = self.inner.vocab.remove_suggestion(id) {
+                log::warn!("[vocab-inbox] remove accepted/rejected suggestion failed: {error}");
+            }
+            return Some(item);
+        }
+        match self.inner.vocab.take_suggestion(id) {
+            Ok(item) => item,
+            Err(error) => {
+                log::warn!("[vocab-inbox] read accepted/rejected suggestion failed: {error}");
+                None
+            }
+        }
     }
 
     /// 逐条点完之后重排卡片：还有剩的就按新行数重算高度，空了就收起来。
@@ -3646,14 +3680,15 @@ fn read_xfyun_credentials() -> crate::asr::XfyunCredentials {
 }
 
 fn enabled_hotwords(inner: &Arc<Inner>) -> Vec<DictionaryHotword> {
+    let project_key = current_project_key(inner);
     inner
         .vocab
-        .list()
+        .active(project_key.as_deref())
         .unwrap_or_default()
         .into_iter()
         .map(|e| DictionaryHotword {
             phrase: e.phrase,
-            enabled: e.enabled,
+            enabled: true,
         })
         .collect()
 }
@@ -3699,6 +3734,86 @@ impl AsrCallLabel {
             model: model.filter(|m| !m.trim().is_empty()),
         }
     }
+}
+
+fn count_nonblank_phrases(phrases: &[String]) -> u32 {
+    phrases
+        .iter()
+        .filter(|phrase| !phrase.trim().is_empty())
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+fn dictionary_delivery_report_for_provider(
+    provider: &str,
+    phrases: &[String],
+) -> crate::types::DictionaryDeliveryReport {
+    use crate::types::{DictionaryDeliveryMode, DictionaryDeliveryReport};
+
+    let total = count_nonblank_phrases(phrases);
+    let (mode, sent_count, dropped_count, reason) = if provider == "volcengine" {
+        let sent = total.min(crate::asr::volcengine::HOTWORD_CAP as u32);
+        (
+            DictionaryDeliveryMode::Dedicated,
+            sent,
+            total.saturating_sub(sent),
+            None,
+        )
+    } else if provider == "stepfun" {
+        (DictionaryDeliveryMode::Dedicated, total, 0, None)
+    } else if provider == crate::asr::stepfun_realtime::PROVIDER_ID {
+        let (sent, dropped) = crate::asr::whisper::prompt_delivery_counts(phrases);
+        (DictionaryDeliveryMode::Prompt, sent, dropped, None)
+    } else if matches!(provider, "openrouter" | ZENMUX_ASR_PROVIDER_ID) {
+        (
+            DictionaryDeliveryMode::Unsupported,
+            0,
+            total,
+            Some("request_format_omits_dictionary".to_string()),
+        )
+    } else if is_whisper_compatible_provider(provider) {
+        let (sent, dropped) = crate::asr::whisper::prompt_delivery_counts(phrases);
+        (DictionaryDeliveryMode::Prompt, sent, dropped, None)
+    } else {
+        (
+            DictionaryDeliveryMode::Unsupported,
+            0,
+            total,
+            Some("provider_does_not_accept_local_dictionary".to_string()),
+        )
+    };
+    DictionaryDeliveryReport {
+        provider: provider.to_string(),
+        mode,
+        sent_count,
+        dropped_count,
+        reason,
+    }
+}
+
+fn dictionary_delivery_report(
+    inner: &Arc<Inner>,
+    label: &AsrCallLabel,
+) -> crate::types::DictionaryDeliveryReport {
+    dictionary_delivery_report_for_provider(&label.provider, &asr_vocab_phrases(inner))
+}
+
+fn llm_dictionary_delivery_report(
+    provider: Option<&str>,
+    sent_count: u32,
+    multimodal: bool,
+) -> Option<crate::types::DictionaryDeliveryReport> {
+    provider.map(|provider| crate::types::DictionaryDeliveryReport {
+        provider: provider.to_string(),
+        mode: if multimodal {
+            crate::types::DictionaryDeliveryMode::MultimodalPrompt
+        } else {
+            crate::types::DictionaryDeliveryMode::Prompt
+        },
+        sent_count,
+        dropped_count: 0,
+        reason: None,
+    })
 }
 
 /// Volcengine resource id 进历史前的 allowlist：只放行 `volc.` 命名空间的产品标识
@@ -3892,12 +4007,19 @@ mod tests {
             enabled: true,
             hits,
             created_at: String::new(),
+            source: crate::types::DictionarySource::Manual,
+            scope: crate::types::DictionaryScope::Persistent,
+            pinned: false,
+            last_hit_at: None,
+            expires_at: None,
+            project_key: None,
         }
     }
 
     fn learned_vocab_entry(phrase: &str, hits: u64) -> crate::types::DictionaryEntry {
         let mut entry = vocab_entry(phrase, hits);
         entry.note = Some(super::dictation::LEARNED_VOCAB_NOTE.to_string());
+        entry.source = crate::types::DictionarySource::Learned;
         entry
     }
 
@@ -4018,6 +4140,30 @@ mod tests {
         let ordered = super::prioritize_vocab_for_asr(entries);
 
         assert_eq!(ordered, vec!["Claude", "other"]);
+    }
+
+    #[test]
+    fn dictionary_delivery_report_exposes_provider_channel_and_budget_loss() {
+        use crate::types::DictionaryDeliveryMode;
+
+        let phrases = (0..81).map(|index| format!("term{index}")).collect::<Vec<_>>();
+        let volc = super::dictionary_delivery_report_for_provider("volcengine", &phrases);
+        assert_eq!(volc.mode, DictionaryDeliveryMode::Dedicated);
+        assert_eq!(volc.sent_count, 80);
+        assert_eq!(volc.dropped_count, 1);
+
+        let whisper = super::dictionary_delivery_report_for_provider("groq", &phrases);
+        assert_eq!(whisper.mode, DictionaryDeliveryMode::Prompt);
+        assert_eq!(whisper.sent_count + whisper.dropped_count, 81);
+
+        let unsupported = super::dictionary_delivery_report_for_provider("openrouter", &phrases);
+        assert_eq!(unsupported.mode, DictionaryDeliveryMode::Unsupported);
+        assert_eq!(unsupported.sent_count, 0);
+        assert_eq!(unsupported.dropped_count, 81);
+        assert_eq!(
+            unsupported.reason.as_deref(),
+            Some("request_format_omits_dictionary")
+        );
     }
 
     #[test]
@@ -5838,13 +5984,19 @@ mod tests {
     }
 }
 
+fn current_project_key(inner: &Arc<Inner>) -> Option<String> {
+    let front_app = inner.state.lock().front_app.clone();
+    let front = crate::types::split_front_app_opt(front_app.as_deref());
+    front.bundle_id.or(front.name)
+}
+
 fn enabled_phrases(inner: &Arc<Inner>) -> Vec<String> {
+    let project_key = current_project_key(inner);
     inner
         .vocab
-        .list()
+        .active(project_key.as_deref())
         .unwrap_or_default()
         .into_iter()
-        .filter(|e| e.enabled)
         .map(|e| e.phrase)
         .collect()
 }
@@ -5869,12 +6021,12 @@ fn enabled_phrases(inner: &Arc<Inner>) -> Vec<String> {
 /// 2. 其余按命中次数降序。
 /// 3. 同词异形（`claude` / `Claude`）只留命中多的那个写法。
 fn asr_vocab_phrases(inner: &Arc<Inner>) -> Vec<String> {
+    let project_key = current_project_key(inner);
     let entries: Vec<crate::types::DictionaryEntry> = inner
         .vocab
-        .list()
+        .active(project_key.as_deref())
         .unwrap_or_default()
         .into_iter()
-        .filter(|e| e.enabled)
         .collect();
     prioritize_vocab_for_asr(entries)
 }
@@ -5887,10 +6039,16 @@ const FRESH_VOCAB_SEATS: usize = 5;
 /// `entries` 必须是词典的原始顺序（最近添加在前）——保底席位靠它取「最近」，
 /// 不去解析 `created_at` 字符串（历史文件由 Swift 版写入，格式不保证一致）。
 fn prioritize_vocab_for_asr(entries: Vec<crate::types::DictionaryEntry>) -> Vec<String> {
+    let mut pinned = Vec::new();
     let mut fresh_manual = Vec::with_capacity(FRESH_VOCAB_SEATS.min(entries.len()));
     let mut ranked = Vec::with_capacity(entries.len());
     for entry in entries {
-        let learned = entry.note.as_deref() == Some(dictation::LEARNED_VOCAB_NOTE);
+        if entry.pinned {
+            pinned.push(entry);
+            continue;
+        }
+        let learned = entry.source == crate::types::DictionarySource::Learned
+            || entry.note.as_deref() == Some(dictation::LEARNED_VOCAB_NOTE);
         if !learned && fresh_manual.len() < FRESH_VOCAB_SEATS {
             fresh_manual.push(entry);
         } else {
@@ -5900,8 +6058,9 @@ fn prioritize_vocab_for_asr(entries: Vec<crate::types::DictionaryEntry>) -> Vec<
     // 保底席位之外的全部词条按命中降序；`sort_by_key` 是稳定排序，同命中次数的保持
     // 词典原顺序（最近添加在前）。学习词条也在这里，不会被拿来填空缺的手动保底席位。
     ranked.sort_by_key(|e| std::cmp::Reverse(e.hits));
-    fresh_manual.extend(ranked);
-    let ordered = fresh_manual;
+    pinned.extend(fresh_manual);
+    pinned.extend(ranked);
+    let ordered = pinned;
 
     // 同一个词的不同写法（`claude` / `Claude`）只留一个：既省预算，也免得两种
     // 写法一起进词表让模型无所适从。留**命中多**的那个写法，但位置取最靠前那次

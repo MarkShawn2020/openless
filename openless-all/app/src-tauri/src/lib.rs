@@ -91,7 +91,6 @@ mod unicode_keystroke;
 #[cfg(target_os = "windows")]
 mod windows_ime_ipc;
 mod windows_ime_profile;
-#[cfg(target_os = "windows")]
 mod windows_ime_protocol;
 mod windows_ime_restore;
 #[cfg(target_os = "windows")]
@@ -209,8 +208,12 @@ macro_rules! app_invoke_handler_desktop {
             commands::marketplace_logout,
             commands::list_vocab,
             commands::add_vocab,
+            commands::add_vocab_with_metadata,
             commands::remove_vocab,
             commands::set_vocab_enabled,
+            commands::set_vocab_metadata,
+            commands::list_vocab_suggestions,
+            commands::get_dictionary_delivery_preview,
             commands::list_correction_rules,
             commands::add_correction_rule,
             commands::remove_correction_rule,
@@ -350,6 +353,7 @@ macro_rules! app_invoke_handler_desktop {
             commands::sherpa_onnx_asr_reveal_model_dir,
             commands::export_error_log,
             commands::debug_read_cursor_context,
+            commands::probe_visual_roi_capability,
             commands::accept_pending_correction,
             commands::reject_pending_correction,
             commands::dismiss_vocab_suggestions,
@@ -428,8 +432,12 @@ macro_rules! app_invoke_handler_mobile {
             $crate::commands::marketplace_logout,
             $crate::commands::list_vocab,
             $crate::commands::add_vocab,
+            $crate::commands::add_vocab_with_metadata,
             $crate::commands::remove_vocab,
             $crate::commands::set_vocab_enabled,
+            $crate::commands::set_vocab_metadata,
+            $crate::commands::list_vocab_suggestions,
+            $crate::commands::get_dictionary_delivery_preview,
             $crate::commands::list_correction_rules,
             $crate::commands::add_correction_rule,
             $crate::commands::remove_correction_rule,

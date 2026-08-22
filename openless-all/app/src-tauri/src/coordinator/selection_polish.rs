@@ -45,6 +45,7 @@ pub(crate) struct PendingSelectionPolishPreview {
     style_pack_id: String,
     llm_provider: Option<String>,
     llm_model: Option<String>,
+    llm_dictionary_sent_count: u32,
     polish_ms: Option<u64>,
     started_at: std::time::Instant,
 }
@@ -287,6 +288,7 @@ pub(super) async fn run_selection_polish(inner: &Arc<Inner>) -> Result<(), Strin
                 style_pack_id: pack.id,
                 llm_provider,
                 llm_model,
+                llm_dictionary_sent_count: hotwords.len().min(u32::MAX as usize) as u32,
                 polish_ms,
                 started_at,
             });
@@ -305,7 +307,14 @@ pub(super) async fn run_selection_polish(inner: &Arc<Inner>) -> Result<(), Strin
         }
     };
     let dictionary_entry_count = if status != InsertStatus::Failed {
-        match inner.vocab.record_hits(&text_to_insert) {
+        match inner
+            .vocab
+            .record_hits(
+                &text_to_insert,
+                super::current_project_key(inner).as_deref(),
+                prefs.temporary_vocab_ttl_days,
+            )
+        {
             Ok(hits) => Some(hits.min(u32::MAX as u64) as u32),
             Err(error) => {
                 log::error!("[selection-polish] record vocabulary hits failed: {error}");
@@ -319,6 +328,12 @@ pub(super) async fn run_selection_polish(inner: &Arc<Inner>) -> Result<(), Strin
         Some(label) => (Some(label.provider), Some(label.model)),
         None => (None, None),
     };
+    let llm_dictionary_count = hotwords.len().min(u32::MAX as usize) as u32;
+    let llm_dictionary_delivery = super::llm_dictionary_delivery_report(
+        llm_provider.as_deref(),
+        llm_dictionary_count,
+        false,
+    );
     let raw_chars = raw_text.chars().count();
     // 与听写路径同口径：应用名与 bundle id 分开存。
     let source_front = crate::types::split_front_app_opt(source_app.as_deref());
@@ -349,6 +364,9 @@ pub(super) async fn run_selection_polish(inner: &Arc<Inner>) -> Result<(), Strin
         pipeline_mode: None,
         asr_ms: None,
         polish_ms,
+        asr_dictionary_delivery: None,
+        llm_dictionary_sent_count: Some(llm_dictionary_count),
+        llm_dictionary_delivery,
     };
     if let Err(error) = inner.history.append_with_retention(
         session,
@@ -440,7 +458,11 @@ impl Coordinator {
         let dictionary_entry_count = self
             .inner
             .vocab
-            .record_hits(&text)
+            .record_hits(
+                &text,
+                super::current_project_key(&self.inner).as_deref(),
+                prefs.temporary_vocab_ttl_days,
+            )
             .map(|hits| Some(hits.min(u32::MAX as u64) as u32))
             .unwrap_or_else(|error| {
                 log::error!("[selection-polish] record vocabulary hits failed: {error}");
@@ -449,6 +471,11 @@ impl Coordinator {
         // 与听写路径同口径：应用名与 bundle id 分开存，详情页才不会把一长串 bundle id
         // 糊进正文。
         let preview_front = crate::types::split_front_app_opt(preview.source_app.as_deref());
+        let llm_dictionary_delivery = super::llm_dictionary_delivery_report(
+            preview.llm_provider.as_deref(),
+            preview.llm_dictionary_sent_count,
+            false,
+        );
         let session = DictationSession {
             id: Uuid::new_v4().to_string(),
             created_at: Utc::now().to_rfc3339(),
@@ -475,6 +502,9 @@ impl Coordinator {
             pipeline_mode: None,
             asr_ms: None,
             polish_ms: preview.polish_ms,
+            asr_dictionary_delivery: None,
+            llm_dictionary_sent_count: Some(preview.llm_dictionary_sent_count),
+            llm_dictionary_delivery,
         };
         if let Err(error) = self.inner.history.append_with_retention(
             session,

@@ -501,6 +501,18 @@ export function History() {
                     </span>
                   </>
                 )}
+                {item.asrDictionaryDelivery && (
+                  <>
+                    <span>{t('history.stepAsrDictionary', { defaultValue: 'ASR vocabulary' })}</span>
+                    <span style={{ color: 'var(--ol-ink-2)', fontFamily: 'var(--ol-font-mono)', overflowWrap: 'anywhere' }}>
+                      {item.asrDictionaryDelivery.mode}
+                      {item.asrDictionaryDelivery.reason ? ` · ${item.asrDictionaryDelivery.reason}` : ''}
+                    </span>
+                    <span style={{ fontFamily: 'var(--ol-font-mono)', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      {t('history.dictionaryDeliveryCounts', { defaultValue: '{{sent}} sent / {{dropped}} omitted', sent: item.asrDictionaryDelivery.sentCount, dropped: item.asrDictionaryDelivery.droppedCount })}
+                    </span>
+                  </>
+                )}
                 {(item.llmProvider || item.llmModel || item.polishMs != null) && (
                   <>
                     <span>{t('history.stepPolish')}</span>
@@ -509,6 +521,20 @@ export function History() {
                     </span>
                     <span style={{ fontFamily: 'var(--ol-font-mono)', textAlign: 'right', whiteSpace: 'nowrap' }}>
                       {item.polishMs != null ? formatStepDuration(item.polishMs, t) : ''}
+                    </span>
+                  </>
+                )}
+                {(item.llmDictionaryDelivery || item.llmDictionarySentCount != null) && (
+                  <>
+                    <span>{t('history.stepLlmDictionary', { defaultValue: 'LLM vocabulary' })}</span>
+                    <span style={{ color: 'var(--ol-ink-2)' }}>
+                      {item.llmDictionaryDelivery?.mode ?? t('history.dictionaryPrompt', { defaultValue: 'Included in the polish prompt' })}
+                      {item.llmDictionaryDelivery?.reason ? ` · ${item.llmDictionaryDelivery.reason}` : ''}
+                    </span>
+                    <span style={{ fontFamily: 'var(--ol-font-mono)', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      {item.llmDictionaryDelivery
+                        ? t('history.dictionaryDeliveryCounts', { defaultValue: '{{sent}} sent / {{dropped}} omitted', sent: item.llmDictionaryDelivery.sentCount, dropped: item.llmDictionaryDelivery.droppedCount })
+                        : item.llmDictionarySentCount}
                     </span>
                   </>
                 )}
