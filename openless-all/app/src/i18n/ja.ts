@@ -61,6 +61,13 @@ export const ja: typeof zhCN = {
     applyError: '適用できません：',
     confirmReplace: '確認して置き換え',
   },
+  selectionCorrection: {
+    close: '閉じる', replace: '直接置き換え', review: 'コメントで修正',
+    recordReview: '修正内容を話してください', recordReplacement: '置き換える内容を話してください', finish: '完了',
+    generating: '修正案を生成中…', transcribing: '置き換え内容を認識中…',
+    failed: '操作に失敗しました。選択し直して再試行してください',
+    previewSubtitle: 'AI がコメントに基づく案を生成しました。確認後にのみ置き換えます。', annotationPrefix: 'コメント：',
+  },
   qa: {
     title: '質問',
     headerHint: 'いつでも質問',

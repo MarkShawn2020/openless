@@ -61,6 +61,13 @@ export const ko: typeof zhCN = {
     applyError: '적용하지 못했습니다: ',
     confirmReplace: '확인 후 교체',
   },
+  selectionCorrection: {
+    close: '닫기', replace: '바로 바꾸기', review: '검토 메모',
+    recordReview: '수정 의견을 말해 주세요', recordReplacement: '바꿀 내용을 말해 주세요', finish: '완료',
+    generating: '수정 제안을 생성 중…', transcribing: '바꿀 내용을 인식 중…',
+    failed: '작업에 실패했습니다. 다시 선택한 뒤 시도해 주세요.',
+    previewSubtitle: 'AI가 메모를 바탕으로 제안했습니다. 확인한 뒤에만 원문을 바꿉니다.', annotationPrefix: '메모: ',
+  },
   qa: {
     title: '질문',
     headerHint: '언제든 질문하세요',

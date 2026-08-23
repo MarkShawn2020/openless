@@ -31,8 +31,8 @@ use super::diff::{
     edit_is_within_typed_text, is_vocab_worthy, minimal_edit, multiple_edits, PositionedEdit,
 };
 use super::{
-    evaluate_gate, plan_window, utf16_offset_to_char_offset, window_around_cursor,
-    EditObservation, GateInputs, ReadOutcome, AX_MESSAGING_TIMEOUT_SECS,
+    evaluate_gate, plan_window, utf16_offset_to_char_offset, window_around_cursor, EditObservation,
+    GateInputs, ReadOutcome, SelectionObservation, AX_MESSAGING_TIMEOUT_SECS,
     EDIT_WATCH_MAX_LIFETIME,
 };
 
@@ -95,7 +95,9 @@ enum SettlementBoundary {
 enum EditSettlementState {
     #[default]
     Idle,
-    Editing { last_change: Instant },
+    Editing {
+        last_change: Instant,
+    },
 }
 
 impl EditSettlementState {
@@ -356,9 +358,7 @@ unsafe fn focused_element_passing_the_gate(mut gate: GateInputs) -> GatedElement
         .flatten();
     let Some(owner) = owner else {
         CFRelease(focused as CFTypeRef);
-        return GatedElement::Unavailable(
-            "could not confirm which app owns the focused element",
-        );
+        return GatedElement::Unavailable("could not confirm which app owns the focused element");
     };
     gate.bundle_id = Some(owner);
     // Secure Input 是全局状态，顺手也刷新一次 —— 同样可能在这几次 AX 调用期间才打开。
@@ -387,6 +387,29 @@ pub(super) fn read_around_cursor_blocking(budget_chars: usize, gate: GateInputs)
         let outcome = read_document(focused, budget_chars);
         CFRelease(focused as CFTypeRef);
         outcome
+    }
+}
+
+/// Review 确认前读取完整控件快照。必须与观察器相同：先过安全闸门、先问长度，绝不对
+/// 超限或长度未知的控件发无界 `AXValue` 读取。
+pub(super) fn read_full_document_blocking(gate: GateInputs) -> Option<String> {
+    unsafe {
+        let focused = match focused_element_passing_the_gate(gate) {
+            GatedElement::Ready(element) => element,
+            GatedElement::Blocked(_) | GatedElement::Unavailable(_) => return None,
+        };
+        let within_limit = matches!(
+            classify_document_length(
+                copy_index_attr(focused, b"AXNumberOfCharacters\0"),
+                FULL_TEXT_MAX_UTF16,
+            ),
+            DocumentLength::WithinLimit(_)
+        );
+        let text = within_limit
+            .then(|| copy_string_attr(focused, b"AXValue\0"))
+            .flatten();
+        CFRelease(focused as CFTypeRef);
+        text
     }
 }
 
@@ -665,6 +688,10 @@ struct WatchContext {
     /// 我们这次实际打出去的文本。只有落在这段文字里的改动才算「用户改了我们插的东西」。
     typed_text: String,
     on_edit: Box<dyn Fn(EditObservation) + Send + Sync>,
+    on_selection: Box<dyn Fn(Option<SelectionObservation>) + Send + Sync>,
+    /// 最近一次已上报选区，用于过滤同一组选区通知。`None` 既表示当前无候选，也表示
+    /// 下一次有效选区必须重新上报。
+    last_selection: std::cell::RefCell<Option<(usize, usize, String)>>,
     /// 已上报过的 `(source, target)`。用户改一个词要敲好几下，每一下都发一次通知，
     /// 不去重会把同一处改动刷成一串日志。
     reported: std::cell::RefCell<std::collections::HashSet<(String, String)>>,
@@ -739,7 +766,11 @@ unsafe extern "C" fn value_changed_shim(
             log::debug!(
                 "[cursor-context] baseline anchored at {} chars ({}, position={:?})",
                 current.chars().count(),
-                if inserted { "insertion landed" } else { "timeout" },
+                if inserted {
+                    "insertion landed"
+                } else {
+                    "timeout"
+                },
                 *ctx.anchor.borrow()
             );
             // 两者必须一起推进：`baseline` 是比对起点，`last_text` 是「上次看到的样子」。
@@ -753,6 +784,7 @@ unsafe extern "C" fn value_changed_shim(
 
     // 第二阶段：把「打字」和「光标移开」分开 —— 全程只记录，边界到了才分析。
     if *ctx.last_text.borrow() != current {
+        clear_selection_candidate(ctx);
         // 还在改。登记一笔，不判定：中间态怎么都可能变。
         *ctx.last_text.borrow_mut() = current;
         let mut settlement = ctx.settlement.get();
@@ -766,8 +798,83 @@ unsafe extern "C" fn value_changed_shim(
     if !is_caret_notification(notification) {
         return;
     }
+    report_selection_candidate(ctx, &current);
     log::debug!("[cursor-context] caret moved away; settling the pending edit");
     settle_pending_edit(ctx, SettlementBoundary::CaretMoved);
+}
+
+unsafe fn clear_selection_candidate(ctx: &WatchContext) {
+    if ctx.last_selection.borrow_mut().take().is_some() {
+        (ctx.on_selection)(None);
+    }
+}
+
+/// 把 AX 的 UTF-16 选区转换为可交给纠错流程的稳定快照，并用最近一次落字的 char 范围
+/// 做位置围栏。这个纯函数也覆盖 emoji 等 UTF-16/Unicode 标量下标不一致的情况。
+fn selection_observation_within_anchor(
+    current: &str,
+    start_utf16: usize,
+    length_utf16: usize,
+    anchor: TextAnchor,
+) -> Option<SelectionObservation> {
+    if length_utf16 == 0 {
+        return None;
+    }
+    let end_utf16 = start_utf16.checked_add(length_utf16)?;
+    if end_utf16 > current.encode_utf16().count() {
+        return None;
+    }
+    let start = utf16_offset_to_char_offset(current, start_utf16);
+    let end = utf16_offset_to_char_offset(current, end_utf16);
+    if start < anchor.start || end > anchor.end || start >= end {
+        return None;
+    }
+    let selected_text: String = current.chars().skip(start).take(end - start).collect();
+    if selected_text.trim().is_empty() {
+        return None;
+    }
+    Some(SelectionObservation {
+        selected_text,
+        document_text: current.to_string(),
+        selection_start_utf16: start_utf16,
+        selection_length_utf16: length_utf16,
+        whole_field_selected: start_utf16 == 0 && end_utf16 == current.encode_utf16().count(),
+    })
+}
+
+/// 只把有高置信位置锚的选区交给纠错气泡。内容 contains 回落在这里不够安全：同一个词
+/// 可能同时出现在邮件标题、引用和本轮听写里，气泡必须能证明用户点的是最后那一段。
+unsafe fn report_selection_candidate(ctx: &WatchContext, current: &str) {
+    if !ctx.anchored.get() {
+        clear_selection_candidate(ctx);
+        return;
+    }
+    let Some(anchor) = *ctx.anchor.borrow() else {
+        clear_selection_candidate(ctx);
+        return;
+    };
+    let Some(range) = copy_selected_range(ctx.element.as_ref()) else {
+        clear_selection_candidate(ctx);
+        return;
+    };
+    if range.location < 0 || range.length <= 0 {
+        clear_selection_candidate(ctx);
+        return;
+    }
+    let start_utf16 = range.location as usize;
+    let length_utf16 = range.length as usize;
+    let Some(observation) =
+        selection_observation_within_anchor(current, start_utf16, length_utf16, anchor)
+    else {
+        clear_selection_candidate(ctx);
+        return;
+    };
+    let dedupe = (start_utf16, length_utf16, observation.selected_text.clone());
+    if ctx.last_selection.borrow().as_ref() == Some(&dedupe) {
+        return;
+    }
+    *ctx.last_selection.borrow_mut() = Some(dedupe);
+    (ctx.on_selection)(Some(observation));
 }
 
 /// 这条通知是不是 `AXSelectedTextChanged`（光标/选区变化）。
@@ -779,11 +886,7 @@ unsafe fn is_caret_notification(notification: CFStringRef) -> bool {
 ///
 /// 边界判定统一交给 [`EditSettlementState`]，避免回调和监听循环各自维护一套时间规则。
 unsafe fn settle_pending_edit(ctx: &WatchContext, boundary: SettlementBoundary) {
-    if !ctx
-        .settlement
-        .get()
-        .should_settle(boundary, Instant::now())
-    {
+    if !ctx.settlement.get().should_settle(boundary, Instant::now()) {
         return;
     }
     ctx.settlement.set(EditSettlementState::Idle);
@@ -798,9 +901,9 @@ unsafe fn settle_pending_edit(ctx: &WatchContext, boundary: SettlementBoundary) 
         // 已处理的文档变化重复卷进来。只有纯删除/纯插入这种尚未形成候选的单一编辑保留
         // 原基线，支持「删掉错词 → 停顿 → 重打正确词」。
         let has_only_unfinished_edit = !edits.is_empty()
-            && edits.iter().all(|item| {
-                item.edit.target.trim().is_empty() && !is_vocab_worthy(&item.edit)
-            });
+            && edits
+                .iter()
+                .all(|item| item.edit.target.trim().is_empty() && !is_vocab_worthy(&item.edit));
         if !has_only_unfinished_edit {
             *ctx.baseline.borrow_mut() = current.clone();
             if let Some(anchor) = old_anchor {
@@ -879,6 +982,7 @@ const EDIT_WATCH_MAX_UTF16: usize = 20_000;
 pub(super) fn spawn_edit_watcher(
     typed_text: String,
     on_edit: Box<dyn Fn(EditObservation) + Send + Sync>,
+    on_selection: Box<dyn Fn(Option<SelectionObservation>) + Send + Sync>,
 ) -> Option<Arc<AtomicBool>> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
@@ -915,6 +1019,8 @@ pub(super) fn spawn_edit_watcher(
                     settlement: std::cell::Cell::new(EditSettlementState::Idle),
                     typed_text,
                     on_edit,
+                    on_selection,
+                    last_selection: std::cell::RefCell::new(None),
                     reported: std::cell::RefCell::new(std::collections::HashSet::new()),
                     reports: std::cell::Cell::new(0),
                     notifications: std::cell::Cell::new(0),
@@ -1057,7 +1163,9 @@ fn run_edit_watch_loop(
             }
         }
         if registered.is_empty() {
-            log::info!("[cursor-context] no usable AX notification on this element; edit watch off");
+            log::info!(
+                "[cursor-context] no usable AX notification on this element; edit watch off"
+            );
             CFRelease(observer as CFTypeRef);
             return;
         }
@@ -1125,6 +1233,7 @@ fn run_edit_watch_loop(
         // 用户那次改动是真的还没被判定过。
         if !stop.load(Ordering::Relaxed) {
             settle_pending_edit(&ctx, SettlementBoundary::ObserverEnding);
+            clear_selection_candidate(&ctx);
         }
 
         // 无论怎么退出的，反注册这一段都必须跑到。
@@ -1156,9 +1265,10 @@ fn run_edit_watch_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_offset_from_location, classify_document_length, locate_typed_span, remap_anchor,
-        positioned_edit_is_within_anchor, DocumentLength, EditSettlementState, SettlementBoundary,
-        TextAnchor, CARET_MOVE_QUIET, EDIT_SETTLE_TIMEOUT,
+        caret_offset_from_location, classify_document_length, locate_typed_span,
+        positioned_edit_is_within_anchor, remap_anchor, selection_observation_within_anchor,
+        DocumentLength, EditSettlementState, SettlementBoundary, TextAnchor, CARET_MOVE_QUIET,
+        EDIT_SETTLE_TIMEOUT,
     };
     use crate::host_document::{EditPair, PositionedEdit};
 
@@ -1196,7 +1306,11 @@ mod tests {
     fn a_negative_caret_location_is_not_the_start_of_the_document() {
         assert_eq!(caret_offset_from_location(0), Some(0), "光标真在开头");
         assert_eq!(caret_offset_from_location(42), Some(42));
-        assert_eq!(caret_offset_from_location(-1), None, "kCFNotFound：没有光标");
+        assert_eq!(
+            caret_offset_from_location(-1),
+            None,
+            "kCFNotFound：没有光标"
+        );
         assert_eq!(caret_offset_from_location(isize::MIN), None);
     }
 
@@ -1224,6 +1338,25 @@ mod tests {
             target_end: 4,
         };
         assert!(!positioned_edit_is_within_anchor(&outside, anchor));
+    }
+
+    #[test]
+    fn selection_candidate_uses_utf16_offsets_inside_the_latest_anchor() {
+        let text = "🙂 甲Codex乙";
+        let observation =
+            selection_observation_within_anchor(text, 4, 5, TextAnchor { start: 2, end: 9 })
+                .expect("selection inside latest insertion");
+        assert_eq!(observation.selected_text, "Codex");
+        assert_eq!(observation.selection_start_utf16, 4);
+    }
+
+    #[test]
+    fn selection_candidate_rejects_identical_text_outside_the_latest_anchor() {
+        let text = "Codex / Codex";
+        assert!(
+            selection_observation_within_anchor(text, 0, 5, TextAnchor { start: 8, end: 13 },)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1262,10 +1395,7 @@ mod tests {
         let now = std::time::Instant::now();
         let state = EditSettlementState::Editing { last_change: now };
         assert!(!state.should_settle(SettlementBoundary::CaretMoved, now));
-        assert!(state.should_settle(
-            SettlementBoundary::CaretMoved,
-            now + CARET_MOVE_QUIET
-        ));
+        assert!(state.should_settle(SettlementBoundary::CaretMoved, now + CARET_MOVE_QUIET));
         assert!(state.should_settle(SettlementBoundary::ObserverEnding, now));
     }
 }

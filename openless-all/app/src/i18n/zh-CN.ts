@@ -57,6 +57,13 @@ export const zhCN = {
     applyError: '未能应用：',
     confirmReplace: '确认并替换',
   },
+  selectionCorrection: {
+    close: '关闭', replace: '直接替换', review: '批注修改',
+    recordReview: '请说出批注意见', recordReplacement: '请说出替换内容', finish: '完成',
+    generating: '正在生成修改建议…', transcribing: '正在识别替换内容…',
+    failed: '操作失败，请重新选择后再试',
+    previewSubtitle: 'AI 已按批注生成建议，确认后才会替换原选区', annotationPrefix: '批注：',
+  },
   qa: {
     title: '划词追问',
     headerHint: '随时提问',

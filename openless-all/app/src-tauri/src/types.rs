@@ -61,6 +61,7 @@ pub enum HistorySource {
     #[default]
     Voice,
     SelectionPolish,
+    SelectionCorrection,
 }
 
 impl PolishMode {

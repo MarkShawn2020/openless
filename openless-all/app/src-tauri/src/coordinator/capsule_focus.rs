@@ -816,14 +816,16 @@ pub(super) fn hide_capsule_if_all_sessions_idle(inner: &Arc<Inner>) {
     let dictation_idle = inner.state.lock().phase == SessionPhase::Idle;
     let qa_idle = inner.qa_state.lock().phase == QaPhase::Idle;
     let selection_polish_active = inner.selection_polish_capsule_active.load(Ordering::SeqCst);
+    let vocab_card_active = inner.vocab_card_visible.load(Ordering::SeqCst);
     let observed_epoch = inner.capsule_event_epoch.load(Ordering::SeqCst);
-    if !dictation_idle || !qa_idle || selection_polish_active {
+    if !dictation_idle || !qa_idle || selection_polish_active || vocab_card_active {
         return;
     }
 
     let _event_guard = inner.capsule_event_lock.lock();
     if inner.capsule_event_epoch.load(Ordering::SeqCst) == observed_epoch
         && !inner.selection_polish_capsule_active.load(Ordering::SeqCst)
+        && !inner.vocab_card_visible.load(Ordering::SeqCst)
     {
         emit_capsule_with_context_locked(inner, CapsuleState::Idle, 0.0, 0, None, None, false);
     }

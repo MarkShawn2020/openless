@@ -59,6 +59,13 @@ export const zhTW: typeof zhCN = {
     applyError: '未能應用：',
     confirmReplace: '確認並替換',
   },
+  selectionCorrection: {
+    close: '關閉', replace: '直接替換', review: '批註修改',
+    recordReview: '請說出批註意見', recordReplacement: '請說出替換內容', finish: '完成',
+    generating: '正在產生修改建議…', transcribing: '正在辨識替換內容…',
+    failed: '操作失敗，請重新選取後再試',
+    previewSubtitle: 'AI 已依批註產生建議，確認後才會替換原選區', annotationPrefix: '批註：',
+  },
   qa: {
     title: '劃詞追問',
     headerHint: '隨時提問',

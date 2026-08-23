@@ -59,6 +59,13 @@ export const en: typeof zhCN = {
     applyError: 'Could not apply: ',
     confirmReplace: 'Confirm & replace',
   },
+  selectionCorrection: {
+    close: 'Close', replace: 'Replace', review: 'Review note',
+    recordReview: 'Describe the change', recordReplacement: 'Say the replacement', finish: 'Finish',
+    generating: 'Generating a suggestion…', transcribing: 'Transcribing replacement…',
+    failed: 'Could not apply. Select the text and try again.',
+    previewSubtitle: 'AI generated a suggestion from your note. The selection changes only after confirmation.', annotationPrefix: 'Note: ',
+  },
   qa: {
     title: 'Ask',
     headerHint: 'Ask anytime',

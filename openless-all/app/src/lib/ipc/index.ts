@@ -162,6 +162,19 @@ export {
     cancelSelectionPolishPreview,
 } from './selection-polish-preview'
 
+export type {
+    SelectionCorrectionAction,
+    SelectionCorrectionBubblePayload,
+    SelectionCorrectionBubbleState,
+} from './selection-correction'
+export {
+    getSelectionCorrection,
+    startSelectionCorrection,
+    stopSelectionCorrection,
+    cancelSelectionCorrection,
+    dismissSelectionCorrection,
+} from './selection-correction'
+
 // less-computer
 export {
     lessComputerWindowDismiss,
