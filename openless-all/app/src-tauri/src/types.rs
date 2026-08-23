@@ -3297,6 +3297,10 @@ pub struct CapsulePayload {
     /// 窗口，但前端据此切换为一行状态提示，避免改变既有语音光效与文案。
     #[serde(default)]
     pub selection_polish: bool,
+    /// Esc 在录音阶段取消后，这里携带可恢复录音的 session id。前端据此在原胶囊位置
+    /// 渲染一个 3 秒「是否继续」提示；其它状态为 None，兼容旧前端。
+    #[serde(default)]
+    pub recovery_session_id: Option<String>,
 }
 
 /// Snapshot of credentials read from vault — only what the UI needs to know

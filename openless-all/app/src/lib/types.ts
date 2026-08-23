@@ -685,6 +685,8 @@ export interface CapsulePayload {
    * 语音/QA 胶囊行为，兼容旧后端 payload。
    */
   selectionPolish?: boolean;
+  /** Esc 取消后可继续录音的历史/WAV session id；只在 3 秒恢复提示期间存在。 */
+  recoverySessionId?: string | null;
 }
 
 export interface CredentialsStatus {
