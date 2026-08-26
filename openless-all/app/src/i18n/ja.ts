@@ -40,8 +40,7 @@ export const ja: typeof zhCN = {
     inserted: '{{count}} 文字を入力しました',
     translating: '翻訳中',
     recovery: {
-      question: '録音を続けますか？',
-      continue: '続ける',
+      continue: '録音を続ける',
       resuming: '再開中…',
       failed: '再開できません。履歴から続けられます。',
     },

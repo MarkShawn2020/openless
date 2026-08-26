@@ -38,8 +38,7 @@ export const en: typeof zhCN = {
     inserted: 'Inserted {{count}}',
     translating: 'Translating',
     recovery: {
-      question: 'Continue recording?',
-      continue: 'Continue',
+      continue: 'Continue recording',
       resuming: 'Resuming…',
       failed: 'Could not resume. Continue from History.',
     },

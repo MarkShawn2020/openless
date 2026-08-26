@@ -36,8 +36,7 @@ export const zhCN = {
     inserted: '已插入 {{count}}',
     translating: '正在翻译',
     recovery: {
-      question: '是否继续录音？',
-      continue: '继续',
+      continue: '继续录音',
       resuming: '恢复中…',
       failed: '恢复失败，可在历史中继续',
     },

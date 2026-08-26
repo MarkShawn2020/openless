@@ -38,8 +38,7 @@ export const zhTW: typeof zhCN = {
     inserted: '已插入 {{count}}',
     translating: '正在翻譯',
     recovery: {
-      question: '是否繼續錄音？',
-      continue: '繼續',
+      continue: '繼續錄音',
       resuming: '恢復中…',
       failed: '恢復失敗，可在歷史中繼續',
     },

@@ -40,8 +40,7 @@ export const ko: typeof zhCN = {
     inserted: '{{count}}자 입력됨',
     translating: '번역 중',
     recovery: {
-      question: '녹음을 계속할까요?',
-      continue: '계속',
+      continue: '녹음 계속',
       resuming: '재개 중…',
       failed: '재개하지 못했습니다. 기록에서 계속할 수 있습니다.',
     },

@@ -314,92 +314,51 @@ function RecordingRecoveryPrompt({
     }
   };
 
+  const continueLabel = t('capsule.recovery.continue');
+  const failedLabel = t('capsule.recovery.failed');
+
   return (
-    <div
+    <button
+      type="button"
       className="ol-frost ol-capsule-pill"
-      role="status"
       aria-live="polite"
+      aria-busy={resuming}
+      aria-label={failed ? `${continueLabel}. ${failedLabel}` : undefined}
+      title={failed ? failedLabel : undefined}
+      onClick={() => void resume()}
+      onMouseDown={event => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+      disabled={resuming}
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        minWidth: os === 'win' ? 196 : 176,
-        maxWidth: os === 'win' ? 268 : 252,
+        justifyContent: 'center',
+        minWidth: os === 'win' ? 160 : 144,
+        maxWidth: os === 'win' ? 216 : 196,
         height: os === 'win' ? 52 : 42,
-        padding: '0 8px 0 14px',
+        padding: os === 'win' ? '0 22px' : '0 18px',
         borderRadius: 999,
         background: 'var(--ol-capsule-pill-bg)',
         border: '1px solid var(--ol-capsule-pill-border)',
         boxShadow: 'var(--ol-capsule-pill-shadow), var(--ol-capsule-pill-inset)',
-        color: 'var(--ol-capsule-center-ink)',
+        color: failed ? 'var(--ol-err)' : 'var(--ol-blue)',
         fontFamily: 'var(--ol-font-sans)',
+        fontSize: 11.5,
+        fontWeight: 600,
+        lineHeight: 1,
+        letterSpacing: '0.005em',
+        whiteSpace: 'nowrap',
         pointerEvents: 'auto',
         boxSizing: 'border-box',
+        appearance: 'none',
+        cursor: 'default',
+        opacity: resuming ? 0.46 : 0.92,
       }}
     >
-      <span
-        aria-hidden="true"
-        style={{
-          width: 5,
-          height: 5,
-          flex: '0 0 auto',
-          marginRight: 9,
-          borderRadius: 999,
-          background: failed ? 'var(--ol-err)' : 'var(--ol-blue)',
-          opacity: failed ? 0.72 : 0.58,
-        }}
-      />
-      <span
-        title={failed ? t('capsule.recovery.failed') : undefined}
-        style={{
-          flex: 1,
-          minWidth: 0,
-          fontSize: 11.5,
-          fontWeight: 550,
-          letterSpacing: '0.005em',
-          lineHeight: 1,
-          whiteSpace: 'nowrap',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-        }}
-      >
-        {failed ? t('capsule.recovery.failed') : t('capsule.recovery.question')}
-      </span>
-      <span
-        aria-hidden="true"
-        style={{
-          width: 1,
-          height: 14,
-          flex: '0 0 auto',
-          marginLeft: 10,
-          background: 'var(--ol-capsule-pill-border)',
-          opacity: 0.72,
-        }}
-      />
-      <button
-        onClick={() => void resume()}
-        onMouseDown={event => {
-          event.preventDefault();
-          event.stopPropagation();
-        }}
-        disabled={resuming}
-        style={{
-          flex: '0 0 auto',
-          border: 0,
-          padding: '7px 6px 7px 10px',
-          background: 'transparent',
-          color: failed ? 'var(--ol-capsule-center-ink)' : 'var(--ol-blue)',
-          font: 'inherit',
-          fontSize: 11.5,
-          fontWeight: 600,
-          lineHeight: 1,
-          cursor: 'default',
-          opacity: resuming ? 0.46 : 0.88,
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {resuming ? t('capsule.recovery.resuming') : t('capsule.recovery.continue')}
-      </button>
-    </div>
+      {resuming ? t('capsule.recovery.resuming') : continueLabel}
+    </button>
   );
 }
 
