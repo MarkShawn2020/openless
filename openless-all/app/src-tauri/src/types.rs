@@ -61,6 +61,7 @@ pub enum HistorySource {
     #[default]
     Voice,
     SelectionPolish,
+    SelectionVoiceEdit,
 }
 
 impl PolishMode {
@@ -189,6 +190,27 @@ pub enum SelectionPolishOutputMode {
     #[default]
     DirectReplace,
     PreviewConfirm,
+}
+
+/// 选区语音会话的意图分流模式（issue #987 桌面 MVP）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SelectionVoiceIntentMode {
+    /// 说完后由用户选择提问或编辑（默认）。
+    #[default]
+    Prompt,
+    Auto,
+    Manual,
+    Heuristic,
+}
+
+/// manual 模式下用户固定的意图。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SelectionVoiceManualIntent {
+    #[default]
+    Question,
+    Edit,
 }
 
 /// 前台应用标签拆分结果：人读的应用名 +（macOS 的）bundle id。
@@ -908,6 +930,10 @@ pub struct UserPreferences {
     /// 语音后的连续静音阈值（秒）。可选 1 / 1.5 / 2 / 3 / 4 / 5，默认 3。
     #[serde(default = "default_silence_auto_stop_seconds")]
     pub silence_auto_stop_seconds: f32,
+    /// 录音中按 Esc 时，是否保留已录 WAV、写入待处理历史并提供「继续录音」入口。
+    /// 默认关闭：Esc 直接取消并丢弃本次录音，保持原有行为且不弹出恢复胶囊。
+    #[serde(default)]
+    pub esc_recording_recovery_enabled: bool,
     /// 录音输入设备名称。空字符串 = 使用系统默认麦克风。
     #[serde(default)]
     pub microphone_device_name: String,
@@ -1002,6 +1028,15 @@ pub struct UserPreferences {
     /// 选区润色直接覆盖，或先在可编辑预览中确认。
     #[serde(default)]
     pub selection_polish_output_mode: SelectionPolishOutputMode,
+    /// 选区语音编辑（issue #987 桌面 MVP）。默认关闭。
+    #[serde(default)]
+    pub selection_voice_enabled: bool,
+    #[serde(default)]
+    pub selection_voice_intent_mode: SelectionVoiceIntentMode,
+    #[serde(default)]
+    pub selection_voice_manual_intent: SelectionVoiceManualIntent,
+    #[serde(default = "default_selection_voice_edit_keywords")]
+    pub selection_voice_edit_keywords: Vec<String>,
     /// 是否把每次 QA 会话写进 history.json。默认 false：QA 默认临时不留痕。
     /// 详见 issue #118。
     #[serde(default)]
@@ -1325,6 +1360,8 @@ struct UserPreferencesWire {
     #[serde(default = "default_silence_auto_stop_seconds")]
     silence_auto_stop_seconds: f32,
     #[serde(default)]
+    esc_recording_recovery_enabled: bool,
+    #[serde(default)]
     microphone_device_name: String,
     active_asr_provider: String,
     active_llm_provider: String,
@@ -1374,6 +1411,14 @@ struct UserPreferencesWire {
     selection_polish_style_pack_id: String,
     #[serde(default)]
     selection_polish_output_mode: SelectionPolishOutputMode,
+    #[serde(default)]
+    selection_voice_enabled: bool,
+    #[serde(default)]
+    selection_voice_intent_mode: SelectionVoiceIntentMode,
+    #[serde(default)]
+    selection_voice_manual_intent: SelectionVoiceManualIntent,
+    #[serde(default = "default_selection_voice_edit_keywords")]
+    selection_voice_edit_keywords: Vec<String>,
     qa_save_history: bool,
     custom_combo_hotkey: Option<ComboBinding>,
     translation_hotkey: Option<ShortcutBinding>,
@@ -1539,6 +1584,7 @@ impl Default for UserPreferencesWire {
             audio_cue_on_record: prefs.audio_cue_on_record,
             silence_auto_stop_enabled: prefs.silence_auto_stop_enabled,
             silence_auto_stop_seconds: prefs.silence_auto_stop_seconds,
+            esc_recording_recovery_enabled: prefs.esc_recording_recovery_enabled,
             microphone_device_name: prefs.microphone_device_name,
             active_asr_provider: prefs.active_asr_provider,
             active_llm_provider: prefs.active_llm_provider,
@@ -1563,6 +1609,10 @@ impl Default for UserPreferencesWire {
             selection_polish_hotkey: None,
             selection_polish_style_pack_id: prefs.selection_polish_style_pack_id,
             selection_polish_output_mode: prefs.selection_polish_output_mode,
+            selection_voice_enabled: prefs.selection_voice_enabled,
+            selection_voice_intent_mode: prefs.selection_voice_intent_mode,
+            selection_voice_manual_intent: prefs.selection_voice_manual_intent,
+            selection_voice_edit_keywords: prefs.selection_voice_edit_keywords,
             qa_save_history: prefs.qa_save_history,
             custom_combo_hotkey: prefs.custom_combo_hotkey,
             translation_hotkey: None,
@@ -1685,6 +1735,7 @@ impl<'de> Deserialize<'de> for UserPreferences {
             audio_cue_on_record: wire.audio_cue_on_record,
             silence_auto_stop_enabled: wire.silence_auto_stop_enabled,
             silence_auto_stop_seconds: wire.silence_auto_stop_seconds,
+            esc_recording_recovery_enabled: wire.esc_recording_recovery_enabled,
             microphone_device_name: wire.microphone_device_name,
             active_asr_provider: wire.active_asr_provider,
             active_llm_provider: wire.active_llm_provider,
@@ -1715,6 +1766,10 @@ impl<'de> Deserialize<'de> for UserPreferences {
             selection_polish_hotkey,
             selection_polish_style_pack_id: wire.selection_polish_style_pack_id,
             selection_polish_output_mode: wire.selection_polish_output_mode,
+            selection_voice_enabled: wire.selection_voice_enabled,
+            selection_voice_intent_mode: wire.selection_voice_intent_mode,
+            selection_voice_manual_intent: wire.selection_voice_manual_intent,
+            selection_voice_edit_keywords: wire.selection_voice_edit_keywords,
             qa_save_history: wire.qa_save_history,
             coding_agent_enabled: wire.coding_agent_enabled,
             coding_agent_provider: wire.coding_agent_provider,
@@ -1920,6 +1975,12 @@ fn default_selection_polish_hotkey() -> Option<ShortcutBinding> {
     {
         None
     }
+}
+
+fn default_selection_voice_edit_keywords() -> Vec<String> {
+    // Pre-#987 defaults were edit imperatives; interrogative routing treats these
+    // as extra question cues — empty default avoids misrouting e.g. 「改成」.
+    Vec::new()
 }
 
 fn is_right_control_modifier_shortcut(binding: &ShortcutBinding) -> bool {
@@ -2517,6 +2578,7 @@ impl Default for UserPreferences {
             audio_cue_on_record: true,
             silence_auto_stop_enabled: false,
             silence_auto_stop_seconds: default_silence_auto_stop_seconds(),
+            esc_recording_recovery_enabled: false,
             microphone_device_name: String::new(),
             active_asr_provider: default_active_asr_provider(),
             active_llm_provider: "ark".into(),
@@ -2541,6 +2603,10 @@ impl Default for UserPreferences {
             selection_polish_hotkey: default_selection_polish_hotkey(),
             selection_polish_style_pack_id: default_active_style_pack_id(),
             selection_polish_output_mode: SelectionPolishOutputMode::default(),
+            selection_voice_enabled: false,
+            selection_voice_intent_mode: SelectionVoiceIntentMode::default(),
+            selection_voice_manual_intent: SelectionVoiceManualIntent::default(),
+            selection_voice_edit_keywords: default_selection_voice_edit_keywords(),
             qa_save_history: false,
             custom_combo_hotkey: None,
             translation_hotkey: default_translation_hotkey(),
@@ -3487,6 +3553,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn obsolete_selection_voice_hotkey_is_ignored_and_not_serialized() {
+        let prefs: UserPreferences = serde_json::from_str(
+            r#"{
+                "selectionVoiceEnabled": true,
+                "selectionVoiceHotkey": { "primary": "E", "modifiers": ["ctrl", "shift"] }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(prefs.selection_voice_enabled);
+        assert!(!serde_json::to_string(&prefs)
+            .unwrap()
+            .contains("selectionVoiceHotkey"));
+    }
+
+    #[test]
     fn local_asr_model_preferences_migrate_without_cross_provider_overwrite() {
         let old_qwen: UserPreferences =
             serde_json::from_str(r#"{"localAsrActiveModel":"qwen3-asr-1.7b"}"#).unwrap();
@@ -3829,6 +3911,22 @@ mod tests {
 
         let restored: UserPreferences = serde_json::from_str(&json).unwrap();
         assert!(!restored.audio_cue_on_record);
+    }
+
+    #[test]
+    fn esc_recording_recovery_defaults_off_and_round_trips_enabled() {
+        let missing: UserPreferences = serde_json::from_str("{}").unwrap();
+        assert!(!missing.esc_recording_recovery_enabled);
+
+        let enabled = UserPreferences {
+            esc_recording_recovery_enabled: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&enabled).unwrap();
+        assert!(json.contains(r#""escRecordingRecoveryEnabled":true"#));
+
+        let restored: UserPreferences = serde_json::from_str(&json).unwrap();
+        assert!(restored.esc_recording_recovery_enabled);
     }
 
     #[test]

@@ -150,6 +150,7 @@ export {
     qaWindowDismiss,
     qaToggleRecording,
     qaSubmitText,
+    qaSetEditInstructionMode,
 } from "./qa"
 
 export {
@@ -157,6 +158,15 @@ export {
     confirmSelectionPolishPreview,
     cancelSelectionPolishPreview,
 } from './selection-polish-preview'
+
+export {
+    getSelectionVoiceIntentPrompt,
+    confirmSelectionVoiceIntentPrompt,
+    cancelSelectionVoiceIntentPrompt,
+    getSelectionVoicePreview,
+    confirmSelectionVoicePreview,
+    revertSelectionVoicePreview,
+} from './selection-voice-preview'
 
 // less-computer
 export {

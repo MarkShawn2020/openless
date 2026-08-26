@@ -2152,6 +2152,11 @@ async fn begin_session_as_with_resume(
     voice_agent: bool,
     resume: Option<ResumedRecording>,
 ) -> Result<(), String> {
+    #[cfg(all(not(mobile), target_os = "windows"))]
+    if super::selection_voice_session::selection_voice_blocks_other_recording(inner) {
+        log::info!("[coord] dictation blocked: selection voice session active");
+        return Ok(());
+    }
     let resume_identity = resume
         .as_ref()
         .map(|value| (value.session_id, value.prior_duration_ms));
@@ -4168,10 +4173,8 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     let result =
                         tokio::time::timeout(timeout_duration, local.clone().transcribe()).await;
                     if result.is_err() {
-                        // 超时只放弃结果：spawn_blocking 里的解码任务仍在跑并持有引擎锁，
-                        // cancel() 只能关 token 门控、中止不了它。直接驱逐引擎，让下次
-                        // 会话加载新引擎而不是排队等旧任务跑完（旧任务持有的 Arc 会在
-                        // 完成后自动释放内存）。
+                        // MLX 的 cancel() 会终止隔离 worker；C 后端仍只能驱逐 cache，
+                        // 让旧 spawn_blocking 任务自行收尾。两者都不复用超时后的引擎。
                         local.cancel();
                         log::warn!(
                             "[coord] local Qwen3-ASR 超时 {}s，驱逐引擎避免下次会话排队",
@@ -5363,10 +5366,20 @@ pub(super) fn cancel_session(inner: &Arc<Inner>) -> bool {
     cancel_session_impl(inner, false)
 }
 
-/// 全局 Esc 的录音阶段专用路径：仍然取消会话，但先保存 WAV + 待处理历史，并短暂给出
-/// 「是否继续」入口。组合键误触撤销、显式取消按钮等仍走原 `cancel_session`，不会污染历史。
+/// 全局 Esc 的录音阶段专用路径：用户开启恢复设置时，取消前保存 WAV + 待处理历史，
+/// 并短暂给出「是否继续」入口；默认关闭时等价于普通取消。组合键误触撤销、显式取消
+/// 按钮等始终走原 `cancel_session`，不会污染历史。
 pub(super) fn cancel_session_after_escape(inner: &Arc<Inner>) -> bool {
-    cancel_session_impl(inner, true)
+    let recover_recording = inner.prefs.get().esc_recording_recovery_enabled;
+    cancel_session_impl(inner, recover_recording)
+}
+
+fn should_offer_escape_recording_recovery(
+    enabled: bool,
+    phase: SessionPhase,
+    voice_agent: bool,
+) -> bool {
+    enabled && matches!(phase, SessionPhase::Starting | SessionPhase::Listening) && !voice_agent
 }
 
 fn cancel_session_impl(inner: &Arc<Inner>, recover_recording: bool) -> bool {
@@ -5381,12 +5394,11 @@ fn cancel_session_impl(inner: &Arc<Inner>, recover_recording: bool) -> bool {
     }) else {
         return false;
     };
-    let should_offer_recovery = recover_recording
-        && matches!(
-            decision.phase,
-            SessionPhase::Starting | SessionPhase::Listening
-        )
-        && !inner.state.lock().voice_agent;
+    let should_offer_recovery = should_offer_escape_recording_recovery(
+        recover_recording,
+        decision.phase,
+        inner.state.lock().voice_agent,
+    );
     let elapsed = inner.state.lock().started_at.elapsed().as_millis() as u64;
     *inner.cancelled_recording_recovery.lock() = None;
 
@@ -5619,12 +5631,14 @@ mod tests {
         eligible_polish_context_turns, finalize_polished_text, flush_streaming_insert_buffer_with,
         insert_delivery_failed, pcm_duration_ms, pcm_from_wav_bytes,
         resolve_less_computer_run_outcome, resolve_macos_newline_mode, retry_error_outcome,
-        should_arm_edit_watch, should_attempt_silent_retry, should_read_cursor_context,
+        should_arm_edit_watch, should_attempt_silent_retry,
+        should_offer_escape_recording_recovery, should_read_cursor_context,
         streaming_insert_eligible, SilentRetryOutcome,
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::{desktop_keyless_dictation_provider, DesktopKeylessDictationProvider};
     use crate::coordinator::RetranscribeError;
+    use crate::coordinator_state::SessionPhase;
     use crate::types::{
         ChineseScriptPreference, CorrectionRule, DictationSession, InsertStatus, MacosNewlineMode,
         PolishMode,
@@ -6452,6 +6466,35 @@ mod tests {
         assert!(insert_delivery_failed(InsertStatus::Failed));
         assert!(!insert_delivery_failed(InsertStatus::Inserted));
         assert!(!insert_delivery_failed(InsertStatus::PasteSent));
+    }
+
+    #[test]
+    fn escape_recording_recovery_requires_opt_in_recording_phase() {
+        assert!(!should_offer_escape_recording_recovery(
+            false,
+            SessionPhase::Listening,
+            false,
+        ));
+        assert!(should_offer_escape_recording_recovery(
+            true,
+            SessionPhase::Starting,
+            false,
+        ));
+        assert!(should_offer_escape_recording_recovery(
+            true,
+            SessionPhase::Listening,
+            false,
+        ));
+        assert!(!should_offer_escape_recording_recovery(
+            true,
+            SessionPhase::Processing,
+            false,
+        ));
+        assert!(!should_offer_escape_recording_recovery(
+            true,
+            SessionPhase::Listening,
+            true,
+        ));
     }
 
     #[test]
